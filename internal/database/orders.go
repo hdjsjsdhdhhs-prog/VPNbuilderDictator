@@ -1,0 +1,625 @@
+package database
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/logger"
+	"go.uber.org/zap"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+// GetOrderByID retrieves an order by its ID.
+func (s *Service) GetOrderByID(ctx context.Context, id uint) (*Order, error) {
+	var order Order
+
+	result := s.db.WithContext(ctx).First(&order, id)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, ErrOrderNotFound
+		}
+
+		return nil, fmt.Errorf("failed to get order: %w", result.Error)
+	}
+
+	return &order, nil
+}
+
+// GetOrderByProviderPaymentID finds an order by provider and external payment ID.
+// Not-found results are normalized to ErrOrderNotFound for service-layer handling.
+func (s *Service) GetOrderByProviderPaymentID(ctx context.Context, provider string, providerPaymentID uuid.UUID) (*Order, error) {
+	var order Order
+
+	result := s.db.WithContext(ctx).Where("payment_provider = ? AND provider_payment_id = ?", provider, providerPaymentID.String()).First(&order)
+	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+		return nil, ErrOrderNotFound
+	}
+
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to get order by provider payment id: %w", result.Error)
+	}
+
+	return &order, nil
+}
+
+// FindPendingPaymentOrder returns the current pending payment intent. An
+// expired intent is terminalized, but no replacement is created by this method.
+func (s *Service) FindPendingPaymentOrder(ctx context.Context, subscriptionID, productID uint, now time.Time) (*Order, error) {
+	var order Order
+
+	result := s.db.WithContext(ctx).
+		Where("subscription_id = ? AND product_id = ? AND payment_provider = ? AND status = ?", subscriptionID, productID, "platega", OrderStatusPending).
+		Order("id ASC").First(&order)
+	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+
+	if result.Error != nil {
+		return nil, fmt.Errorf("find pending payment order: %w", result.Error)
+	}
+
+	// As in FindOrCreatePendingPaymentOrder, an uncertain provider request
+	// requires reconciliation; the link deadline alone cannot release it.
+	if !order.PaymentCreationUncertain && order.PaymentExpiresAt != nil && !now.Before(*order.PaymentExpiresAt) {
+		result := s.db.WithContext(ctx).Model(&Order{}).
+			Where("id = ? AND status = ? AND payment_creation_uncertain = ?", order.ID, OrderStatusPending, false).
+			Update("status", OrderStatusExpired)
+		if result.Error != nil {
+			return nil, fmt.Errorf("expire payment order: %w", result.Error)
+		}
+
+		if result.RowsAffected == 1 {
+			order.Status = OrderStatusExpired
+			return &order, nil
+		}
+		// Another worker may have confirmed/canceled this order between the
+		// lookup and the conditional update. Return the current row so the
+		// caller cannot mistake the race for an absent intent and create a
+		// second payment attempt for the same purchase.
+		var current Order
+
+		err := s.db.WithContext(ctx).First(&current, order.ID).Error
+		if err != nil {
+			return nil, fmt.Errorf("reload payment order after expiry race: %w", err)
+		}
+
+		return &current, nil
+	}
+
+	return &order, nil
+}
+
+// FindOrCreatePendingPaymentOrder returns the single pending payment intent for
+// a subscription/product pair, expiring it first when its local payment-link
+// deadline has passed. The partial unique index is the final concurrency guard.
+func (s *Service) FindOrCreatePendingPaymentOrder(ctx context.Context, subscriptionID, productID uint, amountCents int64, currency string, now time.Time) (*Order, error) {
+	var order Order
+
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Where("subscription_id = ? AND product_id = ? AND payment_provider = ? AND status = ?", subscriptionID, productID, "platega", OrderStatusPending).
+			Order("id ASC").First(&order)
+		if result.Error == nil {
+			if order.PaymentCreationUncertain {
+				return nil
+			}
+
+			if order.PaymentExpiresAt != nil && !now.Before(*order.PaymentExpiresAt) {
+				err := tx.Model(&Order{}).Where("id = ? AND status = ?", order.ID, OrderStatusPending).
+					Update("status", OrderStatusExpired).Error
+				if err != nil {
+					return fmt.Errorf("expire payment order: %w", err)
+				}
+
+				order = Order{}
+			} else {
+				return nil
+			}
+		} else if !errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("find pending payment order: %w", result.Error)
+		}
+
+		order = Order{
+			SubscriptionID:  subscriptionID,
+			ProductID:       productID,
+			Status:          OrderStatusPending,
+			AmountCents:     amountCents,
+			Currency:        currency,
+			PaymentProvider: "platega",
+			CreatedAt:       now,
+		}
+
+		err := tx.Create(&order).Error
+		if err != nil {
+			return fmt.Errorf("create pending payment order: %w", err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		// A concurrent creator can win the partial unique-index race. The
+		// transaction is rolled back, so read the winner and continue with it.
+		message := strings.ToLower(err.Error())
+		if strings.Contains(message, "unique constraint") || strings.Contains(message, "idx_orders_pending_subscription_product_unique") {
+			result := s.db.WithContext(ctx).
+				Where("subscription_id = ? AND product_id = ? AND payment_provider = ? AND status = ?", subscriptionID, productID, "platega", OrderStatusPending).
+				Order("id ASC").First(&order)
+			if result.Error == nil {
+				return &order, nil
+			}
+
+			return nil, fmt.Errorf("reload concurrent pending payment order: %w", result.Error)
+		}
+
+		return nil, err
+	}
+
+	return &order, nil
+}
+
+// MarkPaymentCreationUncertain atomically marks whether an outbound provider
+// request has an outcome that cannot safely be retried automatically.
+func (s *Service) MarkPaymentCreationUncertain(ctx context.Context, orderID uint, uncertain bool) (bool, error) {
+	query := s.db.WithContext(ctx).Model(&Order{}).Where("id = ? AND status = ?", orderID, OrderStatusPending)
+	if uncertain {
+		query = query.Where("payment_creation_uncertain = ? AND (provider_payment_id IS NULL OR provider_payment_id = '')", false)
+	} else {
+		query = query.Where("payment_creation_uncertain = ?", true)
+	}
+
+	result := query.Update("payment_creation_uncertain", uncertain)
+	if result.Error != nil {
+		return false, fmt.Errorf("mark payment creation uncertainty: %w", result.Error)
+	}
+
+	return result.RowsAffected == 1, nil
+}
+
+// SavePaymentDetails stores the provider ID, link and local link deadline in a
+// single update and clears the uncertainty flag.
+func (s *Service) SavePaymentDetails(ctx context.Context, orderID uint, providerPaymentID uuid.UUID, paymentURL string, paymentExpiresAt time.Time) error {
+	result := s.db.WithContext(ctx).Model(&Order{}).
+		Where("id = ? AND status = ?", orderID, OrderStatusPending).
+		Updates(map[string]any{
+			"provider_payment_id":        providerPaymentID.String(),
+			"payment_url":                paymentURL,
+			"payment_expires_at":         paymentExpiresAt.UTC(),
+			"payment_creation_uncertain": false,
+		})
+	if result.Error != nil {
+		return fmt.Errorf("save payment details: %w", result.Error)
+	}
+
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("order %d is not pending: %w", orderID, ErrOrderNotFound)
+	}
+
+	return nil
+}
+
+// SaveOrderPaymentAmounts persists the actual amounts known only at callback
+// time: what was really charged from the customer (callbackAmountCents,
+// including any customer-paid provider fee) and, when the provider API
+// answered, the provider fee. A nil providerFeeCents leaves the stored fee
+// value untouched, so the first call can save the callback amount and a later
+// best-effort call can add the fee without disturbing it.
+func (s *Service) SaveOrderPaymentAmounts(ctx context.Context, orderID uint, callbackAmountCents int64, providerFeeCents *int64) error {
+	// The callback amount is always written; the provider fee is added only
+	// when supplied so a nil value cannot overwrite previously stored
+	// commission data with NULL.
+	updates := map[string]any{
+		"callback_amount_cents": callbackAmountCents,
+	}
+	if providerFeeCents != nil {
+		updates["provider_fee_cents"] = *providerFeeCents
+	}
+
+	err := s.db.WithContext(ctx).Model(&Order{}).Where("id = ?", orderID).Updates(updates).Error
+	if err != nil {
+		return fmt.Errorf("save order payment amounts: %w", err)
+	}
+
+	return nil
+}
+
+// GetPaidOrdersWithoutProviderFee returns paid Platega orders whose provider
+// commission has not been persisted yet. A NULL fee is the durable retry marker
+// for the best-effort provider status lookup.
+func (s *Service) GetPaidOrdersWithoutProviderFee(ctx context.Context, limit int) ([]Order, error) {
+	return s.GetPaidOrdersWithoutProviderFeeAfterID(ctx, 0, limit)
+}
+
+// GetPaidOrdersWithoutProviderFeeAfterID returns the next page of fee-sync
+// candidates after afterID. Paging lets the worker continue past deferred
+// orders without requiring a retry-state column.
+func (s *Service) GetPaidOrdersWithoutProviderFeeAfterID(ctx context.Context, afterID uint, limit int) ([]Order, error) {
+	var orders []Order
+
+	query := s.db.WithContext(ctx).
+		Where("status = ? AND payment_provider = ? AND provider_payment_id IS NOT NULL AND provider_payment_id <> '' AND provider_fee_cents IS NULL", OrderStatusPaid, "platega").
+		Order("id ASC")
+	if afterID > 0 {
+		query = query.Where("id > ?", afterID)
+	}
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+
+	err := query.Find(&orders).Error
+	if err != nil {
+		return nil, fmt.Errorf("get paid orders without provider fee after id %d: %w", afterID, err)
+	}
+
+	return orders, nil
+}
+
+// ConfirmOrderPaidCAS atomically marks an order paid and updates its subscription.
+// The order and subscription expiry are both computed inside the transaction from
+// the current subscription state, so the caller does not need to pre-calculate
+// (and cannot pass a stale) expiry value. The OrderService may call this method
+// for an expired order when its provider callback is still inside the short
+// settlement grace period; the service validates that time window before
+// entering this transaction. Access is local state only: the purchased plan's
+// builder serves the subscription from the next /sub request on.
+func (s *Service) ConfirmOrderPaidCAS(ctx context.Context, orderID uint, paidAt, activatedAt time.Time, sub *Subscription, product *Product, callbackAmountCents int64) (bool, error) {
+	var activated bool
+
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Serialize every entitlement-changing payment transition on the
+		// subscription row before touching its order. Chargeback acquires this
+		// same lock first, so its active-coverage decision cannot be made from a
+		// snapshot that races a concurrent confirmation.
+		var currentSub Subscription
+
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&currentSub, sub.ID).Error
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("load subscription for payment: %w", ErrSubscriptionNotFound)
+			}
+
+			return fmt.Errorf("load subscription for payment: %w", err)
+		}
+
+		newExpiry := CalculatePaymentExpiry(activatedAt, &currentSub, product)
+
+		// An expired order is accepted here only for the provider callback grace
+		// path documented above. The service layer checks the grace deadline;
+		// keeping both statuses in the same conditional update preserves the
+		// pending/expired -> paid transition as one atomic compare-and-swap.
+		result := tx.Model(&Order{}).Where("id = ? AND status IN ?", orderID, []OrderStatus{OrderStatusPending, OrderStatusExpired}).Updates(map[string]any{
+			"status":                OrderStatusPaid,
+			"paid_at":               paidAt,
+			"activated_at":          activatedAt,
+			"expires_at":            newExpiry,
+			"callback_amount_cents": callbackAmountCents,
+		})
+		if result.Error != nil {
+			return fmt.Errorf("confirm order: %w", result.Error)
+		}
+
+		if result.RowsAffected == 0 {
+			return nil
+		}
+
+		result = tx.Model(&Subscription{}).Where("id = ?", sub.ID).Updates(map[string]any{
+			"plan_id": product.PlanID, "status": string(SubscriptionStatusActive),
+			"expires_at": newExpiry, "product_id": product.ID, "started_at": activatedAt,
+			"price_paid_cents": product.PriceCents, "currency": product.Currency, "reminders_sent": 0,
+		})
+		if result.Error != nil {
+			return fmt.Errorf("update subscription after payment: %w", result.Error)
+		}
+
+		if result.RowsAffected == 0 {
+			return fmt.Errorf("update subscription after payment: %w", ErrSubscriptionNotFound)
+		}
+
+		sub.PlanID = product.PlanID
+		sub.Status = string(SubscriptionStatusActive)
+		sub.ProductID = &product.ID
+		expiryCopy := newExpiry
+
+		sub.ExpiresAt = &expiryCopy
+
+		recordPaymentJournal(ctx, tx, orderID, &currentSub, product, newExpiry, activatedAt)
+
+		activated = true
+
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return activated, nil
+}
+
+// recordPaymentJournal journals a confirmed payment and the entitlement it
+// granted: a renewal when the subscription already held a paid term of the
+// same plan (the same rule as the admin payment alert), otherwise a paid
+// activation. Both rows are keyed by the order, so they exist at most once.
+func recordPaymentJournal(ctx context.Context, tx *gorm.DB, orderID uint, prior *Subscription, product *Product, newExpiry, activatedAt time.Time) {
+	var order Order
+	if err := tx.First(&order, orderID).Error; err != nil {
+		logger.Warn("failed to load order for journal", zap.Uint("order_id", orderID), zap.Error(err))
+		return
+	}
+	after := *prior
+	after.PlanID, after.Status = product.PlanID, string(SubscriptionStatusActive)
+	expiry := newExpiry
+	after.ExpiresAt = &expiry
+	amount := order.AmountCents
+	payment := map[string]any{"provider": order.PaymentProvider, "product_id": product.ID, "product_name": product.Name, "duration_days": product.DurationDays}
+	if order.CallbackAmountCents != nil {
+		payment["charged_cents"] = *order.CallbackAmountCents
+	}
+	recordJournal(ctx, tx, JournalRecord{
+		Type: JournalPaymentSucceeded, Actor: JournalActorUser, ActorName: order.PaymentProvider, Subscription: &after,
+		Description: fmt.Sprintf("Оплата заказа #%d прошла успешно", order.ID),
+		OrderID:     order.ID, AmountCents: &amount, Currency: order.Currency, Extra: payment,
+		DedupKey: journalKey("order_paid", order.ID), At: activatedAt,
+	})
+	renewal := prior.PlanID == product.PlanID && (prior.ProductID != nil || prior.PricePaidCents > 0)
+	entitlement := JournalRecord{
+		Type: JournalPaidActivated, Actor: JournalActorUser, ActorName: order.PaymentProvider, Subscription: &after,
+		Description: fmt.Sprintf("Активирована платная подписка «%s» на %s", product.Name, journalDays(product.DurationDays)),
+		OrderID:     order.ID, AmountCents: &amount, Currency: order.Currency,
+		Before: JournalStateOf(prior), After: JournalStateOf(&after), Extra: payment,
+		DedupKey: journalKey("order_activated", order.ID), At: activatedAt,
+	}
+	if renewal {
+		entitlement.Type = JournalRenewed
+		entitlement.Description = fmt.Sprintf("Подписка продлена оплатой «%s» на %s", product.Name, journalDays(product.DurationDays))
+	}
+	recordJournal(ctx, tx, entitlement)
+}
+
+// CalculatePaymentExpiry is the single source of truth for payment expiry
+// computation shared by the order CAS and the service layer. When the current
+// plan matches the purchased product's plan and the existing expiry is still in
+// the future, the new expiry extends the existing one; otherwise it starts from
+// the activation time. A nil product yields the base time unchanged.
+func CalculatePaymentExpiry(now time.Time, sub *Subscription, product *Product) time.Time {
+	base := now
+	if sub != nil && product != nil && sub.PlanID == product.PlanID && sub.ExpiresAt != nil && sub.ExpiresAt.After(now) {
+		base = *sub.ExpiresAt
+	}
+
+	if product == nil {
+		return base
+	}
+
+	return base.AddDate(0, 0, product.DurationDays)
+}
+
+// CancelPaidOrderAndDowngradeCAS atomically records a paid-order chargeback and,
+// when no other currently-valid paid order covers the subscription, resets the
+// subscription to the free plan.
+//
+// The order status and entitlement update share one transaction. A concurrent
+// confirmation therefore cannot commit an entitlement after this chargeback's
+// decision without first observing the serialized DB state.
+func (s *Service) CancelPaidOrderAndDowngradeCAS(ctx context.Context, provider string, providerPaymentID uuid.UUID, now time.Time, freePlanID uint) (*ChargebackResult, error) {
+	var result ChargebackResult
+
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var order Order
+
+		query := tx.Where("payment_provider = ? AND provider_payment_id = ?", provider, providerPaymentID.String()).First(&order)
+		if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+			return nil
+		}
+
+		if query.Error != nil {
+			return fmt.Errorf("find chargeback order: %w", query.Error)
+		}
+
+		// Use the same subscription lock order as ConfirmOrderPaidCAS. The lock
+		// is acquired before changing this order or evaluating other paid orders,
+		// which makes the chargeback coverage decision linearizable per user.
+		var currentSub Subscription
+
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&currentSub, order.SubscriptionID).Error
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("load subscription for chargeback: %w", ErrSubscriptionNotFound)
+			}
+
+			return fmt.Errorf("load subscription for chargeback: %w", err)
+		}
+
+		// Re-read the provider order after the subscription lock. A concurrent
+		// confirmation may have changed it after the initial lookup.
+		err = tx.First(&order, order.ID).Error
+		if err != nil {
+			return fmt.Errorf("reload chargeback order: %w", err)
+		}
+
+		result.Order = &order
+		result.WasPaid = order.Status == OrderStatusPaid
+
+		fromStatus := OrderStatusPending
+		if result.WasPaid {
+			fromStatus = OrderStatusPaid
+		}
+
+		updated := tx.Model(&Order{}).
+			Where("id = ? AND status = ?", order.ID, fromStatus).
+			Update("status", OrderStatusCanceled)
+		if updated.Error != nil {
+			return fmt.Errorf("cancel paid order: %w", updated.Error)
+		}
+
+		if updated.RowsAffected == 0 {
+			return nil
+		}
+
+		result.Transitioned = true
+
+		order.Status = OrderStatusCanceled
+		if !result.WasPaid {
+			result.Order = &order
+			recordOrderCanceledJournal(ctx, tx, &order, &currentSub)
+			return nil
+		}
+		// A chargeback must never resurrect a subscription that was already
+		// revoked/canceled by another lifecycle flow. The order transition is
+		// still committed, but only active subscriptions may be downgraded to
+		// the active free plan below.
+		if currentSub.Status != string(SubscriptionStatusActive) {
+			result.Order = &order
+			recordChargebackJournal(ctx, tx, &order, &currentSub, 0)
+			return nil
+		}
+
+		var activePaid int64
+
+		// Count all paid orders for this subscription, INCLUDING the order
+		// being charged back (it is still OrderStatusPaid at this point in
+		// the transaction). This is intentional: if this is the only paid
+		// order, activePaid == 1, which correctly triggers a downgrade to
+		// free. If another active paid order exists, activePaid > 1 and
+		// access is preserved. The count is taken BEFORE the order status
+		// update below, so it reflects the pre-chargeback state.
+		err = tx.Model(&Order{}).
+			Where("subscription_id = ? AND status = ? AND (expires_at IS NULL OR expires_at > ?)", order.SubscriptionID, OrderStatusPaid, now).
+			Count(&activePaid).Error
+		if err != nil {
+			return fmt.Errorf("check active paid coverage: %w", err)
+		}
+
+		if activePaid > 0 {
+			result.Order = &order
+			recordChargebackJournal(ctx, tx, &order, &currentSub, 0)
+			return nil
+		}
+
+		updated = tx.Model(&Subscription{}).Where("id = ?", order.SubscriptionID).Updates(map[string]any{
+			"status":           string(SubscriptionStatusActive),
+			"expires_at":       nil,
+			"plan_id":          freePlanID,
+			"product_id":       nil,
+			"started_at":       nil,
+			"price_paid_cents": 0,
+			"currency":         nil,
+		})
+		if updated.Error != nil {
+			return fmt.Errorf("downgrade subscription after chargeback: %w", updated.Error)
+		}
+
+		if updated.RowsAffected == 0 {
+			return fmt.Errorf("downgrade subscription after chargeback: %w", ErrSubscriptionNotFound)
+		}
+
+		result.Downgraded = true
+		result.Order = &order
+		recordChargebackJournal(ctx, tx, &order, &currentSub, freePlanID)
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if result.Order == nil {
+		return nil, nil
+	}
+
+	return &result, nil
+}
+
+// CancelOrderCAS cancels an order only from one of the supplied states. It
+// returns false without error when the callback is an idempotent no-op.
+func (s *Service) CancelOrderCAS(ctx context.Context, provider string, providerPaymentID uuid.UUID, fromStatuses []OrderStatus) (bool, error) {
+	changed := false
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&Order{}).Where("payment_provider = ? AND provider_payment_id = ? AND status IN ?", provider, providerPaymentID.String(), fromStatuses).Update("status", OrderStatusCanceled)
+		if result.Error != nil {
+			return result.Error
+		}
+		changed = result.RowsAffected > 0
+		if !changed {
+			return nil
+		}
+		var order Order
+		if err := tx.Where("payment_provider = ? AND provider_payment_id = ?", provider, providerPaymentID.String()).First(&order).Error; err != nil {
+			logger.Warn("failed to load canceled order for journal", zap.String("provider", provider), zap.Error(err))
+			return nil
+		}
+		var sub Subscription
+		if err := tx.First(&sub, order.SubscriptionID).Error; err != nil {
+			logger.Warn("failed to load subscription of canceled order for journal", zap.Uint("order_id", order.ID), zap.Error(err))
+			return nil
+		}
+		recordOrderCanceledJournal(ctx, tx, &order, &sub)
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("cancel order: %w", err)
+	}
+
+	return changed, nil
+}
+
+// recordOrderCanceledJournal journals a payment that did not go through: the
+// provider canceled an order before any money was collected.
+func recordOrderCanceledJournal(ctx context.Context, tx *gorm.DB, order *Order, sub *Subscription) {
+	amount := order.AmountCents
+	recordJournal(ctx, tx, JournalRecord{
+		Type: JournalPaymentFailed, Outcome: JournalOutcomeFailed, Actor: JournalActorSystem, ActorName: order.PaymentProvider,
+		Subscription: sub, PlanID: orderPlanID(tx, order),
+		Description: fmt.Sprintf("Оплата заказа #%d не прошла: платёж отменён провайдером", order.ID),
+		OrderID:     order.ID, AmountCents: &amount, Currency: order.Currency,
+		Extra:    map[string]any{"provider": order.PaymentProvider, "product_id": order.ProductID},
+		DedupKey: journalKey("order_canceled", order.ID),
+	})
+}
+
+// recordChargebackJournal journals a refund of a collected payment.
+// freePlanID is non-zero when access was downgraded to the free plan.
+func recordChargebackJournal(ctx context.Context, tx *gorm.DB, order *Order, prior *Subscription, freePlanID uint) {
+	amount := order.AmountCents
+	rec := JournalRecord{
+		Type: JournalPaymentRefunded, Actor: JournalActorSystem, ActorName: order.PaymentProvider,
+		Subscription: prior, PlanID: orderPlanID(tx, order),
+		Description: fmt.Sprintf("Возврат платежа по заказу #%d, доступ сохранён", order.ID),
+		OrderID:     order.ID, AmountCents: &amount, Currency: order.Currency,
+		Extra:    map[string]any{"provider": order.PaymentProvider, "product_id": order.ProductID, "downgraded": freePlanID != 0},
+		DedupKey: journalKey("order_canceled", order.ID),
+	}
+	if freePlanID != 0 {
+		after := JournalStateOf(prior)
+		after.Status, after.ExpiresAt, after.PlanID = string(SubscriptionStatusActive), nil, freePlanID
+		rec.Before, rec.After = JournalStateOf(prior), after
+		rec.Description = fmt.Sprintf("Возврат платежа по заказу #%d, подписка переведена на бесплатный тариф", order.ID)
+	}
+	recordJournal(ctx, tx, rec)
+}
+
+// orderPlanID is the plan of the order's product (0 when unavailable).
+func orderPlanID(tx *gorm.DB, order *Order) uint {
+	var product Product
+	if err := tx.Select("id", "plan_id").First(&product, order.ProductID).Error; err != nil {
+		return 0
+	}
+	return product.PlanID
+}
+
+// GetOrdersBySubscriptionID returns orders for the given subscription.
+func (s *Service) GetOrdersBySubscriptionID(ctx context.Context, subscriptionID uint) ([]Order, error) {
+	var orders []Order
+
+	result := s.db.WithContext(ctx).
+		Where("subscription_id = ?", subscriptionID).
+		Order("created_at DESC").
+		Find(&orders)
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to list orders: %w", result.Error)
+	}
+
+	return orders, nil
+}

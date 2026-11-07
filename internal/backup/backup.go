@@ -1,0 +1,413 @@
+package backup
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/logger"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	_ "github.com/mattn/go-sqlite3"
+	"go.uber.org/zap"
+)
+
+// validatePath checks if a path is safe (no directory traversal).
+func validatePath(path string) error {
+	if path == "" {
+		return fmt.Errorf("path cannot be empty")
+	}
+
+	// Check for directory traversal attempts in the original path
+	// This must be done BEFORE cleaning because Clean() resolves ".."
+	if strings.Contains(path, "..") {
+		return fmt.Errorf("invalid path: directory traversal detected")
+	}
+
+	// Get absolute path
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path: %w", err)
+	}
+
+	// Clean the path to resolve any . elements
+	cleaned := filepath.Clean(absPath)
+
+	// Prevent access to system directories (case-insensitive for safety)
+	lowerPath := strings.ToLower(cleaned)
+	if strings.HasPrefix(lowerPath, "/etc/") ||
+		strings.HasPrefix(lowerPath, "/root/") ||
+		strings.HasPrefix(lowerPath, "/sys/") ||
+		strings.HasPrefix(lowerPath, "/proc/") ||
+		strings.HasPrefix(lowerPath, "/dev/") ||
+		strings.HasPrefix(lowerPath, "/var/run/") {
+		return fmt.Errorf("access to system directories is forbidden")
+	}
+
+	// Ensure path is within reasonable bounds (not root)
+	if cleaned == "/" {
+		return fmt.Errorf("cannot use root directory")
+	}
+
+	return nil
+}
+
+// checkpointWAL opens the database with write access, checkpoints WAL, and closes it.
+// A writable connection is required because TRUNCATE may modify both the WAL and the
+// main database file. The caller must fail the backup if checkpointing fails.
+func checkpointWAL(ctx context.Context, dbPath string) error {
+	err := ctx.Err()
+	if err != nil {
+		return err
+	}
+
+	_, err = os.Stat(dbPath)
+	if err != nil {
+		return fmt.Errorf("stat database: %w", err)
+	}
+	// A database without a WAL sidecar has nothing to checkpoint. This also
+	// keeps backups of legacy rollback-journal databases on the ordinary copy path.
+	_, err = os.Stat(dbPath + "-wal")
+	if os.IsNotExist(err) {
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("stat database WAL: %w", err)
+	}
+
+	// #nosec G304 -- dbPath is validated by the caller
+	dsn := fmt.Sprintf("file:%s?_busy_timeout=5000", dbPath)
+
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return fmt.Errorf("failed to open database for checkpoint: %w", err)
+	}
+
+	defer func() {
+		closeErr := db.Close()
+		if closeErr != nil {
+			logger.Debug("Failed to close checkpoint database", zap.Error(closeErr))
+		}
+	}()
+
+	// WAL checkpoint: PASSIVE returns immediately, TRUNCATE tries to reset WAL file
+	// Using TRUNCATE to ensure all data is in the main database file. The pragma
+	// returns a row (busy, log, checkpointed): a nonzero busy count means frames
+	// are still in use and would be omitted from a raw copy of the DB file, so the
+	// backup must not proceed.
+	ctxWithTimeout, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	var busy, logFrames, checkpointedFrames int
+
+	err = db.QueryRowContext(ctxWithTimeout, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointedFrames)
+	if err != nil {
+		return fmt.Errorf("checkpoint failed: %w", err)
+	}
+
+	if busy != 0 {
+		return fmt.Errorf("checkpoint incomplete: %d WAL frames still busy (log=%d, checkpointed=%d)", busy, logFrames, checkpointedFrames)
+	}
+
+	return nil
+}
+
+// BackupDatabase creates a backup of the SQLite database file.
+// It uses WAL checkpoint before copying to ensure a consistent snapshot,
+// then atomic write pattern (temp file + rename) for the copy itself.
+func BackupDatabase(ctx context.Context, dbPath string) error {
+	// Validate the database path to prevent directory traversal
+	err := validatePath(dbPath)
+	if err != nil {
+		return fmt.Errorf("invalid database path: %w", err)
+	}
+
+	// Checkpoint WAL to ensure the main database file contains all data. Never
+	// create a raw copy after a failed checkpoint: the current data may still be
+	// stored in the WAL sidecar and omitted from the backup.
+	err = checkpointWAL(ctx, dbPath)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+
+		return fmt.Errorf("checkpoint database WAL: %w", err)
+	}
+
+	backupPath := dbPath + ".backup"
+
+	// Open source database
+	// #nosec G304 -- File path is validated by validatePath() above to prevent directory traversal
+	src, err := os.Open(dbPath)
+	if err != nil {
+		return fmt.Errorf("failed to open database: %w", err)
+	}
+	defer func() {
+		closeErr := src.Close()
+		if closeErr != nil {
+			logger.Error("Failed to close source database file",
+				zap.String("path", dbPath),
+				zap.Error(closeErr))
+		}
+	}()
+
+	// Create unpredictable temp file in same dir via CreateTemp (O_EXCL, no predictable name)
+	// to close symlink/hardlink TOCTOU race window that existed with fixed tempPath + OpenFile(O_CREATE|TRUNC).
+	// #nosec G304 -- dir derived from validated dbPath
+	tmpDir := filepath.Dir(backupPath)
+
+	dst, err := os.CreateTemp(tmpDir, "db-*.backup.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temp backup: %w", err)
+	}
+
+	tempPath := dst.Name()
+	closed, published := false, false
+	defer func() {
+		if !closed {
+			if closeErr := dst.Close(); closeErr != nil {
+				logger.Error("Failed to close backup file",
+					zap.String("path", tempPath),
+					zap.Error(closeErr))
+			}
+		}
+		// Windows cannot remove an open file. Clean up only after closing it,
+		// and never remove a successfully published backup.
+		if !published {
+			if removeErr := os.Remove(tempPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				logger.Warn("Failed to remove temporary backup", zap.Error(removeErr))
+			}
+		}
+	}()
+
+	// Copy database to temp file with context cancellation support
+	buf := make([]byte, 32*1024) // 32KB buffer
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		n, err := src.Read(buf)
+		if n > 0 {
+			_, writeErr := dst.Write(buf[:n])
+			if writeErr != nil {
+				return fmt.Errorf("failed to write to backup: %w", writeErr)
+			}
+		}
+
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		if err != nil {
+			return fmt.Errorf("failed to read database: %w", err)
+		}
+	}
+
+	// Sync and close before publishing: Windows rejects renaming an open file.
+	err = dst.Sync()
+	if err != nil {
+		return fmt.Errorf("failed to sync backup: %w", err)
+	}
+	err = dst.Close()
+	closed = true
+	if err != nil {
+		return fmt.Errorf("failed to close backup: %w", err)
+	}
+
+	err = os.Rename(tempPath, backupPath)
+	if err != nil {
+		return fmt.Errorf("failed to rename backup: %w", err)
+	}
+	published = true
+
+	// Ensure backup file has secure permissions (0600)
+	err = os.Chmod(backupPath, 0600)
+	if err != nil {
+		logger.Error("Failed to set backup file permissions",
+			zap.String("path", backupPath),
+			zap.Error(err))
+
+		return fmt.Errorf("failed to set secure permissions on backup: %w", err)
+	}
+
+	logger.Info("Database backup created", zap.String("path", backupPath))
+
+	return nil
+}
+
+// RotateBackups rotates the current backup file to a timestamped version
+// and removes old backups beyond the retention limit.
+func RotateBackups(dbPath string, keep int) error {
+	if keep < 1 {
+		keep = config.DefaultBackupRetention
+	}
+
+	basePath := dbPath + ".backup"
+
+	// Check if backup exists
+	_, err := os.Stat(basePath)
+	if os.IsNotExist(err) {
+		return nil // No backup to rotate
+	}
+
+	// Create timestamped backup
+	timestamp := time.Now().Format("20060102_150405")
+	timedBackupPath := fmt.Sprintf("%s.%s", basePath, timestamp)
+
+	err = os.Rename(basePath, timedBackupPath)
+	if err != nil {
+		return fmt.Errorf("failed to rename backup: %w", err)
+	}
+
+	// Ensure rotated backup has secure permissions
+	err = os.Chmod(timedBackupPath, 0600)
+	if err != nil {
+		logger.Error("Failed to set rotated backup file permissions",
+			zap.String("path", timedBackupPath),
+			zap.Error(err))
+
+		return fmt.Errorf("failed to set secure permissions on rotated backup: %w", err)
+	}
+
+	logger.Info("Rotated backup", zap.String("path", timedBackupPath))
+
+	// Find and remove old backups
+	pattern := basePath + ".*"
+
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return fmt.Errorf("failed to find backups: %w", err)
+	}
+
+	// Sort backups by modification time (newest first)
+	type backupInfo struct {
+		path    string
+		modTime time.Time
+	}
+
+	backups := make([]backupInfo, 0, len(matches))
+	for _, match := range matches {
+		info, statErr := os.Stat(match)
+		if statErr == nil {
+			backups = append(backups, backupInfo{path: match, modTime: info.ModTime()})
+		}
+	}
+
+	sort.Slice(backups, func(i, j int) bool {
+		return backups[i].modTime.After(backups[j].modTime)
+	})
+
+	// Remove old backups beyond retention limit
+	removed := 0
+
+	for i := keep; i < len(backups); i++ {
+		err := os.Remove(backups[i].path)
+		if err == nil {
+			logger.Info("Removed old backup", zap.String("path", backups[i].path))
+
+			removed++
+		} else {
+			logger.Warn("Failed to remove old backup",
+				zap.String("path", backups[i].path),
+				zap.Error(err))
+		}
+	}
+
+	if removed > 0 {
+		logger.Info("Cleaned up old backups", zap.Int("count", removed))
+	}
+
+	return nil
+}
+
+// DailyBackup performs a database backup and rotation.
+// This is the main entry point for scheduled backups.
+// The context allows cancellation of the backup operation.
+func DailyBackup(ctx context.Context, dbPath string, keepDays int) error {
+	if keepDays < 1 {
+		keepDays = config.DefaultBackupRetention
+	}
+
+	err := BackupDatabase(ctx, dbPath)
+	if err != nil {
+		return fmt.Errorf("backup failed: %w", err)
+	}
+
+	err = RotateBackups(dbPath, keepDays)
+	if err != nil {
+		return fmt.Errorf("rotation failed: %w", err)
+	}
+
+	return nil
+}
+
+// GetBackupInfo returns information about existing backups.
+func GetBackupInfo(dbPath string) ([]BackupInfo, error) {
+	basePath := dbPath + ".backup"
+	pattern := basePath + ".*"
+
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find backups: %w", err)
+	}
+
+	// Also check for the main backup file
+	_, statErr := os.Stat(basePath)
+	if statErr == nil {
+		matches = append(matches, basePath)
+	}
+
+	infos := make([]BackupInfo, 0, len(matches))
+	for _, match := range matches {
+		info, err := os.Stat(match)
+		if err != nil {
+			continue
+		}
+
+		infos = append(infos, BackupInfo{
+			Path:    match,
+			Size:    info.Size(),
+			ModTime: info.ModTime(),
+		})
+	}
+
+	// Sort by modification time (newest first)
+	sort.Slice(infos, func(i, j int) bool {
+		return infos[i].ModTime.After(infos[j].ModTime)
+	})
+
+	return infos, nil
+}
+
+// BackupInfo contains information about a backup file.
+type BackupInfo struct {
+	Path    string
+	Size    int64
+	ModTime time.Time
+}
+
+// TotalBackupSize returns the total size of all backup files.
+func TotalBackupSize(dbPath string) (int64, error) {
+	infos, err := GetBackupInfo(dbPath)
+	if err != nil {
+		return 0, err
+	}
+
+	var total int64
+	for _, info := range infos {
+		total += info.Size
+	}
+
+	return total, nil
+}

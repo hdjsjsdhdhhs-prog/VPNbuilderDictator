@@ -1,0 +1,299 @@
+package database
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// ==================== GetSubscriptionStatus Tests ====================
+
+func TestGetSubscriptionStatus_Active(t *testing.T) {
+	t.Parallel()
+
+	svc := newTestService(t)
+	ctx := context.Background()
+
+	sub := createTestSubscription(t, svc, 9001, "status-user", "client-status-1")
+
+	status, expiryTime, err := svc.GetSubscriptionStatus(ctx, sub.SubscriptionID)
+	require.NoError(t, err)
+	assert.Equal(t, "active", status)
+	assert.False(t, expiryTime.IsZero(), "expiry time should be set for active subscription with future expiry")
+}
+
+func TestGetSubscriptionStatus_Revoked(t *testing.T) {
+	t.Parallel()
+
+	svc := newTestService(t)
+	ctx := context.Background()
+
+	sub := createTestSubscription(t, svc, 9002, "status-revoked", "client-status-2")
+	require.NoError(t, svc.db.WithContext(ctx).Model(sub).Update("status", "revoked").Error)
+
+	status, _, err := svc.GetSubscriptionStatus(ctx, sub.SubscriptionID)
+	require.NoError(t, err)
+	assert.Equal(t, "revoked", status)
+}
+
+func TestGetSubscriptionStatus_NotFound(t *testing.T) {
+	t.Parallel()
+
+	svc := newTestService(t)
+	ctx := context.Background()
+
+	_, _, err := svc.GetSubscriptionStatus(ctx, "nonexistent-sub-id")
+	assert.Error(t, err)
+}
+
+// ==================== GetSubscriptionWithProviderSource Tests ====================
+
+func TestGetSubscriptionWithProviderSource_ActiveSubscription(t *testing.T) {
+	t.Parallel()
+
+	svc := newTestService(t)
+	ctx := context.Background()
+
+	// Create a subscription with the trial plan
+	plan, err := svc.GetPlanByName(ctx, TrialPlanName)
+	require.NoError(t, err)
+
+	sub := &Subscription{
+		TelegramID:     9100,
+		Username:       "plan-user",
+		ClientID:       "client-plan-1",
+		SubscriptionID: "sub-plan-1",
+		Status:         "active",
+		PlanID:         plan.ID,
+		ExpiresAt:      ptrTime(time.Now().Add(24 * time.Hour)),
+	}
+	require.NoError(t, svc.CreateSubscription(ctx, sub, ""))
+
+	result, err := svc.GetSubscriptionWithProviderSource(ctx, sub.SubscriptionID)
+	require.NoError(t, err)
+	assert.Equal(t, sub.SubscriptionID, result.SubscriptionID)
+	assert.Equal(t, plan.ID, result.PlanID)
+}
+
+func TestGetSubscriptionWithProviderSource_NotFound(t *testing.T) {
+	t.Parallel()
+
+	svc := newTestService(t)
+	ctx := context.Background()
+
+	_, err := svc.GetSubscriptionWithProviderSource(ctx, "nonexistent")
+	assert.ErrorIs(t, err, ErrSubscriptionNotFound)
+}
+
+func TestGetSubscriptionWithProviderSource_ExpiredActiveSubscription(t *testing.T) {
+	t.Parallel()
+
+	svc := newTestService(t)
+	ctx := context.Background()
+	plan, err := svc.GetPlanByName(ctx, TrialPlanName)
+	require.NoError(t, err)
+
+	sub := &Subscription{
+		TelegramID:     9102,
+		Username:       "expired-cache-miss",
+		ClientID:       "client-expired-cache-miss",
+		SubscriptionID: "sub-expired-cache-miss",
+		Status:         "active",
+		PlanID:         plan.ID,
+		ExpiresAt:      ptrTime(time.Now().Add(-time.Minute)),
+	}
+	require.NoError(t, svc.CreateSubscription(ctx, sub, ""))
+
+	_, err = svc.GetSubscriptionWithProviderSource(ctx, sub.SubscriptionID)
+	assert.ErrorIs(t, err, ErrSubscriptionNotFound)
+}
+
+func TestGetSubscriptionWithProviderSource_RevokedSubscription(t *testing.T) {
+	t.Parallel()
+
+	svc := newTestService(t)
+	ctx := context.Background()
+
+	sub := createTestSubscription(t, svc, 9101, "plan-revoked", "client-plan-rev")
+	require.NoError(t, svc.db.WithContext(ctx).Model(sub).Update("status", "revoked").Error)
+
+	_, err := svc.GetSubscriptionWithProviderSource(ctx, sub.SubscriptionID)
+	assert.ErrorIs(t, err, ErrSubscriptionNotFound)
+}
+
+// ==================== UpdateDevices Tests ====================
+
+// ==================== UpdateIPs Tests ====================
+
+// ==================== ExpireSubscription Tests ====================
+
+func TestExpireSubscription_Success(t *testing.T) {
+	t.Parallel()
+
+	svc := newTestService(t)
+	ctx := context.Background()
+
+	sub := createTestSubscription(t, svc, 9400, "expire-user", "client-expire-1")
+	startedAt := time.Now().UTC().Add(-24 * time.Hour)
+	currency := "RUB"
+	sub.StartedAt = &startedAt
+	sub.PricePaidCents = 2300
+	sub.Currency = &currency
+	require.NoError(t, svc.db.Save(sub).Error)
+
+	freePlan, err := svc.GetPlanByName(ctx, FreePlanName)
+	require.NoError(t, err)
+
+	err = svc.ExpireSubscription(ctx, sub.ID, freePlan.ID)
+	require.NoError(t, err)
+
+	got, err := svc.GetByID(ctx, sub.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "active", got.Status)
+	assert.Nil(t, got.ExpiresAt)
+	assert.Equal(t, freePlan.ID, got.PlanID)
+	assert.Nil(t, got.ProductID)
+	assert.Nil(t, got.StartedAt)
+	assert.Zero(t, got.PricePaidCents)
+	assert.Nil(t, got.Currency)
+	assert.False(t, got.IsPaid())
+}
+
+func TestExpireSubscription_NotFound(t *testing.T) {
+	t.Parallel()
+
+	svc := newTestService(t)
+	ctx := context.Background()
+
+	err := svc.ExpireSubscription(ctx, 99999, 1)
+	assert.ErrorIs(t, err, ErrSubscriptionNotFound)
+}
+
+// ==================== GetExpiredPaidSubscriptions Tests ====================
+
+func TestGetExpiredPaidSubscriptions_WithExpiredPaidSub(t *testing.T) {
+	t.Parallel()
+
+	svc := newTestService(t)
+	ctx := context.Background()
+
+	// Create a paid plan subscription that has expired
+	paidPlan := &Plan{Name: "paid-plan-exp", IsActive: true}
+	require.NoError(t, svc.db.WithContext(ctx).Create(paidPlan).Error)
+
+	pastTime := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Minute)
+	sub := &Subscription{
+		TelegramID:     9500,
+		Username:       "expired-paid-user",
+		ClientID:       "client-exp-paid-1",
+		SubscriptionID: "sub-exp-paid-1",
+		Status:         "active",
+		PlanID:         paidPlan.ID,
+		ExpiresAt:      &pastTime,
+	}
+	require.NoError(t, svc.CreateSubscription(ctx, sub, ""))
+
+	subs, err := svc.GetExpiredPaidSubscriptions(ctx, time.Now().UTC())
+	require.NoError(t, err)
+	require.Len(t, subs, 1)
+	assert.Equal(t, sub.SubscriptionID, subs[0].SubscriptionID)
+}
+
+func TestGetExpiredPaidSubscriptions_NoExpired(t *testing.T) {
+	t.Parallel()
+
+	svc := newTestService(t)
+	ctx := context.Background()
+
+	// Active subscription with future expiry — should not appear
+	_ = createTestSubscription(t, svc, 9501, "not-expired", "client-not-exp")
+
+	subs, err := svc.GetExpiredPaidSubscriptions(ctx, time.Now().UTC())
+	require.NoError(t, err)
+	assert.Empty(t, subs)
+}
+
+func TestGetExpiredPaidSubscriptions_FreePlanExcluded(t *testing.T) {
+	t.Parallel()
+
+	svc := newTestService(t)
+	ctx := context.Background()
+
+	// Free plan subscription that has "expired" — should NOT be returned
+	freePlan, err := svc.GetPlanByName(ctx, FreePlanName)
+	require.NoError(t, err)
+
+	pastTime := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Minute)
+	sub := &Subscription{
+		TelegramID:     9502,
+		Username:       "free-expired-user",
+		ClientID:       "client-free-exp-1",
+		SubscriptionID: "sub-free-exp-1",
+		Status:         "active",
+		PlanID:         freePlan.ID,
+		ExpiresAt:      &pastTime,
+	}
+	require.NoError(t, svc.CreateSubscription(ctx, sub, ""))
+
+	subs, err := svc.GetExpiredPaidSubscriptions(ctx, time.Now().UTC())
+	require.NoError(t, err)
+	assert.Empty(t, subs, "free plan subscriptions should be excluded")
+}
+
+func TestGetExpiredPaidSubscriptions_TrialPlanExcluded(t *testing.T) {
+	t.Parallel()
+
+	svc := newTestService(t)
+	ctx := context.Background()
+
+	trialPlan, err := svc.GetPlanByName(ctx, TrialPlanName)
+	require.NoError(t, err)
+
+	pastTime := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Minute)
+	sub := &Subscription{
+		TelegramID:     -9503,
+		ClientID:       "client-trial-exp-1",
+		SubscriptionID: "sub-trial-exp-1",
+		Status:         "active",
+		PlanID:         trialPlan.ID,
+		ExpiresAt:      &pastTime,
+	}
+	require.NoError(t, svc.CreateSubscription(ctx, sub, ""))
+
+	subs, err := svc.GetExpiredPaidSubscriptions(ctx, time.Now().UTC())
+	require.NoError(t, err)
+	assert.Empty(t, subs, "trial subscriptions are cleaned up by TrialCleanupScheduler")
+}
+
+func TestExpireSubscriptionWithPlanCAS_RequiresExpiredActiveSubscription(t *testing.T) {
+	t.Parallel()
+
+	svc := newTestService(t)
+	ctx := context.Background()
+	freePlan, err := svc.GetPlanByName(ctx, FreePlanName)
+	require.NoError(t, err)
+
+	paidPlan := &Plan{Name: "expiry-paid", IsActive: true}
+	require.NoError(t, svc.db.Create(paidPlan).Error)
+	product := &Product{PlanID: paidPlan.ID, Name: "expiry", DurationDays: 30, PriceCents: 100, Currency: "RUB", IsActive: true}
+	require.NoError(t, svc.db.Create(product).Error)
+
+	expired := time.Now().UTC().Add(-time.Hour)
+	productID := product.ID
+	currency := "RUB"
+	sub := &Subscription{TelegramID: 994003, Username: "expiry-cas", ClientID: "expiry-cas-client", SubscriptionID: "expiry-cas-sub", Status: "active", PlanID: paidPlan.ID, ExpiresAt: &expired, ProductID: &productID, PricePaidCents: 100, Currency: &currency}
+	require.NoError(t, svc.CreateSubscription(ctx, sub, ""))
+
+	err = svc.ExpireSubscriptionWithPlanCAS(ctx, sub.ID, freePlan.ID)
+	require.NoError(t, err)
+
+	updated, err := svc.GetByID(ctx, sub.ID)
+	require.NoError(t, err)
+	assert.Equal(t, freePlan.ID, updated.PlanID)
+	assert.Nil(t, updated.ExpiresAt)
+	assert.Zero(t, updated.PricePaidCents)
+	assert.Nil(t, updated.Currency)
+}

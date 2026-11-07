@@ -1,0 +1,131 @@
+package web
+
+import (
+	"crypto/subtle"
+	"net/http"
+	"path"
+	"strings"
+
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/logger"
+
+	"go.uber.org/zap"
+)
+
+// SecurityHeadersMiddleware adds response headers that reduce browser-side
+// framing, MIME-sniffing, and referrer leakage risks. HSTS is intentionally
+// omitted because this server may run behind plain HTTP in local deployments.
+func SecurityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		// Cover ServeMux redirects as well as handler responses for bearer pages,
+		// including paths with duplicate slashes or dot segments.
+		cleanPath := path.Clean(r.URL.Path)
+		if strings.HasPrefix(r.URL.Path, "/connect/") || cleanPath == "/connect" || strings.HasPrefix(cleanPath, "/connect/") {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/miniapp/") || cleanPath == "/api/miniapp" || strings.HasPrefix(cleanPath, "/api/miniapp/") {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+		}
+		if strings.HasPrefix(r.URL.Path, "/admin/") || cleanPath == "/admin" || strings.HasPrefix(cleanPath, "/admin/") {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// safeRequestPath accepts the decoded URL.Path, not a full URL. Keep ordinary
+// route diagnostics, but hide everything after a bearer-bearing route segment.
+// Inspect before path.Clean so dot segments cannot expose a discarded token.
+func safeRequestPath(requestPath string) string {
+	segments := strings.Split(requestPath, "/")
+	for i, segment := range segments {
+		switch segment {
+		case "sub", "connect", "i", "subscription-info":
+			if i+1 < len(segments) && strings.Join(segments[i+1:], "/") != "" {
+				return logger.Sanitize(strings.Join(segments[:i+1], "/") + "/[redacted]")
+			}
+		}
+	}
+	return logger.Sanitize(requestPath)
+}
+
+// BearerAuthMiddleware returns an HTTP middleware that enforces a Bearer token equal to expectedToken.
+// It bypasses authentication for OPTIONS requests. If the Authorization header is missing, does not start
+// with "Bearer ", or the extracted token does not match expectedToken, the middleware logs a warning with
+// the request path and method and responds with HTTP 401 and body "unauthorized". On a valid token it calls
+// the next handler.
+func BearerAuthMiddleware(expectedToken string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Fail closed: reject all requests if expectedToken is empty/whitespace (misconfiguration)
+			if strings.TrimSpace(expectedToken) == "" {
+				logger.Error("BearerAuthMiddleware misconfigured: empty expectedToken",
+					zap.String("path", safeRequestPath(r.URL.Path)),
+					zap.String("method", r.Method))
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+
+				return
+			}
+
+			// Skip auth for OPTIONS requests (CORS preflight)
+			if r.Method == http.MethodOptions {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// If no expected token is configured, reject all requests.
+			// An empty token is an invalid configuration — allowing access
+			// with an empty Bearer token would be a security hole.
+			if expectedToken == "" {
+				logger.Warn("No auth token configured, rejecting request",
+					zap.String("path", safeRequestPath(r.URL.Path)),
+					zap.String("method", r.Method))
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+
+				return
+			}
+
+			// Get Authorization header
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
+				logger.Warn("Missing Authorization header",
+					zap.String("path", safeRequestPath(r.URL.Path)),
+					zap.String("method", r.Method))
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+
+				return
+			}
+
+			// Check Bearer prefix
+			if !strings.HasPrefix(authHeader, "Bearer ") {
+				logger.Warn("Invalid Authorization header format",
+					zap.String("path", safeRequestPath(r.URL.Path)),
+					zap.String("method", r.Method))
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+
+				return
+			}
+
+			// Extract token
+			token := strings.TrimPrefix(authHeader, "Bearer ")
+			// Use constant-time comparison to prevent timing attacks
+			if subtle.ConstantTimeCompare([]byte(token), []byte(expectedToken)) != 1 {
+				logger.Warn("Invalid Bearer token",
+					zap.String("path", safeRequestPath(r.URL.Path)),
+					zap.String("method", r.Method))
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+
+				return
+			}
+
+			// Token is valid, proceed to next handler
+			next.ServeHTTP(w, r)
+		})
+	}
+}

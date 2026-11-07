@@ -1,0 +1,346 @@
+package bot
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"go.uber.org/zap"
+
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/logger"
+)
+
+// CommandHandler handles command updates: /start, /help, /invite and share_ links.
+type CommandHandler struct {
+	h *Handler
+}
+
+// NewCommandHandler creates a new CommandHandler with parent reference.
+func NewCommandHandler(parent *Handler) *CommandHandler {
+	return &CommandHandler{h: parent}
+}
+
+// HandleStart processes /start command.
+func (c *CommandHandler) HandleStart(ctx context.Context, update tgbotapi.Update) error {
+	ctxWithTimeout, cancel := c.h.withTimeout(ctx)
+	defer cancel()
+
+	ctx = ctxWithTimeout
+
+	if update.Message == nil {
+		logger.Error("HandleStart called with nil Message")
+		return fmt.Errorf("nil message")
+	}
+
+	if update.Message.From == nil {
+		logger.Error("HandleStart: Message.From is nil",
+			zap.Int64("chat_id", update.Message.Chat.ID))
+
+		return fmt.Errorf("nil from")
+	}
+
+	chatID := update.Message.Chat.ID
+	username := c.h.getUsername(update.Message.From)
+
+	// Every /start (also trial_/share_ deep links) is a warm-up contact.
+	c.h.recordWarmupContact(ctx, update.Message)
+
+	args := update.Message.CommandArguments()
+	if after, ok := strings.CutPrefix(args, "trial_"); ok {
+		return c.handleBindTrial(ctx, chatID, username, after)
+	}
+
+	if after, ok := strings.CutPrefix(args, "share_"); ok {
+		return c.handleShareStart(ctx, chatID, username, after)
+	}
+
+	logger.Info("User started bot", userFields(update.Message.From, chatID)...)
+
+	sub, err := c.h.db.GetByTelegramID(ctx, chatID)
+	hasSubscription := err == nil && sub != nil && sub.Status == string(database.SubscriptionStatusActive)
+
+	text, keyboard := c.h.getMainMenuContent(ctx, username, hasSubscription, chatID, sub)
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = &keyboard
+	c.h.send(ctx, msg)
+
+	return nil
+}
+
+// HandleMySub processes /mysub — shows the "Ваша подписка" window. There is
+// no message to edit (unlike the 🚀 Подписка button), so messageID=0 makes
+// handleMySubscription send a fresh message instead of editing an existing one.
+func (c *CommandHandler) HandleMySub(ctx context.Context, update tgbotapi.Update) error {
+	ctxWithTimeout, cancel := c.h.withTimeout(ctx)
+	defer cancel()
+
+	ctx = ctxWithTimeout
+
+	if update.Message == nil {
+		logger.Error("HandleMySub called with nil Message")
+		return fmt.Errorf("nil message")
+	}
+
+	if update.Message.From == nil {
+		logger.Error("HandleMySub: Message.From is nil",
+			zap.Int64("chat_id", update.Message.Chat.ID))
+
+		return fmt.Errorf("nil from")
+	}
+
+	chatID := update.Message.Chat.ID
+	username := c.h.getUsername(update.Message.From)
+
+	logger.Info("User checked subscription via /mysub",
+		zap.Int64("chat_id", chatID),
+		zap.String("username", username))
+
+	return c.h.handleMySubscription(ctx, chatID, username, 0)
+}
+
+// HandleHelp sends help message.
+func (c *CommandHandler) HandleHelp(ctx context.Context, update tgbotapi.Update) error {
+	ctxWithTimeout, cancel := c.h.withTimeout(ctx)
+	defer cancel()
+
+	ctx = ctxWithTimeout
+
+	if update.Message == nil {
+		logger.Error("HandleHelp called with nil Message")
+		return fmt.Errorf("nil message")
+	}
+
+	chatID := update.Message.Chat.ID
+
+	helpText := fmt.Sprintf(`📖 *Справка по командам бота*
+
+*Доступные команды:*
+/start - Начать работу с ботом
+/mysub - Показать информацию о подписке
+/help - Показать эту справку
+/invite - Получить реферальную ссылку
+
+*Функции бота:*
+📥 *Получить подписку* - Создать новую подписку или получить существующую
+📋 *Подписка* - Посмотреть информацию о текущей подписке
+
+*Технические детали:*
+🌍 Серверы и страны подписки подбирает администратор сервиса
+📱 Совместимость: V2Ray, Xray и другие клиенты с поддержкой подписок
+
+*Поддержка:*
+%s
+
+*Дополнительная информация:*
+- Состав серверов обновляется автоматически — обновите подписку в VPN-клиенте
+- Не передавайте ссылку на подписку третьим лицам
+- После окончания срока подписка перестаёт работать до продления`,
+		SupportText(c.h.cfg.ContactUsername),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, helpText)
+	msg.ParseMode = "Markdown"
+	c.h.send(ctx, msg)
+
+	return nil
+}
+
+// HandleInvite processes /invite command.
+func (c *CommandHandler) HandleInvite(ctx context.Context, update tgbotapi.Update) error {
+	ctxWithTimeout, cancel := c.h.withTimeout(ctx)
+	defer cancel()
+
+	ctx = ctxWithTimeout
+
+	if update.Message == nil {
+		logger.Error("HandleInvite called with nil Message")
+		return fmt.Errorf("nil message")
+	}
+
+	if update.Message.From == nil {
+		logger.Error("HandleInvite called with nil From")
+		return fmt.Errorf("nil from")
+	}
+
+	chatID := update.Message.Chat.ID
+	username := c.h.getUsername(update.Message.From)
+
+	logger.Info("User requested invite link",
+		zap.Int64("chat_id", chatID),
+		zap.String("username", username), zap.Int64("chat_id", chatID))
+
+	// Delegate to referral handler (no rate limit here)
+	err := c.h.referral.HandleInvite(ctx, chatID, username, 0)
+	if err != nil {
+		return fmt.Errorf("handle invite: %w", err)
+	}
+
+	return nil
+}
+
+// handleShareStart processes deep links: t.me/{bot}?start=share_{invite_code}
+func (c *CommandHandler) handleShareStart(ctx context.Context, chatID int64, username, inviteCode string) error {
+	logger.Info("User clicked share link",
+		zap.Int64("chat_id", chatID),
+		zap.String("username", username),
+		zap.String("invite_code", inviteCode))
+
+	// Check existing subscription
+	sub, err := c.h.db.GetByTelegramID(ctx, chatID)
+	hasSubscription := err == nil && sub != nil && sub.Status == string(database.SubscriptionStatusActive)
+
+	if hasSubscription {
+		logger.Info("User with existing subscription clicked share link, ignoring",
+			zap.Int64("chat_id", chatID),
+			zap.String("invite_code", inviteCode))
+
+		text, keyboard := c.h.getMainMenuContent(ctx, username, true, chatID, sub)
+		msg := tgbotapi.NewMessage(chatID, text)
+		msg.ReplyMarkup = &keyboard
+		c.h.send(ctx, msg)
+
+		return nil
+	}
+
+	// Validate invite code
+	invite, err := c.h.db.GetInviteByCode(ctx, inviteCode)
+	if err != nil {
+		if errors.Is(err, database.ErrInviteNotFound) {
+			logger.Warn("Invalid invite code in share link",
+				zap.String("invite_code", inviteCode),
+				zap.Error(err))
+
+			text, keyboard := c.h.getMainMenuContent(ctx, username, false, chatID, nil)
+			msg := tgbotapi.NewMessage(chatID, text)
+			msg.ReplyMarkup = &keyboard
+			c.h.send(ctx, msg)
+
+			return nil
+		}
+		// Infra error (DB down, etc) — log full, do not treat as "invalid code"
+		logger.Error("Failed to validate invite code (infrastructure error)",
+			zap.String("invite_code", inviteCode),
+			zap.Error(err))
+
+		text, keyboard := c.h.getMainMenuContent(ctx, username, false, chatID, nil)
+		msg := tgbotapi.NewMessage(chatID, text)
+		msg.ReplyMarkup = &keyboard
+		c.h.send(ctx, msg)
+
+		return fmt.Errorf("get invite by code: %w", err)
+	}
+
+	// Cache invite code for 60 minutes for later reward
+	c.h.pendingMu.Lock()
+	c.h.pendingInvites[chatID] = pendingInvite{
+		code:      inviteCode,
+		expiresAt: time.Now().Add(60 * time.Minute),
+	}
+	c.h.pendingMu.Unlock()
+
+	logger.Info("Share invite code cached",
+		zap.Int64("chat_id", chatID),
+		zap.String("invite_code", inviteCode),
+		zap.Int64("referrer_tg_id", invite.ReferrerTGID))
+
+	text := fmt.Sprintf(
+		"🎉 Вас пригласили!\n\n" +
+			"Нажмите кнопку ниже, чтобы получить подписку и активировать реферальное подключение.",
+	)
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📥 Получить подписку", "create_subscription"),
+		),
+	)
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = &keyboard
+	c.h.send(ctx, msg)
+
+	return nil
+}
+
+// handleBindTrial binds a trial subscription from a deep link.
+func (c *CommandHandler) handleBindTrial(ctx context.Context, chatID int64, username, subscriptionID string) error {
+	ctxWithTimeout, cancel := c.h.withTimeout(ctx)
+	defer cancel()
+
+	ctx = ctxWithTimeout
+
+	logger.Info("User binding trial subscription",
+		zap.Int64("chat_id", chatID),
+		zap.String("username", username),
+		zap.String("subscription_id", subscriptionID))
+
+	// Check existing subscription — only truly active ones block trial bind (expired/cancelled allow re-trial)
+	existing, err := c.h.db.GetByTelegramID(ctx, chatID)
+	if err != nil && !errors.Is(err, database.ErrSubscriptionNotFound) {
+		return fmt.Errorf("get existing subscription: %w", err)
+	}
+
+	if err == nil && existing != nil && existing.IsActive() {
+		logger.Warn("User already has active subscription, skipping trial bind",
+			zap.Int64("chat_id", chatID),
+			zap.String("existing_sub_id", existing.SubscriptionID))
+		c.h.SendMessage(ctx, chatID, "❌ У вас уже есть активная подписка. Используйте /start для управления.")
+
+		return nil
+	}
+
+	sub, err := c.h.subscriptionService.BindTrial(ctx, subscriptionID, chatID, username)
+	if err != nil {
+		logger.Error("Failed to bind trial subscription",
+			zap.Error(err),
+			zap.Int64("chat_id", chatID))
+		c.h.SendMessage(ctx, chatID, "❌ Не удалось активировать подписку. Возможно, ссылка уже была использована.")
+
+		return fmt.Errorf("bind trial: %w", err)
+	}
+
+	logger.Info("Trial subscription bound successfully",
+		zap.Int64("chat_id", chatID),
+		zap.String("subscription_id", subscriptionID))
+
+	c.h.invalidateCache(ctx, chatID)
+	c.h.SendMessage(ctx, chatID, "✅ Подписка активирована!\n\nДобро пожаловать!\n\nИспользуйте /start для работы с ботом.")
+
+	// Admin notification
+	if c.h.cfg.TelegramAdminID > 0 {
+		if sub.InviteCode != nil {
+			invite, err := c.h.db.GetInviteByCode(ctx, *sub.InviteCode)
+			if err != nil {
+				logger.Warn("Failed to get invite for admin notification", zap.Error(err))
+			} else if invite != nil {
+				c.h.SendMessage(ctx, c.h.cfg.TelegramAdminID,
+					fmt.Sprintf("🔔 Новый пользователь активировал подписку по реферационной ссылке!\n\n- Username: @%s\n- Telegram ID: %d\n- Пригласил: %d",
+						username, chatID, invite.ReferrerTGID))
+			}
+		}
+	}
+
+	// Notify referrer
+	referredBy := int64(0)
+	if sub.ReferredBy != nil {
+		referredBy = *sub.ReferredBy
+	}
+
+	if referredBy > 0 {
+		referrerMsg := fmt.Sprintf("🎉 По вашей ссылке новый пользователь @%s активировал подписку!", username)
+
+		msg := tgbotapi.NewMessage(referredBy, referrerMsg)
+
+		err := c.h.sendWithError(ctx, msg)
+		if err != nil {
+			logger.Warn("Failed to notify referrer", zap.Int64("referrer_id", referredBy), zap.Error(err))
+		} else {
+			logger.Info("Referrer notified", zap.Int64("referrer_id", referredBy))
+		}
+
+		c.h.IncrementReferralCount(referredBy)
+	}
+
+	return nil
+}

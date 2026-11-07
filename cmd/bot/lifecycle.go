@@ -1,0 +1,243 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/bot"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/logger"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/metrics"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/netmon"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/service"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/service/payment/platega"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/subserver"
+
+	"github.com/getsentry/sentry-go"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"go.uber.org/zap"
+)
+
+// initSentry initializes Sentry error tracking if DSN is configured.
+func initSentry(cfg *config.Config) {
+	logger.RegisterSecrets(cfg.TelegramBotToken, cfg.PlategaSecret)
+	if cfg.SentryDSN == "" {
+		return
+	}
+
+	err := sentry.Init(sentry.ClientOptions{
+		Dsn:              cfg.SentryDSN,
+		Environment:      "production",
+		Release:          getVersion(),
+		TracesSampleRate: logger.SentryTracesSampleRate,
+		BeforeSend:       logger.SanitizeSentryEvent,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize Sentry: %v\n", err)
+		return
+	}
+
+	fmt.Fprintln(os.Stderr, "Sentry error tracking initialized")
+}
+
+// initLogger initializes the logger and redirects stdlib log output.
+// Returns the log service for deferred cleanup.
+func initLogger(cfg *config.Config) (*logger.Service, error) {
+	logger.RegisterSecrets(cfg.TelegramBotToken, cfg.PlategaSecret)
+	logService, err := logger.Init(cfg.LogFilePath, cfg.LogLevel)
+	if err != nil {
+		return nil, fmt.Errorf("initialize logger: %w", err)
+	}
+
+	logger.RedirectStdLog()
+	logger.Info("Starting bot",
+		zap.String("version", getVersion()),
+		zap.String("built", buildTime))
+	logger.Info("Configuration loaded", zap.String("config", cfg.String()))
+
+	return logService, nil
+}
+
+// initDatabase initializes the database service. Startup needs no VPN nodes:
+// subscriptions are served by builders from provider sources.
+func initDatabase(cfg *config.Config) (*database.Service, error) {
+	dbService, err := database.NewService(cfg.DatabasePath)
+	if err != nil {
+		return nil, fmt.Errorf("initialize database: %w", err)
+	}
+
+	metrics.RegisterDBMetrics(dbService.GetDB())
+
+	return dbService, nil
+}
+
+type appServices struct {
+	subService     *service.SubscriptionService
+	subServer      *subserver.Service
+	handler        *bot.Handler
+	orderService   *service.OrderService
+	adminService   *service.AdminService
+	builderService *service.BuilderService
+	netMonitor     *netmon.Service
+}
+
+// newNetworkMonitor wires the network monitor with the /sub builder pipeline
+// (subserver.ResolveMonitorBuilders) and the handshake prober. It is created
+// even when NETMON_ENABLED=false so the admin page still shows history; only
+// the background worker is gated by the flag.
+func newNetworkMonitor(cfg *config.Config, dbService *database.Service) *netmon.Service {
+	resolve := func(ctx context.Context, builders []database.SubscriptionBuilder) ([]subserver.MonitorBuilder, error) {
+		return subserver.ResolveMonitorBuilders(ctx, dbService, builders)
+	}
+	timeout := time.Duration(cfg.NetMonTimeout) * time.Second
+	return netmon.New(dbService, resolve, netmon.NetProber{Timeout: timeout}, netmon.Config{
+		Enabled:     cfg.NetMonEnabled,
+		Interval:    time.Duration(cfg.NetMonInterval) * time.Second,
+		Timeout:     timeout,
+		Refresh:     time.Duration(cfg.NetMonRefresh) * time.Second,
+		Concurrency: cfg.NetMonConcurrency,
+		DownAfter:   cfg.NetMonDownAfter,
+	})
+}
+
+// initServices wires the subscription service, subserver, bot handler,
+// and cache invalidation composition.
+func initServices(cfg *config.Config, dbService *database.Service, botAPI *tgbotapi.BotAPI, botConfig *bot.BotConfig) *appServices {
+	subService := service.NewSubscriptionService(dbService, cfg)
+	subService.SetBot(botAPI)
+	// Admin-editable trial (Admin → «Тарифы» → «Пробная подписка»); without a
+	// stored configuration the environment trial values keep applying.
+	subService.SetTrialPolicy(dbService)
+
+	subServer := subserver.NewService(config.SubServerCacheTTL)
+	handler := bot.NewHandler(botAPI, cfg, dbService, botConfig, subService, getVersion())
+	botCache := handler.Cache()
+
+	subService.SetInvalidateBySubIDFunc(func(subID string) {
+		botCache.InvalidateBySubID(subID)
+		subServer.InvalidateCache(subID)
+	})
+
+	var payment service.PaymentProvider
+	if cfg.PaymentEnabled {
+		payment = platega.New(platega.Config{MerchantID: cfg.PlategaMerchantID, Secret: cfg.PlategaSecret})
+	}
+
+	orderService := service.NewOrderService(dbService, subService, payment, "", cfg)
+	handler.SetOrderService(orderService)
+	adminService := service.NewAdminService(dbService, subService)
+	builderService := service.NewBuilderService(dbService)
+	// Source catalogue sync fetches and parses on the server with the /sub parser.
+	builderService.SetCatalogueFetcher(func(ctx context.Context, src database.ProviderSource) (*service.FetchedCatalogue, error) {
+		c, err := subserver.FetchSourceCatalogue(ctx, src)
+		if err != nil {
+			return nil, err
+		}
+		return &service.FetchedCatalogue{Format: c.Format, Entries: c.Entries, Skipped: c.Skipped, Duplicates: c.Duplicates}, nil
+	})
+
+	return &appServices{
+		subService: subService, subServer: subServer, handler: handler, orderService: orderService,
+		adminService: adminService, builderService: builderService, netMonitor: newNetworkMonitor(cfg, dbService),
+	}
+}
+
+// runEventLoop processes Telegram updates with bounded concurrency until
+// the shutdown context is cancelled. Blocks until all in-flight handlers
+// complete or the shutdown timeout elapses.
+func runEventLoop(ctx context.Context, botAPI *tgbotapi.BotAPI, handler *bot.Handler, updates tgbotapi.UpdatesChannel) {
+	updateSem := make(chan struct{}, config.MaxConcurrentHandlers)
+
+	var updatesWg sync.WaitGroup
+
+eventLoop:
+	for {
+		select {
+		case update, ok := <-updates:
+			if !ok {
+				logger.Info("Telegram updates channel closed")
+				break eventLoop
+			}
+
+			select {
+			case updateSem <- struct{}{}:
+				updatesWg.Add(1)
+
+				go func(u tgbotapi.Update) {
+					defer func() {
+						<-updateSem
+						updatesWg.Done()
+					}()
+
+					handleUpdateSafely(ctx, handler, u)
+				}(update)
+			case <-ctx.Done():
+				logger.Info("Graceful shutdown initiated, draining updates...")
+				break eventLoop
+			}
+
+		case <-ctx.Done():
+			break eventLoop
+		}
+	}
+
+	logger.Info("Graceful shutdown initiated")
+	botAPI.StopReceivingUpdates()
+
+	// Drain the updates channel to prevent goroutine leak. StopReceivingUpdates
+	// closes the channel (via the polling goroutine on shutdownChannel), so a
+	// plain range exits once the buffered updates are exhausted.
+	go func() {
+		for range updates {
+		}
+	}()
+
+	// Wait for in-flight update handlers to complete
+	logger.Info("Waiting for update handlers to complete...")
+
+	done := make(chan struct{})
+
+	go func() {
+		updatesWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		logger.Info("All update handlers completed successfully")
+	case <-time.After(config.ShutdownTimeout):
+		logger.Warn("Timeout waiting for update handlers to complete")
+	}
+}
+
+// gracefulShutdown stops background workers and handler goroutines with timeouts.
+// subServer.Stop() (cache drop) runs first so revoked/updated subs stop being
+// served before we wait on workers; web server drain remains via its own defer.
+func gracefulShutdown(bgWg *sync.WaitGroup, handler *bot.Handler, subServer *subserver.Service) {
+	subServer.Stop()
+
+	logger.Info("Waiting for background tasks to stop...")
+
+	bgDone := make(chan struct{})
+
+	go func() {
+		bgWg.Wait()
+		close(bgDone)
+	}()
+
+	select {
+	case <-bgDone:
+		logger.Info("All background tasks stopped successfully")
+	case <-time.After(config.ShutdownTimeout):
+		logger.Warn("Timeout waiting for background tasks to stop")
+	}
+
+	logger.Info("Waiting for handler background goroutines...")
+	handler.WaitForBackgroundGoroutines()
+	logger.Info("Handler background goroutines stopped")
+	logger.Info("Bot stopped successfully")
+}

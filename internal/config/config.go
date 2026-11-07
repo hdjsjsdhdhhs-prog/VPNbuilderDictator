@@ -1,0 +1,403 @@
+// Package config loads, validates, and presents application configuration.
+package config
+
+import (
+	"fmt"
+	"net/url"
+	"strings"
+
+	"github.com/google/uuid"
+	flag "github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/flag"
+)
+
+// Config holds all configuration for the application.
+// All fields are validated before use.
+type Config struct {
+	// Browser administrator credentials. Never include these in String/logs.
+	AdminUsername     string
+	AdminPasswordHash string
+
+	// Telegram configuration
+	TelegramBotToken string
+	TelegramAdminID  int64
+
+	// Database configuration
+	DatabasePath string
+
+	// Logging configuration
+	LogFilePath string
+	LogLevel    string
+
+	// Monitoring configuration
+	HeartbeatURL      string
+	HeartbeatInterval int
+
+	// Error tracking
+	SentryDSN string
+
+	// Health check configuration
+	WebServerPort int
+
+	// Trial & Referral configuration
+	SiteURL            string
+	TrialDurationHours int
+	TrialRateLimit     int
+
+	// Contact configuration
+	ContactUsername string
+
+	// Donation configuration
+	DonateCardNumber string
+	DonateURL        string
+	// DonateEnabled controls whether the "☕ Донат" button is shown in the main menu.
+	// Defaults to true (preserves historical behaviour).
+	DonateEnabled bool
+	// Subscription server configuration
+	GlobalSubURL           string
+	SubServerAccessLogPath string
+
+	// Payment configuration
+	PaymentEnabled    bool
+	PaymentProvider   string
+	PlategaMerchantID string
+	PlategaSecret     string
+
+	// Network monitor ("Мониторинг"): handshake checks of builder servers.
+	NetMonEnabled     bool
+	NetMonInterval    int // seconds between check rounds
+	NetMonTimeout     int // seconds per probe
+	NetMonRefresh     int // seconds between builder re-resolutions
+	NetMonConcurrency int // probes in flight
+	NetMonDownAfter   int // consecutive failures before DOWN
+}
+
+// configFlags holds typed flag values for config fields.
+type configFlags struct {
+	adminUsername          *flag.StringValue
+	adminPasswordHash      *flag.StringValue
+	telegramBotToken       *flag.StringValue
+	telegramAdminID        *flag.Int64Value
+	databasePath           *flag.StringValue
+	logFilePath            *flag.StringValue
+	logLevel               *flag.StringValue
+	heartbeatURL           *flag.StringValue
+	heartbeatInterval      *flag.IntValue
+	sentryDSN              *flag.StringValue
+	webServerPort          *flag.IntValue
+	siteURL                *flag.StringValue
+	trialDurationHours     *flag.IntValue
+	trialRateLimit         *flag.IntValue
+	contactUsername        *flag.StringValue
+	donateCardNumber       *flag.StringValue
+	donateURL              *flag.StringValue
+	donateEnabled          *flag.BoolValue
+	globalSubURL           *flag.StringValue
+	subServerAccessLogPath *flag.StringValue
+	paymentEnabled         *flag.BoolValue
+	paymentProvider        *flag.StringValue
+	plategaMerchantID      *flag.StringValue
+	plategaSecret          *flag.StringValue
+	netMonEnabled          *flag.BoolValue
+	netMonInterval         *flag.IntValue
+	netMonTimeout          *flag.IntValue
+	netMonRefresh          *flag.IntValue
+	netMonConcurrency      *flag.IntValue
+	netMonDownAfter        *flag.IntValue
+}
+
+// registerFlags creates a new flag.Registry and initializes a configFlags instance with defaults,
+// registering each configuration entry under its corresponding environment variable name.
+// It returns the registry and the populated configFlags.
+func registerFlags() (*flag.Registry, *configFlags) {
+	r := flag.New()
+	f := &configFlags{
+		adminUsername: flag.NewString(""), adminPasswordHash: flag.NewString(""),
+		telegramBotToken: flag.NewString(""), telegramAdminID: flag.NewInt64(0),
+		databasePath: flag.NewString(DefaultDatabasePath), logFilePath: flag.NewString(DefaultLogFilePath),
+		logLevel: flag.NewString(DefaultLogLevel), heartbeatURL: flag.NewString(""),
+		heartbeatInterval: flag.NewInt(DefaultHeartbeatInterval), sentryDSN: flag.NewString(""),
+		webServerPort: flag.NewInt(DefaultWebServerPort), siteURL: flag.NewString(DefaultSiteURL),
+		trialDurationHours: flag.NewInt(DefaultTrialDurationHours), trialRateLimit: flag.NewInt(DefaultTrialRateLimit),
+		contactUsername: flag.NewString(ContactUsername), donateCardNumber: flag.NewString(DonateCardNumber),
+		donateURL: flag.NewString(DonateURL), donateEnabled: flag.NewBool(DefaultDonateEnabled),
+		globalSubURL: flag.NewString(""), subServerAccessLogPath: flag.NewString(""),
+		paymentEnabled: flag.NewBool(false), paymentProvider: flag.NewString("platega"), plategaMerchantID: flag.NewString(""), plategaSecret: flag.NewString(""),
+		netMonEnabled: flag.NewBool(DefaultNetMonEnabled), netMonInterval: flag.NewInt(DefaultNetMonInterval),
+		netMonTimeout: flag.NewInt(DefaultNetMonTimeout), netMonRefresh: flag.NewInt(DefaultNetMonRefresh),
+		netMonConcurrency: flag.NewInt(DefaultNetMonConcurrency), netMonDownAfter: flag.NewInt(DefaultNetMonDownAfter),
+	}
+	r.Register("ADMIN_USERNAME", f.adminUsername)
+	r.Register("ADMIN_PASSWORD_HASH", f.adminPasswordHash)
+	r.Register("TELEGRAM_BOT_TOKEN", f.telegramBotToken)
+	r.Register("TELEGRAM_ADMIN_ID", f.telegramAdminID)
+	r.Register("GLOBAL_SUB_URL", f.globalSubURL)
+	r.Register("DATABASE_PATH", f.databasePath)
+	r.Register("LOG_FILE_PATH", f.logFilePath)
+	r.Register("LOG_LEVEL", f.logLevel)
+	r.Register("HEARTBEAT_URL", f.heartbeatURL)
+	r.Register("HEARTBEAT_INTERVAL", f.heartbeatInterval)
+	r.Register("SENTRY_DSN", f.sentryDSN)
+	r.Register("WEB_SERVER_PORT", f.webServerPort)
+	r.Register("SITE_URL", f.siteURL)
+	r.Register("TRIAL_DURATION_HOURS", f.trialDurationHours)
+	r.Register("TRIAL_RATE_LIMIT", f.trialRateLimit)
+	r.Register("CONTACT_USERNAME", f.contactUsername)
+	r.Register("DONATE_CARD_NUMBER", f.donateCardNumber)
+	r.Register("DONATE_URL", f.donateURL)
+	r.Register("DONATE_ENABLED", f.donateEnabled)
+	r.Register("SUBSERVER_ACCESS_LOG", f.subServerAccessLogPath)
+	r.Register("PAYMENT_ENABLED", f.paymentEnabled)
+	r.Register("PAYMENT_PROVIDER", f.paymentProvider)
+	r.Register("PLATEGA_MERCHANT_ID", f.plategaMerchantID)
+	r.Register("PLATEGA_SECRET", f.plategaSecret)
+	r.Register("NETMON_ENABLED", f.netMonEnabled)
+	r.Register("NETMON_INTERVAL", f.netMonInterval)
+	r.Register("NETMON_TIMEOUT", f.netMonTimeout)
+	r.Register("NETMON_REFRESH", f.netMonRefresh)
+	r.Register("NETMON_CONCURRENCY", f.netMonConcurrency)
+	r.Register("NETMON_DOWN_AFTER", f.netMonDownAfter)
+
+	return r, f
+}
+
+// Load reads configuration from environment variables and validates it.
+// Load loads configuration from environment variables, constructs a Config from the parsed flag values, and validates it.
+// It returns the validated Config on success or an error if environment loading or validation fails.
+func Load() (*Config, error) {
+	r, f := registerFlags()
+
+	err := r.LoadEnv()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load configuration: %w", err)
+	}
+
+	cfg := &Config{
+		AdminUsername: f.adminUsername.Get(), AdminPasswordHash: f.adminPasswordHash.Get(),
+		TelegramBotToken: f.telegramBotToken.Get(), TelegramAdminID: f.telegramAdminID.Get(),
+		DatabasePath: f.databasePath.Get(), LogFilePath: f.logFilePath.Get(), LogLevel: f.logLevel.Get(),
+		HeartbeatURL: f.heartbeatURL.Get(), HeartbeatInterval: f.heartbeatInterval.Get(), SentryDSN: f.sentryDSN.Get(),
+		WebServerPort: f.webServerPort.Get(), SiteURL: f.siteURL.Get(),
+		TrialDurationHours: f.trialDurationHours.Get(), TrialRateLimit: f.trialRateLimit.Get(),
+		ContactUsername: f.contactUsername.Get(), DonateCardNumber: f.donateCardNumber.Get(), DonateURL: f.donateURL.Get(),
+		DonateEnabled: f.donateEnabled.Get(), GlobalSubURL: f.globalSubURL.Get(),
+		SubServerAccessLogPath: f.subServerAccessLogPath.Get(),
+		PaymentEnabled:         f.paymentEnabled.Get(), PaymentProvider: f.paymentProvider.Get(),
+		PlategaMerchantID: f.plategaMerchantID.Get(), PlategaSecret: f.plategaSecret.Get(),
+		NetMonEnabled: f.netMonEnabled.Get(), NetMonInterval: f.netMonInterval.Get(), NetMonTimeout: f.netMonTimeout.Get(),
+		NetMonRefresh: f.netMonRefresh.Get(), NetMonConcurrency: f.netMonConcurrency.Get(), NetMonDownAfter: f.netMonDownAfter.Get(),
+	}
+	// Validate all required fields
+	err = cfg.validate()
+	if err != nil {
+		return nil, fmt.Errorf("configuration validation failed: %w", err)
+	}
+
+	return cfg, nil
+}
+
+// validate checks that all configuration values are valid.
+func (c *Config) validate() error {
+	if _, _, err := c.AdminConfiguration(); err != nil {
+		return err
+	}
+	// Telegram validation
+	if c.TelegramBotToken == "" {
+		return fmt.Errorf("TELEGRAM_BOT_TOKEN is required")
+	}
+
+	if !strings.Contains(c.TelegramBotToken, ":") {
+		return fmt.Errorf("TELEGRAM_BOT_TOKEN appears to be invalid (expected format: 'number:token')")
+	}
+
+	if c.TelegramAdminID <= 0 {
+		return fmt.Errorf("TELEGRAM_ADMIN_ID must be positive")
+	}
+
+	// Heartbeat validation
+	if c.HeartbeatInterval < MinHeartbeatInterval {
+		return fmt.Errorf("HEARTBEAT_INTERVAL must be at least %d seconds", MinHeartbeatInterval)
+	}
+
+	// Health check port validation
+	if c.WebServerPort < 1 || c.WebServerPort > 65535 {
+		return fmt.Errorf("WEB_SERVER_PORT must be between 1 and 65535")
+	}
+
+	// Log level validation
+	validLogLevels := map[string]bool{
+		"debug": true,
+		"info":  true,
+		"warn":  true,
+		"error": true,
+	}
+	if !validLogLevels[strings.ToLower(c.LogLevel)] {
+		return fmt.Errorf("LOG_LEVEL must be one of: debug, info, warn, error")
+	}
+
+	// Sentry DSN validation (optional but if provided, should be valid URL)
+	if c.SentryDSN != "" {
+		err := c.validateURL("SENTRY_DSN", c.SentryDSN)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Heartbeat URL validation (optional but if provided, should be valid URL)
+	if c.HeartbeatURL != "" {
+		err := c.validateURL("HEARTBEAT_URL", c.HeartbeatURL)
+		if err != nil {
+			return err
+		}
+	}
+
+	if c.PaymentEnabled {
+		if c.PaymentProvider != "platega" {
+			return fmt.Errorf("PAYMENT_PROVIDER must be platega when PAYMENT_ENABLED=true")
+		}
+
+		if strings.TrimSpace(c.PlategaMerchantID) == "" || strings.TrimSpace(c.PlategaSecret) == "" {
+			return fmt.Errorf("PLATEGA_MERCHANT_ID and PLATEGA_SECRET are required when PAYMENT_ENABLED=true")
+		}
+
+		_, err := uuid.Parse(strings.TrimSpace(c.PlategaMerchantID))
+		if err != nil {
+			return fmt.Errorf("PLATEGA_MERCHANT_ID must be a UUID: %w", err)
+		}
+	}
+	// Global subscription URL validation (required)
+	if c.GlobalSubURL == "" {
+		return fmt.Errorf("GLOBAL_SUB_URL is required")
+	}
+
+	err := c.validateURL("GLOBAL_SUB_URL", c.GlobalSubURL)
+	if err != nil {
+		return err
+	}
+
+	c.GlobalSubURL = strings.TrimRight(c.GlobalSubURL, "/") + "/"
+
+	// Site URL validation
+	err = c.validateURL("SITE_URL", c.SiteURL)
+	if err != nil {
+		return err
+	}
+
+	// Trial duration validation
+	if c.TrialDurationHours < 1 || c.TrialDurationHours > 168 {
+		return fmt.Errorf("TRIAL_DURATION_HOURS must be between 1 and 168 (max 7 days)")
+	}
+
+	// Trial rate limit validation
+	if c.TrialRateLimit < 1 || c.TrialRateLimit > 100 {
+		return fmt.Errorf("TRIAL_RATE_LIMIT must be between 1 and 100")
+	}
+
+	return c.validateNetMon()
+}
+
+// validateNetMon checks the network monitor settings. They are validated
+// even when the monitor is disabled so enabling it later cannot fail. A zero
+// value means "not set" and takes the default; any other value is checked.
+func (c *Config) validateNetMon() error {
+	defaultInt(&c.NetMonInterval, DefaultNetMonInterval)
+	defaultInt(&c.NetMonTimeout, DefaultNetMonTimeout)
+	defaultInt(&c.NetMonRefresh, DefaultNetMonRefresh)
+	defaultInt(&c.NetMonConcurrency, DefaultNetMonConcurrency)
+	defaultInt(&c.NetMonDownAfter, DefaultNetMonDownAfter)
+	if c.NetMonInterval < MinNetMonInterval {
+		return fmt.Errorf("NETMON_INTERVAL must be at least %d seconds", MinNetMonInterval)
+	}
+	if c.NetMonTimeout < 1 || c.NetMonTimeout > MaxNetMonTimeout {
+		return fmt.Errorf("NETMON_TIMEOUT must be between 1 and %d seconds", MaxNetMonTimeout)
+	}
+	if c.NetMonTimeout >= c.NetMonInterval {
+		return fmt.Errorf("NETMON_TIMEOUT must be shorter than NETMON_INTERVAL")
+	}
+	if c.NetMonRefresh < MinNetMonRefresh {
+		return fmt.Errorf("NETMON_REFRESH must be at least %d seconds", MinNetMonRefresh)
+	}
+	if c.NetMonConcurrency < 1 || c.NetMonConcurrency > MaxNetMonConcurrency {
+		return fmt.Errorf("NETMON_CONCURRENCY must be between 1 and %d", MaxNetMonConcurrency)
+	}
+	if c.NetMonDownAfter < 1 || c.NetMonDownAfter > MaxNetMonDownAfter {
+		return fmt.Errorf("NETMON_DOWN_AFTER must be between 1 and %d", MaxNetMonDownAfter)
+	}
+	return nil
+}
+
+func defaultInt(v *int, def int) {
+	if *v == 0 {
+		*v = def
+	}
+}
+
+// validateURL checks if a URL string is valid.
+func (c *Config) validateURL(name, value string) error {
+	u, err := url.Parse(value)
+	if err != nil {
+		return fmt.Errorf("%s is not a valid URL: %w", name, err)
+	}
+
+	// Check that scheme is present and allowed
+	switch u.Scheme {
+	case "http", "https":
+		// allowed
+	default:
+		return fmt.Errorf("%s must use http or https scheme", name)
+	}
+
+	// Check that host is present
+	if u.Host == "" {
+		return fmt.Errorf("%s must include a host", name)
+	}
+
+	return nil
+}
+
+// String returns a safe string representation of the config (without sensitive data).
+func (c *Config) String() string {
+	return fmt.Sprintf("Config{"+
+		"TelegramBotToken=***, "+
+		"TelegramAdminID=%d, "+
+		"DatabasePath=%s, "+
+		"LogFilePath=%s, "+
+		"LogLevel=%s, "+
+		"HeartbeatURL=%s, "+
+		"HeartbeatInterval=%d, "+
+		"GlobalSubURL=%s, "+
+		"SentryDSN=***, "+
+		"}",
+		c.TelegramAdminID,
+		c.DatabasePath,
+		c.LogFilePath,
+		c.LogLevel,
+		maskURL(c.HeartbeatURL),
+		c.HeartbeatInterval,
+		maskURL(c.GlobalSubURL),
+	)
+}
+
+// SubURL builds a full subscription URL from its public bearer token.
+func (c *Config) SubURL(token string) string {
+	u, err := url.JoinPath(c.GlobalSubURL, token)
+	if err != nil {
+		return c.GlobalSubURL + token
+	}
+
+	return u
+}
+
+// maskURL returns a masked version of a URL for logging purposes.
+func maskURL(urlStr string) string {
+	if urlStr == "" {
+		return "(not set)"
+	}
+
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return "***"
+	}
+
+	// Show scheme and host only
+	return fmt.Sprintf("%s://%s/***", u.Scheme, u.Host)
+}

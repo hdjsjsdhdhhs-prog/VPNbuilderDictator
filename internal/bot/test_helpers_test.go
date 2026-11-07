@@ -1,0 +1,103 @@
+package bot
+
+import (
+	"context"
+	"testing"
+
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/service"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/testutil"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+)
+
+// newTestAdminHandler creates a Handler with admin config and a stub SubscriptionService
+// wired to the provided mock objects. Eliminates repeated NewHandler + subscriptionService
+// assignment across admin tests.
+func newTestAdminHandler(cfg *config.Config, mockDB *testutil.DatabaseService, mockBot *testutil.BotAPI) *Handler {
+	h := NewHandler(mockBot, cfg, mockDB, NewTestBotConfig(), nil, "")
+	h.subscriptionService = service.NewSubscriptionService(mockDB, cfg)
+	h.subscriptionService.SetInvalidateFunc(h.cache.Invalidate)
+
+	return h
+}
+
+// createTextUpdate creates a tgbotapi.Update with a plain (non-command) text message.
+func createTextUpdate(fromUser *tgbotapi.User, text string) tgbotapi.Update {
+	return tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: fromUser.ID},
+			From: fromUser,
+			Text: text,
+		},
+	}
+}
+
+// text string, fromUser *tgbotapi.User and return tgbotapi.Update.
+func createCommandUpdate(messageID int64, fromUser *tgbotapi.User, text string) tgbotapi.Update {
+	cmdLen := 0
+
+	for _, ch := range text {
+		if ch == ' ' {
+			break
+		}
+
+		if ch == '/' {
+			cmdLen = 0
+		}
+
+		cmdLen++
+	}
+
+	if cmdLen == 0 {
+		cmdLen = len(text)
+	}
+
+	entities := []tgbotapi.MessageEntity{}
+	if cmdLen > 0 && len(text) > 0 && text[0] == '/' {
+		entities = append(entities, tgbotapi.MessageEntity{
+			Type:   "bot_command",
+			Offset: 0,
+			Length: cmdLen,
+		})
+	}
+
+	return tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat:     &tgbotapi.Chat{ID: fromUser.ID},
+			From:     fromUser,
+			Text:     text,
+			Entities: entities,
+		},
+	}
+}
+
+// newTestHandlerWithSubService creates a Handler with a stub SubscriptionService
+// wired from the provided mock DB. Falls back to fresh mocks when nil.
+func newTestHandlerWithSubService(t *testing.T, cfg *config.Config, mockDB *testutil.DatabaseService, mockBot *testutil.BotAPI) *Handler {
+	t.Helper()
+
+	if cfg == nil {
+		cfg = &config.Config{TelegramAdminID: 123456}
+	}
+
+	if mockDB == nil {
+		mockDB = testutil.NewDatabaseService()
+	}
+
+	if mockBot == nil {
+		mockBot = testutil.NewBotAPI()
+	}
+
+	if mockDB.GetTrialSubscriptionBySubIDFunc == nil {
+		mockDB.GetTrialSubscriptionBySubIDFunc = func(_ context.Context, subscriptionID string) (*database.Subscription, error) {
+			inviteCode := subscriptionID
+			return &database.Subscription{SubscriptionID: subscriptionID, InviteCode: &inviteCode}, nil
+		}
+	}
+
+	subService := service.NewSubscriptionService(mockDB, cfg)
+
+	return NewHandler(mockBot, cfg, mockDB, NewTestBotConfig(), subService, "")
+}

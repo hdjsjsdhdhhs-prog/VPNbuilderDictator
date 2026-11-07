@@ -1,0 +1,340 @@
+import type { Offer, Order, Subscription } from './api';
+import { catalogOrder, errorText } from './api';
+import type { Store, Resource } from './store';
+import { safeHTTPS } from './telegram';
+import type { WebApp } from './telegram';
+import type { Choice } from './vpnapps';
+import { choose, connectPageLink, detectPlatform, loadChoice, platformLabel, saveChoice } from './vpnapps';
+import { appList, appName, choiceSummary, downloadButtons, enableSteps, isBestEffort, platformSwitch } from './picker';
+
+export function el<K extends keyof HTMLElementTagNameMap>(tag: K, className = '', text?: string): HTMLElementTagNameMap[K] {
+  const node = document.createElement(tag);
+  node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+function button(text: string, action: () => void, secondary = false, disabled = false) {
+  const node = el('button', secondary ? 'button secondary' : 'button', text);
+  node.type = 'button'; node.disabled = disabled; node.addEventListener('click', action);
+  return node;
+}
+function go(route: string) { window.location.hash = route; }
+function link(text: string, route: string, secondary = false) {
+  const node = el('a', secondary ? 'button secondary' : 'button', text); node.href = `#${route}`; return node;
+}
+function heading(title: string, subtitle: string) {
+  const node = el('div', 'section-heading'); node.append(el('h1', '', title), el('p', 'muted', subtitle)); return node;
+}
+function message(title: string, text: string, tone = '') {
+  const node = el('section', `card message ${tone}`); node.append(el('h2', '', title), el('p', 'muted', text)); return node;
+}
+function errorCard(error: unknown, retry: () => void) {
+  const node = message('Не получилось загрузить', errorText(error), 'error'); node.setAttribute('role', 'alert');
+  node.append(button('Попробовать снова', retry, true)); return node;
+}
+function skeleton() {
+  const node = el('div', 'skeletons'); node.setAttribute('role', 'status'); node.setAttribute('aria-label', 'Загрузка');
+  for (let i = 0; i < 3; i++) node.append(el('div', 'skeleton'));
+  return node;
+}
+function resource<T>(value: Resource<T>, render: (data: T) => HTMLElement, retry: () => void): HTMLElement {
+  if (value.loading) return skeleton();
+  if (value.error) return errorCard(value.error, retry);
+  return render(value.data);
+}
+const date = (raw: string) => new Date(raw).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' });
+export function price(offer: Offer) {
+  if (offer.currency === 'XTR') return `${offer.amount_cents.toLocaleString('ru-RU')} ★`;
+  return `${(offer.amount_cents / 100).toLocaleString('ru-RU')} ${offer.currency}`;
+}
+const subLabels: Record<Subscription['status'], string> = {
+  active: 'Активна', expired: 'Срок закончился', revoked: 'Доступ отозван', paused: 'Приостановлена', canceled: 'Отменена',
+};
+const orderLabels: Record<Order['status'], string> = {
+  pending: 'Ожидает оплаты', paid: 'Оплачено', expired: 'Срок счёта истёк', canceled: 'Покупка отменена',
+};
+function subscriptionCard(sub: Subscription | null, details = false) {
+  if (!sub) {
+    const card = message('Начнём с подключения', 'Подписки пока нет. Вернитесь в чат с ботом и пройдите начальное подключение, затем откройте Mini App снова.');
+    card.append(el('span', 'badge', 'Ваш доступ появится здесь')); return card;
+  }
+  const active = sub.status === 'active';
+  const card = el('section', active ? 'card access-card' : 'card');
+  card.append(el('span', active ? 'badge positive' : 'badge', subLabels[sub.status] ?? 'Статус уточняется'), el('h2', 'access-title', active ? 'Ваш личный доступ' : 'Моя подписка'));
+  if (sub.expires_at) {
+    card.append(el('p', 'muted', `До ${date(sub.expires_at)}`));
+    // Date arithmetic is presentation only: never override server status.
+    if (active) {
+      const days = Math.ceil((Date.parse(sub.expires_at) - Date.now()) / 86400000);
+      card.append(el('p', 'remaining', days > 0 ? `Осталось ${days} дн.` : 'Обновите статус подписки'));
+    }
+  } else card.append(el('p', 'muted', 'Без даты окончания'));
+  if (active) card.append(link('Подключиться ↗', 'connection'));
+  else if (sub.status === 'expired') {
+    card.append(el('p', 'muted', 'Выберите доступное предложение, чтобы снова пользоваться подпиской.'), link('Выбрать доступ', 'catalog'));
+  } else card.append(el('p', 'muted', 'Для уточнения статуса обратитесь в поддержку через бота.'));
+  if (!details) card.append(link('Подробнее о подписке', 'subscriptions', true));
+  return card;
+}
+// Card presentation from the admin tariff editor. Every field is optional:
+// blank values mean "not configured" and the card keeps its default copy.
+const badgeOf = (offer: Offer) => (offer.badge ?? '').trim();
+const descriptionOf = (offer: Offer) => (offer.description ?? '').trim();
+const featuresOf = (offer: Offer) => (offer.features ?? []).map(item => item.trim()).filter(Boolean);
+function featureList(items: string[]) {
+  const list = el('ul', 'offer-features');
+  for (const item of items) list.append(el('li', '', item));
+  return list;
+}
+export function offerCard(offer: Offer) {
+  const card = el('a', 'card offer-card'); card.href = `#product/${offer.offer_id}`;
+  const badge = badgeOf(offer);
+  if (badge) {
+    const top = el('div', 'offer-top'); top.append(el('span', 'offer-icon', '↗'), el('span', 'badge offer-badge', badge)); card.append(top);
+  } else card.append(el('span', 'offer-icon', '↗'));
+  card.append(el('h2', '', offer.name), el('p', 'muted', `${offer.duration_days} дней доступа`));
+  const description = descriptionOf(offer);
+  if (description) card.append(el('p', 'offer-description', description));
+  const features = featuresOf(offer);
+  if (features.length) card.append(featureList(features));
+  const row = el('div', 'row'); row.append(el('strong', 'price', price(offer)), el('span', 'arrow', '→')); card.append(row);
+  if (offer.currency !== 'XTR') card.append(el('p', 'small muted', 'Оплата Stars недоступна'));
+  return card;
+}
+export function catalog(offers: Offer[]) {
+  const node = el('div', 'stack');
+  if (!offers.length) return message('Предложения появятся здесь', 'Сейчас для вашей подписки нет доступных предложений. Проверьте статус подписки или вернитесь чуть позже.');
+  for (const offer of catalogOrder(offers)) node.append(offerCard(offer));
+  return node;
+}
+export function productDetail(offer: Offer) {
+  const card = el('section', 'card product-detail');
+  const badge = badgeOf(offer);
+  card.append(el('span', badge ? 'badge offer-badge' : 'badge', badge || 'Доступ по подписке'), el('h2', '', offer.name), el('p', 'price large', price(offer)), el('p', 'muted', `${offer.duration_days} дней · разовая покупка`));
+  if (offer.available_until) card.append(el('p', 'small muted', `Предложение доступно до ${date(offer.available_until)}`));
+  const description = descriptionOf(offer);
+  if (description) card.append(el('p', 'offer-description', description));
+  card.append(el('div', 'divider'));
+  const features = featuresOf(offer);
+  if (features.length) card.append(featureList(features));
+  else card.append(el('p', '', '✦ Подключение через ваш личный кабинет'), el('p', '', '✦ Без автоматических списаний'));
+  return card;
+}
+
+export function mount(root: HTMLElement, store: Store, telegram?: WebApp, preferences?: Storage) {
+  let notice = '';
+  let previousRoute = '';
+  // VPN client choice: only platform/app identifiers are ever persisted.
+  const saved = loadChoice(preferences);
+  let chosen = saved !== null;
+  let choice: Choice = saved ?? choose(detectPlatform(navigator.userAgent, telegram?.platform, navigator.maxTouchPoints, navigator.platform));
+  let pendingFocus = '';
+  const setChoice = (next: Choice, focus = '') => {
+    choice = next; chosen = true; pendingFocus = focus; saveChoice(choice, preferences); notice = ''; render();
+  };
+  const openExternal = (url: string, failure: string) => {
+    try { telegram?.openLink(safeHTTPS(url)); } catch { notice = failure; render(); }
+  };
+  // Opens THIS subscription's https connection page in the browser with the
+  // choice preselected in the fragment. Custom schemes are never opened from
+  // the Telegram WebView; the page launches the app from the user's own tap.
+  const addToApp = (sub: Subscription) => {
+    if (!chosen) { chosen = true; saveChoice(choice, preferences); }
+    try {
+      telegram?.openLink(connectPageLink(sub.connection_url, choice));
+      notice = `Открываем страницу подключения в браузере. Нажмите там «Добавить подписку в ${appName(choice)}». Если ${appName(choice)} не откроется, используйте QR-код или ссылку на той же странице.`;
+    } catch { notice = 'Не удалось открыть страницу подключения. Скопируйте ссылку подписки ниже и добавьте её в приложение вручную.'; }
+    render();
+  };
+  const addButton = (sub: Subscription) => button(`Добавить подписку в ${appName(choice)}`, () => addToApp(sub));
+  const refresh = () => { void store.refresh(); };
+  const back = () => {
+    const route = location.hash.slice(1);
+    go(route.startsWith('product/') ? 'catalog' : route === 'connection' ? 'subscriptions' : 'home');
+  };
+  telegram?.BackButton.onClick(back);
+  const render = () => {
+    const activeElement = document.activeElement as HTMLElement | null;
+    const focusKey = activeElement?.dataset.focus;
+    const route = location.hash.slice(1) || 'home';
+    const view = el('div', 'app-shell');
+    const header = el('header', 'header');
+    const brand = el('a', 'brand', 'DictatorVPN'); brand.href = '#home'; brand.setAttribute('aria-label', 'На главную');
+    header.append(brand, el('span', 'brand-caption', 'ЛИЧНЫЙ КАБИНЕТ'));
+    view.append(header);
+    const main = el('main', 'content'); main.id = 'main';
+    if (!telegram?.initData || store.unauthorized) {
+      main.append(message('Откройте из Telegram', store.unauthorized ? errorText(store.error) : 'Этот личный кабинет работает внутри Telegram. Откройте Mini App из меню вашего бота.'));
+      if (telegram?.initData) main.append(button('Закрыть Mini App', () => telegram.close()));
+      view.append(main); root.replaceChildren(view); telegram?.BackButton.hide(); return;
+    }
+    if (route !== 'home') main.append(button('← Назад', back, true));
+    if (route.startsWith('product/') || route.startsWith('purchase/') || route === 'connection') telegram.BackButton.show();
+    else telegram.BackButton.hide();
+    if (notice) { const live = el('p', 'notice', notice); live.setAttribute('role', 'status'); main.append(live); }
+    const retry = () => { void store.checkOrder(route.split('/')[1]); };
+    if (route === 'home') {
+      const name = telegram.initDataUnsafe?.user?.first_name;
+      main.append(heading(name ? `Привет, ${name}` : 'Добро пожаловать', 'Ваш доступ. Всё под контролем.'));
+      main.append(resource(store.subscription, sub => subscriptionCard(sub), refresh));
+      const banner = el('section', 'card promo');
+      banner.append(el('span', 'eyebrow', 'БОЛЬШЕ ВОЗМОЖНОСТЕЙ'), el('h2', '', 'Доступ в вашем ритме'), el('p', 'muted', 'Выберите срок и оплатите прямо в Telegram.'), link('Смотреть предложения', 'catalog', true)); main.append(banner);
+      const pending = store.recent.data.find(order => order.status === 'pending' || (order.status === 'expired' && order.checkout_started));
+      if (pending) main.append(link('Продолжить покупку →', `purchase/${pending.order_id}`, true));
+      main.append(button('Обновить данные', refresh, true, store.subscription.loading));
+    } else if (route === 'catalog') {
+      main.append(heading('Выберите свой доступ', 'Прозрачная цена. Удобная оплата в Telegram.'), resource(store.offers, catalog, refresh));
+    } else if (route.startsWith('product/')) {
+      main.append(heading('Ваш следующий шаг', 'Проверьте предложение перед покупкой.'));
+      main.append(resource(store.offers, offers => {
+        const offer = offers.find(item => item.offer_id === route.split('/')[1]);
+        if (!offer) return message('Предложение недоступно', 'Вернитесь в каталог и обновите список.');
+        const card = productDetail(offer);
+        if (offer.currency === 'XTR') card.append(button(store.busy ? 'Создаём покупку…' : 'Перейти к покупке', () => { void store.buy(offer).then(order => { if (order) go(`purchase/${order.order_id}`); }); }, false, store.busy));
+        else card.append(el('p', 'muted', 'Это предложение не поддерживает Stars. Выберите предложение с ценой в звёздах.'));
+        return card;
+      }, refresh));
+      if (store.error) main.append(errorCard(store.error, refresh));
+    } else if (route.startsWith('purchase/')) {
+      main.append(heading('Ваша покупка', 'Безопасная оплата Telegram Stars.'));
+      const order = store.order;
+      if (!order || order.order_id !== route.split('/')[1]) {
+        main.append(store.error ? errorCard(store.error, retry) : skeleton());
+      } else {
+        const card = el('section', 'card');
+        const paid = order.status === 'paid';
+        card.append(el('span', paid ? 'badge positive' : 'badge', orderLabels[order.status] ?? 'Статус уточняется'), el('h2', '', order.name), el('p', 'price large', price(order)), el('p', 'muted', `${order.duration_days} дней доступа`));
+        if (paid) {
+          card.append(el('p', 'success-copy', 'Готово! Оплата подтверждена сервером.'), el('p', 'muted', 'Подготовка доступа может занять немного времени.'));
+          main.append(card, resource(store.subscription, sub => subscriptionCard(sub, true), refresh));
+        } else {
+          if (order.status === 'pending') {
+            if (order.expires_at) card.append(el('p', 'small muted', `Счёт действует до ${new Date(order.expires_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}`));
+            if (order.checkout_started) card.append(el('p', 'muted', 'Платёж уже начат. Ждём подтверждение. Не оплачивайте повторно. Если статус долго не меняется, обратитесь в поддержку через бота.'));
+            else card.append(button(store.busy ? 'Открываем Telegram…' : `Оплатить ${price(order)}`, () => { void store.pay(); }, false, store.busy || store.checking || !telegram.isVersionAtLeast('6.1') || order.currency !== 'XTR'));
+            if (!telegram.isVersionAtLeast('6.1')) card.append(el('p', 'muted', 'Для оплаты обновите Telegram.'));
+          }
+          if (order.status === 'expired') card.append(el('p', 'muted', 'Срок счёта закончился. Если звёзды уже списаны, не платите повторно: подтверждение может задержаться. Обновите статус или обратитесь в поддержку через бота.'), link('Вернуться в каталог', 'catalog', true));
+          if (order.status === 'canceled') card.append(el('p', 'muted', 'Сервер отменил эту покупку.'), link('Выбрать предложение', 'catalog', true));
+          if (store.paymentHint) {
+            const hints = { opening: 'Следуйте подсказкам в окне Telegram.', paid: 'Telegram завершил оплату. Проверяем подтверждение сервера…', pending: 'Платёж обрабатывается. Мы проверяем статус.', cancelled: 'Окно оплаты закрыто. Проверяем, не был ли платёж уже начат.', failed: 'Telegram сообщил об ошибке оплаты. Проверяем состояние на сервере.' };
+            const hint = el('p', 'notice', hints[store.paymentHint]); hint.setAttribute('role', 'status'); card.append(hint);
+          }
+          card.append(button(store.checking ? 'Проверяем…' : 'Проверить статус', retry, true, store.checking));
+          main.append(card);
+        }
+        if (store.error) main.append(errorCard(store.error, retry));
+      }
+    } else if (route === 'subscriptions') {
+      main.append(heading('Мои подписки', 'Ваш доступ и срок действия.'), resource(store.subscription, sub => {
+        const card = subscriptionCard(sub, true);
+        // Each card's button carries the connection link of ITS subscription.
+        if (sub && sub.status === 'active') {
+          const direct = el('div', 'direct-connect');
+          if (chosen) {
+            direct.append(addButton(sub));
+            const change = link(`Устройство: ${choiceSummary(choice)} · Изменить`, 'connection', true); change.classList.add('choice-link');
+            direct.append(change);
+          } else direct.append(el('p', 'small muted', 'Выберите систему и VPN-приложение один раз — и добавляйте подписку в него одной кнопкой.'), link('Выбрать приложение', 'connection', true));
+          card.append(direct);
+        }
+        return card;
+      }, refresh), button('Обновить статус', refresh, true, store.subscription.loading));
+    } else if (route === 'connection') {
+      main.append(heading('Вы на шаг ближе', 'Подключите доступ на вашем устройстве.'));
+      main.append(resource(store.subscription, sub => {
+        if (!sub || sub.status !== 'active') return subscriptionCard(sub, true);
+        const wrap = el('div', 'stack');
+        const card = el('section', 'card steps connect-steps');
+        const step = (index: number, title: string, id = '') => {
+          const item = el('div', 'step'); const head = el('div', 'step-head');
+          const number = el('span', 'step-number', String(index)); number.setAttribute('aria-hidden', 'true');
+          const h = el('h2', '', title); if (id) h.id = id;
+          head.append(number, h); item.append(head); card.append(item); return item;
+        };
+        const name = appName(choice);
+        const s1 = step(1, 'Выберите систему', 'pick-os');
+        s1.append(platformSwitch(choice, setChoice, 'pick-os'));
+        if (!chosen) s1.append(el('p', 'small muted', 'Система определена автоматически — её можно сменить.'));
+        step(2, 'Выберите приложение', 'pick-app').append(appList(choice, setChoice, 'pick-app'));
+        const s3 = step(3, `Установите ${name}`);
+        s3.append(el('p', 'small muted', `Пропустите шаг, если ${name} уже установлен. Ссылки ведут на официальные страницы разработчика.`), downloadButtons(choice, url => {
+          if (!chosen) { chosen = true; saveChoice(choice, preferences); }
+          openExternal(url, 'Не удалось открыть страницу загрузки.');
+        }));
+        const s4 = step(4, 'Добавьте подписку');
+        s4.append(addButton(sub), el('p', 'small muted', `Откроется страница подключения в браузере, где уже выбраны ${platformLabel(choice.platform)} и ${name}. Нажмите там «Добавить подписку в ${name}» — приложение предложит сохранить подписку.`));
+        if (isBestEffort(choice)) s4.append(el('p', 'notice', `На ${platformLabel(choice.platform)} запуск ${name} по ссылке зависит от версии приложения. Если ничего не произошло, скопируйте ссылку и добавьте её в ${name} вручную.`));
+        step(5, 'Включите VPN').append(enableSteps(choice));
+        const fallback = el('section', 'card fallback');
+        fallback.append(el('h2', '', 'Другие способы'), el('p', 'small muted', 'QR-код, ссылка подписки и подробная инструкция — на странице подключения.'));
+        fallback.append(button('Открыть подключение ↗', () => openExternal(sub.connection_url, 'Не удалось открыть подключение. Обновите подписку.')), button('Скопировать ссылку подписки', () => {
+          void (async () => {
+            try { await navigator.clipboard.writeText(safeHTTPS(sub.subscription_url)); notice = 'Ссылка скопирована. Не передавайте её другим.'; }
+            catch { notice = 'Копирование недоступно. Откройте страницу подключения и скопируйте ссылку там.'; }
+            render();
+          })();
+        }, true), el('p', 'small muted', 'Ссылка — ваш личный ключ доступа. Не делитесь ей.'));
+        wrap.append(card, fallback);
+        return wrap;
+      }, refresh));
+    } else if (route === 'profile') {
+      main.append(heading('Профиль', 'Покупки и настройки приложения.'));
+      const user = telegram.initDataUnsafe?.user;
+      const card = el('section', 'card profile');
+      const name = user?.first_name ?? 'Пользователь Telegram';
+      card.append(el('div', 'avatar', Array.from(name)[0]?.toUpperCase() ?? 'T'), el('h2', '', [name, user?.last_name].filter(Boolean).join(' ')));
+      if (user?.username) card.append(el('p', 'muted', `@${user.username}`));
+      card.append(el('span', 'badge', 'Вход через Telegram')); main.append(card);
+      main.append(message('Как вам удобно', 'Тема синхронизируется с Telegram. Язык интерфейса — русский. Для помощи вернитесь в чат с ботом.'));
+      main.append(el('h2', 'section-title', 'Последние покупки'), el('p', 'small muted', 'Показываем до 20 последних покупок Mini App.'));
+      main.append(resource(store.recent, orders => {
+        if (!orders.length) return message('Покупок пока нет', 'Когда вы выберете доступ, покупка появится здесь.');
+        const list = el('div', 'stack');
+        for (const order of orders) {
+          const item = el('a', 'card order-row'); item.href = `#purchase/${order.order_id}`;
+          item.append(el('strong', '', order.name), el('span', 'muted small', `${orderLabels[order.status]} · ${price(order)} · ${date(order.created_at)}`)); list.append(item);
+        }
+        return list;
+      }, refresh), button('Обновить покупки', refresh, true, store.recent.loading));
+    } else main.append(message('Страница не найдена', 'Перейдите в один из разделов ниже.'));
+    view.append(main);
+    const nav = el('nav', 'bottom-nav'); nav.setAttribute('aria-label', 'Основная навигация');
+    for (const [path, symbol, label] of [['home', '⌂', 'Главная'], ['catalog', '◈', 'Каталог'], ['subscriptions', '◎', 'Подписки'], ['profile', '◉', 'Профиль']]) {
+      const item = el('a', 'nav-item'); item.href = `#${path}`;
+      const current = route === path || (path === 'catalog' && route.startsWith('product/')) || (path === 'subscriptions' && route === 'connection') || (path === 'profile' && route.startsWith('purchase/'));
+      if (current) item.setAttribute('aria-current', 'page');
+      const icon = el('span', 'nav-icon', symbol); icon.setAttribute('aria-hidden', 'true');
+      item.append(icon, el('span', '', label)); nav.append(item);
+    }
+    view.append(nav);
+    // Restore keyboard focus across state renders, without HTML interpolation.
+    for (const [index, node] of Array.from(view.querySelectorAll<HTMLElement>('button, a')).entries()) node.dataset.focus = `${route}:${node.textContent}:${index}`;
+    root.replaceChildren(view);
+    if (pendingFocus) {
+      // Radio groups keep focus on the newly selected option (arrow keys/click).
+      Array.from(root.querySelectorAll<HTMLElement>('[data-radio]')).find(node => node.dataset.radio === pendingFocus)?.focus({ preventScroll: true });
+      pendingFocus = '';
+    } else if (focusKey) Array.from(root.querySelectorAll<HTMLElement>('[data-focus]')).find(node => node.dataset.focus === focusKey)?.focus({ preventScroll: true });
+    if (route !== previousRoute) { previousRoute = route; window.scrollTo(0, 0); }
+  };
+  const routeChanged = () => {
+    notice = '';
+    const route = location.hash.slice(1);
+    if (route.startsWith('purchase/')) void store.selectOrder(route.split('/')[1]);
+    else store.leaveOrder();
+    render();
+  };
+  const visibility = () => store.resume();
+  const unsubscribe = store.subscribe(render);
+  window.addEventListener('hashchange', routeChanged);
+  document.addEventListener('visibilitychange', visibility);
+  window.addEventListener('online', visibility);
+  routeChanged();
+  return () => {
+    unsubscribe(); telegram?.BackButton.offClick(back);
+    window.removeEventListener('hashchange', routeChanged);
+    window.removeEventListener('online', visibility);
+    document.removeEventListener('visibilitychange', visibility);
+  };
+}

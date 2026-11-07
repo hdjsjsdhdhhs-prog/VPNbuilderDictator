@@ -1,0 +1,65 @@
+# Production Docker Compose configuration
+# Usage: docker compose up -d
+
+services:
+    rs8kvn_bot:
+        # :latest is convenient for automatic updates; pin a concrete SemVer or SHA tag for reproducibility
+        image: ghcr.io/hdjsjsdhdhhs-prog/dictatorvpn:latest
+        container_name: rs8kvn_bot
+        restart: unless-stopped
+
+        # Security: Run as non-root user (matches UID/GID in Dockerfile)
+        user: "1000:1000"
+
+        volumes:
+            # Read-only config file
+            - ./.env:/app/.env:ro
+            # Persistent data directory (must be writable)
+            - ./data:/app/data
+
+        environment:
+            - TZ=Europe/Moscow
+            # Go runtime memory optimization
+            # GOMEMLIMIT: 64MB soft limit (67108864 bytes)
+            # GOGC: More aggressive GC (50 instead of default 100)
+            - GOMEMLIMIT=67108864
+            - GOGC=40
+
+        # Expose health check port for monitoring (optional)
+        ports:
+            - "127.0.0.1:8880:8880"
+
+        # Security hardening
+        security_opt:
+            - no-new-privileges:true
+        # Note: read_only filesystem not possible due to SQLite writes
+
+        # Health check - verify the application and database are healthy
+        healthcheck:
+            test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8880/healthz > /dev/null"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 30s
+
+        # Resource limits for production
+        # Note: Memory limit should be higher than GOMEMLIMIT to allow GC headroom
+        deploy:
+            resources:
+                limits:
+                    cpus: "0.5"
+                    memory: 128M # 2x GOMEMLIMIT for GC headroom
+                reservations:
+                    cpus: "0.1"
+                    memory: 32M # Minimum guaranteed memory
+
+        # Logging configuration - prevent disk overflow
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "10m"
+                max-file: "3"
+
+        # Graceful shutdown
+        stop_grace_period: 90s
+        stop_signal: SIGTERM

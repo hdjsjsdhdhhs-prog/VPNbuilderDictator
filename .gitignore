@@ -1,0 +1,70 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Data
+*.db
+*.db.backup
+*.db.backup.*
+data/
+
+# Logs
+*.log
+logs/
+
+# Binary
+/tgvpn_bot
+/rs8kvn_bot
+/bot
+*.so
+
+# Test
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Temporary
+tmp/
+temp/
+
+# Go
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+.kilo/
+.kilocode/
+.agents/
+/skills-lock.json
+/frontend/node_modules/
+/frontend/test-results/
+/frontend/playwright-report/
+/internal/web/miniapp_dist/public/
+/internal/web/admin_dist/public/
+/graphify-out
+.freebuff/
+
+# Personal agent state and local scratch files (never committed)
+.serena/
+.tmp_*
+SKILL*/
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+*.bak
+/release-assets/
+/release_*/
+/build_*/

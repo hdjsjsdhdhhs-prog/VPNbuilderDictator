@@ -1,0 +1,590 @@
+package bot
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/ratelimiter"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/testutil"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/utils"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestMain(m *testing.M) {
+	testutil.InitLogger(m)
+	os.Exit(m.Run())
+}
+
+func TestNewHandler(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		TelegramAdminID:  123456789,
+		TelegramBotToken: "test_token",
+	}
+
+	mockDB := testutil.NewDatabaseService()
+	handler := NewHandler(testutil.NewBotAPI(), cfg, mockDB, NewTestBotConfig(), nil, "")
+
+	require.NotNil(t, handler, "NewHandler returned nil")
+	assert.Equal(t, cfg, handler.cfg, "Config not set correctly")
+	assert.NotNil(t, handler.rateLimiter, "RateLimiter should not be nil")
+}
+
+func TestGenerateInviteCode(t *testing.T) {
+	t.Parallel()
+
+	code1, err := utils.GenerateInviteCode()
+	require.NoError(t, err)
+	code2, err := utils.GenerateInviteCode()
+	require.NoError(t, err)
+
+	assert.Len(t, code1, 8, "Expected code length 8")
+	assert.NotEqual(t, code1, code2, "Expected different codes on consecutive calls")
+
+	validChars := "0123456789abcdefghijklmnopqrstuvwxyz"
+	for _, c := range code1 {
+		assert.True(t, strings.ContainsRune(validChars, c), "Invalid character %c in code", c)
+	}
+}
+
+// NOTE: Tests for sendInviteLink and handleBindTrial require real Telegram Bot API
+// and cannot be unit tested without mocking tgbotapi.BotAPI.
+// These functions are tested via integration tests with a real bot instance.
+// See integration_test.go for integration tests.
+
+func TestHandler_ConfigField(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		TelegramBotToken: "123456:test_token",
+		TelegramAdminID:  999888777,
+	}
+
+	handler := &Handler{
+		cfg: cfg,
+	}
+
+	assert.Equal(t, cfg, handler.cfg, "Handler.cfg not set correctly")
+	assert.Equal(t, int64(999888777), handler.cfg.TelegramAdminID)
+	assert.Equal(t, int64(999888777), handler.cfg.TelegramAdminID)
+}
+
+func TestHandleBroadcast_MessageTooLong(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		TelegramAdminID: 123456,
+	}
+	mockDB := testutil.NewDatabaseService()
+	mockBot := testutil.NewBotAPI()
+	handler := NewHandler(mockBot, cfg, mockDB, NewTestBotConfig(), nil, "")
+	admin := &tgbotapi.User{ID: 123456, UserName: "admin"}
+	ctx := context.Background()
+
+	// (a) A message just over one Telegram message is now accepted: the draft
+	// is auto-split, so the handler must NOT reject it.
+	justOver := make([]byte, config.MaxTelegramMessageLen+1)
+	for i := range justOver {
+		justOver[i] = 'a'
+	}
+
+	handler.HandleBroadcast(ctx, createCommandUpdate(123456, admin, "/broadcast"))
+	handler.HandleBroadcastDraft(ctx, createTextUpdate(admin, "Тестовая рассылка"))
+	handler.HandleBroadcastDraft(ctx, createTextUpdate(admin, string(justOver)))
+	assert.True(t, handler.broadcastSessionActive(123456),
+		"Handler should accept a message slightly over one Telegram message (moves to preview)")
+	assert.NotContains(t, mockBot.LastSentTextSafe(), "слишком длинное",
+		"Handler should not reject a message under the broadcast cap")
+
+	// (b) A message over the hard broadcast cap is rejected.
+	handler.HandleBroadcast(ctx, createCommandUpdate(123456, admin, "/broadcast"))
+	handler.HandleBroadcastDraft(ctx, createTextUpdate(admin, "Тестовая рассылка"))
+
+	tooLong := make([]byte, config.MaxTelegramMessageLen*20+1)
+	for i := range tooLong {
+		tooLong[i] = 'a'
+	}
+
+	handler.HandleBroadcastDraft(ctx, createTextUpdate(admin, string(tooLong)))
+	assert.True(t, mockBot.SendCalledSafe())
+	assert.Contains(t, mockBot.LastSentTextSafe(), "слишком длинное")
+}
+
+func TestHandleSend_RateLimit(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		TelegramAdminID: 123456,
+	}
+	mockDB := testutil.NewDatabaseService()
+	mockBot := testutil.NewBotAPI()
+	handler := NewHandler(mockBot, cfg, mockDB, NewTestBotConfig(), nil, "")
+	mockDB.GetTelegramIDByUsernameFunc = func(ctx context.Context, username string) (int64, error) {
+		return 999888777, nil
+	}
+
+	ctx := context.Background()
+	adminID := int64(123456)
+
+	update := createCommandUpdate(adminID, &tgbotapi.User{ID: adminID, UserName: "admin"}, "/send @testuser Test message")
+	handler.HandleSend(ctx, update)
+
+	update2 := createCommandUpdate(adminID, &tgbotapi.User{ID: adminID, UserName: "admin"}, "/send @testuser Second message")
+	handler.HandleSend(ctx, update2)
+
+	assert.True(t, mockBot.SendCalledSafe())
+}
+
+func TestHandleSend_NoArguments(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{TelegramAdminID: 123456}
+	mockDB := testutil.NewDatabaseService()
+	mockBot := testutil.NewBotAPI()
+	handler := NewHandler(mockBot, cfg, mockDB, NewTestBotConfig(), nil, "")
+
+	ctx := context.Background()
+	update := tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: 123456},
+			From: &tgbotapi.User{ID: 123456},
+			Text: "/send",
+		},
+	}
+
+	handler.HandleSend(ctx, update)
+
+	assert.True(t, mockBot.SendCalledSafe(), "Should send usage message")
+	assert.Contains(t, mockBot.LastSentTextSafe(), "Использование", "Should show usage instructions")
+}
+
+func TestHandleSend_OnlyTarget(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{TelegramAdminID: 123456}
+	mockDB := testutil.NewDatabaseService()
+	mockBot := testutil.NewBotAPI()
+	handler := NewHandler(mockBot, cfg, mockDB, NewTestBotConfig(), nil, "")
+
+	ctx := context.Background()
+	update := tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: 123456},
+			From: &tgbotapi.User{ID: 123456},
+			Text: "/send 123",
+		},
+	}
+
+	handler.HandleSend(ctx, update)
+
+	assert.True(t, mockBot.SendCalledSafe(), "Should send usage message")
+	assert.Contains(t, mockBot.LastSentTextSafe(), "Использование", "Should show usage instructions")
+}
+
+// sendInviteLink tests are now in keyboard_test.go
+
+// === sendInviteLink tests ===
+
+func TestSendInviteLink_Success(t *testing.T) {
+	t.Parallel()
+
+	mockDB := testutil.NewDatabaseService()
+	mockBot := testutil.NewBotAPI()
+	cfg := &config.Config{
+		SiteURL:         "https://vpn.site",
+		TelegramAdminID: 12345,
+	}
+	handler := NewHandler(mockBot, cfg, mockDB, NewTestBotConfig(), nil, "")
+
+	mockDB.GetOrCreateInviteFunc = func(ctx context.Context, referrerTGID int64, code string) (*database.Invite, error) {
+		return &database.Invite{Code: "TESTCODE1", ReferrerTGID: referrerTGID}, nil
+	}
+
+	ctx := context.Background()
+	handler.sendInviteLink(ctx, 12345, 99)
+
+	assert.True(t, mockBot.SendCalledSafe(), "sendInviteLink should send a message")
+	assert.Contains(t, mockBot.LastSentTextSafe(), "TESTCODE1", "Message should contain invite code")
+	assert.Contains(t, mockBot.LastSentTextSafe(), "vpn.site", "Message should contain web link")
+}
+
+func TestSendInviteLink_DatabaseError(t *testing.T) {
+	t.Parallel()
+
+	mockDB := testutil.NewDatabaseService()
+	mockBot := testutil.NewBotAPI()
+	cfg := &config.Config{
+		SiteURL:         "https://vpn.site",
+		TelegramAdminID: 12345,
+	}
+	handler := NewHandler(mockBot, cfg, mockDB, NewTestBotConfig(), nil, "")
+
+	mockDB.GetOrCreateInviteFunc = func(ctx context.Context, referrerTGID int64, code string) (*database.Invite, error) {
+		return nil, fmt.Errorf("database error")
+	}
+
+	ctx := context.Background()
+	handler.sendInviteLink(ctx, 12345, 99)
+
+	assert.True(t, mockBot.SendCalledSafe(), "sendInviteLink should send error message on DB error")
+	assert.Contains(t, mockBot.LastSentTextSafe(), "❌", "Error message should contain error emoji")
+}
+
+// === isAdmin edge cases ===
+
+func TestHandler_IsAdmin_NegativeID(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{TelegramAdminID: 12345}
+	handler := &Handler{cfg: cfg, botConfig: NewTestBotConfig()}
+
+	assert.False(t, handler.isAdmin(-1), "isAdmin() should return false for negative ID")
+	assert.False(t, handler.isAdmin(0), "isAdmin() should return false for zero ID")
+}
+
+func TestHandler_IsAdmin_ZeroAdminID(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{TelegramAdminID: 0}
+	handler := &Handler{cfg: cfg, botConfig: NewTestBotConfig()}
+
+	assert.False(t, handler.isAdmin(0), "isAdmin() should return false when admin ID is 0")
+	assert.False(t, handler.isAdmin(12345), "isAdmin() should return false when admin ID is 0")
+}
+
+// === getUsername edge cases ===
+
+func TestHandler_GetUsername_EmptyStrings(t *testing.T) {
+	t.Parallel()
+
+	handler := &Handler{}
+
+	// User with empty strings
+	user := &tgbotapi.User{ID: 12345, UserName: "", FirstName: ""}
+	result := handler.getUsername(user)
+	assert.Equal(t, "", result, "getUsername() should return empty when no username")
+
+	// User with whitespace username
+	user2 := &tgbotapi.User{ID: 67890, UserName: "  ", FirstName: "Test"}
+	result2 := handler.getUsername(user2)
+	// UserName is not empty (it's whitespace), so it should be returned
+	assert.Equal(t, "  ", result2, "getUsername() should return username even if whitespace")
+}
+
+func TestHandler_CacheField(t *testing.T) {
+	t.Parallel()
+
+	handler := &Handler{
+		cache: NewSubscriptionCache(100, 5*time.Minute),
+	}
+
+	assert.NotNil(t, handler.cache, "Cache should not be nil")
+
+	// Test cache operations
+	sub := &database.Subscription{
+		TelegramID: 12345,
+		Username:   "testuser",
+		Status:     "active",
+	}
+	handler.cache.Set(12345, sub)
+
+	retrieved := handler.cache.Get(12345)
+	require.NotNil(t, retrieved, "Cache should return stored subscription")
+	assert.Equal(t, "testuser", retrieved.Username, "Username should match")
+}
+
+// === Rate limiter tests ===
+
+func TestHandler_RateLimiter(t *testing.T) {
+	t.Parallel()
+
+	handler := NewHandler(testutil.NewBotAPI(), &config.Config{}, testutil.NewDatabaseService(), NewTestBotConfig(), nil, "")
+
+	assert.NotNil(t, handler.rateLimiter, "Rate limiter should be initialized")
+
+	// Test that rate limiter allows requests
+	ctx := context.Background()
+	assert.True(t, handler.rateLimiter.Wait(ctx, 12345), "Rate limiter should allow request")
+}
+
+// === Subscription cache integration ===
+
+func TestHandler_CacheInvalidation(t *testing.T) {
+	t.Parallel()
+
+	handler := &Handler{
+		cache: NewSubscriptionCache(100, 5*time.Minute),
+	}
+
+	// Add to cache
+	sub := &database.Subscription{
+		TelegramID: 12345,
+		Username:   "testuser",
+		Status:     "active",
+	}
+	handler.cache.Set(12345, sub)
+
+	// Verify it's there
+	assert.NotNil(t, handler.cache.Get(12345), "Should be in cache")
+
+	// Invalidate
+	handler.invalidateCache(context.Background(), 12345)
+
+	// Verify it's gone
+	assert.Nil(t, handler.cache.Get(12345), "Should not be in cache after invalidation")
+}
+
+// === Multiple subscription creation prevention ===
+
+func TestHandler_SubscriptionCreationLock(t *testing.T) {
+	t.Parallel()
+
+	handler := &Handler{
+		inProgressSyncMap: sync.Map{},
+	}
+
+	// Simulate subscription in progress
+	_, loaded := handler.inProgressSyncMap.LoadOrStore(12345, true)
+	assert.False(t, loaded, "First LoadOrStore should return false (not loaded)")
+
+	// Check that it's marked as in progress
+	_, exists := handler.inProgressSyncMap.Load(12345)
+	assert.True(t, exists, "Should be marked as in progress")
+
+	// Try to add again - should return true (already loaded)
+	_, loaded = handler.inProgressSyncMap.LoadOrStore(12345, true)
+	assert.True(t, loaded, "Second LoadOrStore should return true (already loaded)")
+
+	// Remove from in progress
+	handler.inProgressSyncMap.Delete(12345)
+
+	// Verify it's removed
+	_, exists = handler.inProgressSyncMap.Load(12345)
+	assert.False(t, exists, "Should not be in progress anymore")
+}
+
+// === handleCreateError tests ===
+
+func TestHandleCreateError_AllErrorTypes(t *testing.T) {
+	t.Parallel()
+
+	// Subscription creation is a local DB operation, so errors are no longer
+	// classified: every failure, including former panel-style errors, shows the
+	// generic message.
+	tests := []struct {
+		name        string
+		err         error
+		wantContain string
+	}{
+		{"connection refused", fmt.Errorf("connection refused"), msg(MsgErrGeneric)},
+		{"request timeout", fmt.Errorf("request timeout"), msg(MsgErrGeneric)},
+		{"authentication failed", fmt.Errorf("authentication failed"), msg(MsgErrGeneric)},
+		{"context canceled", fmt.Errorf("context canceled"), msg(MsgErrGeneric)},
+		{"TLS handshake", fmt.Errorf("TLS handshake failed"), msg(MsgErrGeneric)},
+		{"generic error", fmt.Errorf("some unknown error"), msg(MsgErrGeneric)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			mockBot := testutil.NewBotAPI()
+			handler := &Handler{
+				bot:    mockBot,
+				sender: NewMessageSender(mockBot, ratelimiter.NewPerUserRateLimiter(float64(config.RateLimiterMaxTokens), float64(config.RateLimiterRefillRate))),
+			}
+
+			handler.handleCreateError(context.Background(), 12345, 100, "testuser", tt.err)
+
+			assert.True(t, mockBot.SendCalledSafe(), "should send error message")
+			assert.Contains(t, mockBot.LastSentTextSafe(), tt.wantContain, "message should contain expected text")
+		})
+	}
+}
+
+func TestHandleUpdate_CommandRouting(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		TelegramAdminID:  123456789,
+		TelegramBotToken: "test_token",
+	}
+
+	tests := []struct {
+		name        string
+		update      tgbotapi.Update
+		wantCommand string
+	}{
+		{
+			name: "/start command",
+			update: tgbotapi.Update{
+				Message: &tgbotapi.Message{
+					Chat: &tgbotapi.Chat{ID: 111},
+					From: &tgbotapi.User{ID: 111, UserName: "user1"},
+					Text: "/start",
+				},
+			},
+			wantCommand: "start",
+		},
+		{
+			name: "/help command",
+			update: tgbotapi.Update{
+				Message: &tgbotapi.Message{
+					Chat: &tgbotapi.Chat{ID: 111},
+					From: &tgbotapi.User{ID: 111, UserName: "user1"},
+					Text: "/help",
+				},
+			},
+			wantCommand: "help",
+		},
+		{
+			name: "/invite command",
+			update: tgbotapi.Update{
+				Message: &tgbotapi.Message{
+					Chat: &tgbotapi.Chat{ID: 111},
+					From: &tgbotapi.User{ID: 111, UserName: "user1"},
+					Text: "/invite",
+				},
+			},
+			wantCommand: "invite",
+		},
+		{
+			name: "/refstats command",
+			update: tgbotapi.Update{
+				Message: &tgbotapi.Message{
+					Chat: &tgbotapi.Chat{ID: 123456789},
+					From: &tgbotapi.User{ID: 123456789, UserName: "admin"},
+					Text: "/refstats",
+				},
+			},
+			wantCommand: "refstats",
+		},
+		{
+			name: "unknown command",
+			update: tgbotapi.Update{
+				Message: &tgbotapi.Message{
+					Chat: &tgbotapi.Chat{ID: 111},
+					From: &tgbotapi.User{ID: 111, UserName: "user1"},
+					Text: "/unknown",
+				},
+			},
+			wantCommand: "unknown",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			mockBot := testutil.NewBotAPI()
+			mockDB := testutil.NewDatabaseService()
+			handler := NewHandler(mockBot, cfg, mockDB, NewTestBotConfig(), nil, "")
+
+			handler.HandleUpdate(context.Background(), tt.update)
+
+			assert.True(t, mockBot.SendCalledSafe(), "should send response")
+		})
+	}
+}
+
+func TestHandleUpdate_NonCommandMessage(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		TelegramAdminID:  123456789,
+		TelegramBotToken: "test_token",
+	}
+
+	mockBot := testutil.NewBotAPI()
+	mockDB := testutil.NewDatabaseService()
+	handler := NewHandler(mockBot, cfg, mockDB, NewTestBotConfig(), nil, "")
+
+	update := tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: 111},
+			From: &tgbotapi.User{ID: 111, UserName: "testuser"},
+			Text: "hello world",
+		},
+	}
+
+	handler.HandleUpdate(context.Background(), update)
+
+	assert.True(t, mockBot.SendCalledSafe(), "should send response for non-command message")
+	assert.Contains(t, mockBot.LastSentTextSafe(), "/start", "should suggest /start command")
+}
+
+func TestHandleUpdate_CallbackQuery(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		TelegramAdminID:  123456789,
+		TelegramBotToken: "test_token",
+	}
+
+	mockBot := testutil.NewBotAPI()
+	mockDB := testutil.NewDatabaseService()
+	mockDB.GetByTelegramIDFunc = func(ctx context.Context, id int64) (*database.Subscription, error) {
+		return &database.Subscription{
+			ID:             1,
+			TelegramID:     111,
+			Username:       "testuser",
+			SubscriptionID: "test-sub-id",
+			ExpiresAt:      testutil.PtrTime(time.Now().Add(24 * time.Hour)),
+			Status:         "active",
+		}, nil
+	}
+	handler := NewHandler(mockBot, cfg, mockDB, NewTestBotConfig(), nil, "")
+
+	update := tgbotapi.Update{
+		CallbackQuery: &tgbotapi.CallbackQuery{
+			ID:   "callback_123",
+			From: &tgbotapi.User{ID: 111, UserName: "testuser"},
+			Message: &tgbotapi.Message{
+				Chat: &tgbotapi.Chat{ID: 111},
+			},
+			Data: "create_subscription",
+		},
+	}
+
+	handler.HandleUpdate(context.Background(), update)
+
+	assert.True(t, mockBot.SendCalledSafe(), "should handle callback query")
+}
+
+// TestHandleUpdateMalformedStartDoesNotPanic verifies that HandleUpdate handles
+// a malformed /start update without panicking.
+func TestHandleUpdateMalformedStartDoesNotPanic(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		TelegramAdminID:  123456789,
+		TelegramBotToken: "test_token",
+	}
+	mockDB := testutil.NewDatabaseService()
+	handler := NewHandler(testutil.NewBotAPI(), cfg, mockDB, NewTestBotConfig(), nil, "")
+
+	// /start with nil From → HandleStart returns "nil from" error.
+	update := tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Text: "/start",
+			Chat: &tgbotapi.Chat{ID: 999},
+			Entities: []tgbotapi.MessageEntity{
+				{Type: "bot_command", Offset: 0, Length: 6},
+			},
+			// From is nil → triggers error path.
+		},
+	}
+
+	handler.HandleUpdate(context.Background(), update)
+}

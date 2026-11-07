@@ -1,0 +1,108 @@
+package bot
+
+import (
+	"context"
+	"time"
+
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/interfaces"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/logger"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/metrics"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/ratelimiter"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"go.uber.org/zap"
+)
+
+// MessageSender handles rate-limited Telegram message sending.
+type MessageSender struct {
+	bot         interfaces.BotAPI
+	rateLimiter *ratelimiter.PerUserRateLimiter
+}
+
+// NewMessageSender creates a new MessageSender.
+func NewMessageSender(bot interfaces.BotAPI, rl *ratelimiter.PerUserRateLimiter) *MessageSender {
+	return &MessageSender{bot: bot, rateLimiter: rl}
+}
+
+func (ms *MessageSender) SetBot(bot interfaces.BotAPI) {
+	ms.bot = bot
+}
+
+// Send sends a message with rate limiting, swallowing errors.
+func (ms *MessageSender) Send(ctx context.Context, msg tgbotapi.MessageConfig) {
+	_ = ms.SendWithError(ctx, msg)
+}
+
+// SendWithError sends a message with rate limiting and returns any error.
+func (ms *MessageSender) SendWithError(ctx context.Context, msg tgbotapi.MessageConfig) error {
+	msg.DisableWebPagePreview = true
+
+	_, err := ms.SendChattable(ctx, msg.ChatID, msg)
+
+	return err
+}
+
+// SendChattable sends any Chattable (text, photo, ...) to chatID with the same
+// per-user rate limiting, metrics and logging as SendWithError, and returns
+// the sent message (its ID and, for photos, the Telegram file IDs).
+func (ms *MessageSender) SendChattable(ctx context.Context, chatID int64, chattable tgbotapi.Chattable) (tgbotapi.Message, error) {
+	if !ms.rateLimiter.Wait(ctx, chatID) {
+		return tgbotapi.Message{}, ctx.Err()
+	}
+
+	start := time.Now()
+	sent, err := ms.bot.Send(chattable)
+	duration := time.Since(start).Seconds()
+
+	if err != nil {
+		metrics.TelegramAPICallsTotal.WithLabelValues("send", "error").Inc()
+		metrics.TelegramAPIDuration.WithLabelValues("send").Observe(duration)
+
+		if isUserBlockedOrGoneError(err) {
+			logger.Warn("Failed to send message", zap.Error(err))
+		} else {
+			logger.Error("Failed to send message", zap.Error(err))
+		}
+
+		return tgbotapi.Message{}, err
+	}
+
+	metrics.TelegramAPICallsTotal.WithLabelValues("send", "success").Inc()
+	metrics.TelegramAPIDuration.WithLabelValues("send").Observe(duration)
+
+	return sent, nil
+}
+
+// SafeSend sends a message without rate limiting and logs errors.
+func (ms *MessageSender) SafeSend(chattable tgbotapi.Chattable) {
+	start := time.Now()
+	_, err := ms.bot.Send(chattable)
+	duration := time.Since(start).Seconds()
+
+	if err != nil {
+		metrics.TelegramAPICallsTotal.WithLabelValues("send", "error").Inc()
+		metrics.TelegramAPIDuration.WithLabelValues("send").Observe(duration)
+
+		if isUserBlockedOrGoneError(err) {
+			logger.Warn("Failed to send message", zap.Error(err))
+		} else {
+			logger.Error("Failed to send message", zap.Error(err))
+		}
+	} else {
+		metrics.TelegramAPICallsTotal.WithLabelValues("send", "success").Inc()
+		metrics.TelegramAPIDuration.WithLabelValues("send").Observe(duration)
+	}
+}
+
+// SendMessage sends a plain text message to a chat.
+func (ms *MessageSender) SendMessage(ctx context.Context, chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	ms.Send(ctx, msg)
+}
+
+// SendMessageMarkdown sends a Markdown-formatted message to a chat.
+func (ms *MessageSender) SendMessageMarkdown(ctx context.Context, chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown"
+	ms.Send(ctx, msg)
+}

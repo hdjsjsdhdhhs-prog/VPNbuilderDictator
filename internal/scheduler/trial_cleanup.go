@@ -1,0 +1,59 @@
+package scheduler
+
+import (
+	"context"
+	"time"
+
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/logger"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/service"
+
+	"go.uber.org/zap"
+)
+
+// TrialCleanupScheduler runs periodic expired trial cleanup.
+type TrialCleanupScheduler struct {
+	subService *service.SubscriptionService
+}
+
+// NewTrialCleanupScheduler creates a new TrialCleanupScheduler.
+func NewTrialCleanupScheduler(subService *service.SubscriptionService) *TrialCleanupScheduler {
+	return &TrialCleanupScheduler{
+		subService: subService,
+	}
+}
+
+// Start runs the trial cleanup scheduler loop. It blocks until ctx is cancelled.
+func (s *TrialCleanupScheduler) Start(ctx context.Context) {
+	logger.Info("Trial cleanup scheduler started", zap.String("schedule", "every 3h"))
+
+	// Run cleanup immediately on startup
+	s.runCleanup(ctx)
+
+	ticker := time.NewTicker(3 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.runCleanup(ctx)
+
+		case <-ctx.Done():
+			logger.Info("Trial cleanup scheduler stopped")
+			return
+		}
+	}
+}
+
+func (s *TrialCleanupScheduler) runCleanup(ctx context.Context) {
+	logger.Info("Running trial cleanup")
+
+	deleted, err := s.subService.CleanupExpiredTrials(ctx)
+	if err != nil {
+		// Best-effort background work: partial failures are retried on the next
+		// pass, so a degraded run is a warning, not an error (same as
+		// SubscriptionSyncWorker's aggregate sync failure).
+		logger.Warn("Trial cleanup failed", zap.Error(err))
+	} else if deleted > 0 {
+		logger.Info("Trial cleanup completed", zap.Int64("deleted", deleted))
+	}
+}

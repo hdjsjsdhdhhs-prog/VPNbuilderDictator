@@ -1,0 +1,473 @@
+// Package main starts the Telegram bot and its HTTP/background services.
+package main
+
+import (
+	"context"
+	cryptorand "crypto/rand"
+	"fmt"
+	"math/big"
+	"os"
+	"os/signal"
+	"runtime/debug"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/getsentry/sentry-go"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/bot"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/heartbeat"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/interfaces"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/logger"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/metrics"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/netmon"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/scheduler"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/service"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/subserver"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/telegramstars"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/web"
+	"go.uber.org/zap"
+)
+
+// Build information (set via ldflags)
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildTime = "unknown"
+)
+
+// getVersion returns the service version string prefixed with "rs8kvn_bot@".
+// It prefers a non-"dev" ldflag version, then a module tag from build info, then a short VCS revision from build info, then an ldflag commit, and finally falls back to the ldflag version.
+func getVersion() string {
+	// If version was set via ldflags and is not "dev", use it
+	if version != "dev" {
+		return "rs8kvn_bot@" + version
+	}
+
+	// Try to get version from Go build info (set by go install or git tags)
+	if info, ok := debug.ReadBuildInfo(); ok {
+		// Check for vcs tag (git tag)
+		for _, setting := range info.Settings {
+			if setting.Key == "vcs.revision" {
+				// If we have a tagged version, use it
+				if info.Main.Version != "" && info.Main.Version != "(devel)" {
+					return "rs8kvn_bot@" + info.Main.Version
+				}
+				// Otherwise use short commit hash
+				if len(setting.Value) >= 7 {
+					return "rs8kvn_bot@" + setting.Value[:7]
+				}
+			}
+		}
+		// Fallback to module version if available
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			return "rs8kvn_bot@" + info.Main.Version
+		}
+	}
+
+	// If commit was set via ldflags, use it
+	if commit != "unknown" && len(commit) >= 7 {
+		return "rs8kvn_bot@" + commit[:7]
+	}
+
+	// Default version if no build info available
+	return "rs8kvn_bot@" + version
+}
+
+// initBot инициализирует Telegram-бота: проверяет токен, создаёт BotAPI
+// и собирает bot.BotConfig с повторными попытками при сбоях подключения.
+func initBot(cfg *config.Config) (*tgbotapi.BotAPI, *bot.BotConfig, error) {
+	logger.Info("Validating Telegram bot token")
+
+	const botInitMaxAttempts = 5
+
+	botInitDelay := 3 * time.Second
+
+	var lastErr error
+
+	for i := range botInitMaxAttempts {
+		var (
+			api *tgbotapi.BotAPI
+			bc  *bot.BotConfig
+			err error
+		)
+
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					lastErr = fmt.Errorf("telegram bot init panic: %v", recovered)
+				}
+			}()
+
+			api, err = tgbotapi.NewBotAPI(cfg.TelegramBotToken)
+			if err == nil {
+				bc, err = bot.NewBotConfig(api)
+			}
+		}()
+
+		if err == nil && api != nil && bc != nil {
+			logger.Info("Telegram bot authorized", zap.String("username", bc.Username))
+			return api, bc, nil
+		}
+
+		if err == nil {
+			err = lastErr
+		}
+
+		lastErr = err
+
+		if i == botInitMaxAttempts-1 {
+			break
+		}
+
+		logger.Warn("Telegram bot init failed, retrying...", zap.Int("attempt", i+1), zap.Int("max_attempts", botInitMaxAttempts), logger.SafeError(err, cfg.TelegramBotToken))
+
+		jitter := time.Duration(0)
+
+		if maxJitter := botInitDelay / 2; maxJitter > 0 {
+			n, randErr := cryptorand.Int(cryptorand.Reader, big.NewInt(int64(maxJitter)))
+			if randErr == nil {
+				jitter = time.Duration(n.Int64())
+			}
+		}
+
+		time.Sleep(botInitDelay + jitter)
+	}
+
+	return nil, nil, fmt.Errorf("failed to initialize Telegram bot after %d attempts: %w", botInitMaxAttempts, lastErr)
+}
+
+// startWebServer создаёт и запускает HTTP-сервер (подписки, инвайт/trial-страницы).
+// Сервер стартует асинхронно; функция ждёт до 2 секунд первой ошибки запуска,
+// чтобы не блокировать старт бота, но вернуть ошибку, если сервер точно не поднялся.
+func startWebServer(subService *service.SubscriptionService, cfg *config.Config, botConfig *bot.BotConfig, subServer *subserver.Service, dbService *database.Service, orderService *service.OrderService, adminService *service.AdminService, builderService *service.BuilderService, netMonitor *netmon.Service, botAPI interfaces.BotAPI) (*web.Server, error) {
+	webServer := web.NewServer(fmt.Sprintf(":%d", cfg.WebServerPort), dbService, cfg, botConfig.Username, subService, subServer)
+	webServer.SetOrderService(orderService)
+	webServer.SetAdminService(adminService)
+	webServer.SetBuilderService(builderService)
+	webServer.SetTariffService(service.NewTariffService(dbService))
+	webServer.SetTrialService(service.NewTrialService(dbService, subService.TrialDefaults()))
+	webServer.SetWarmupService(service.NewWarmupService(dbService, subService.TrialDefaults()))
+	if netMonitor != nil {
+		webServer.SetNetworkMonitor(netMonitor)
+	}
+	webServer.SetBot(botAPI)
+
+	if cfg.PaymentEnabled {
+		webServer.SetPaymentConfig(&web.PaymentConfig{
+			Enabled:    true,
+			MerchantID: cfg.PlategaMerchantID,
+			Secret:     cfg.PlategaSecret,
+		})
+	}
+
+	webServer.RegisterChecker("database", func(ctx context.Context) web.ComponentHealth {
+		err := dbService.Ping(ctx)
+		if err != nil {
+			return web.ComponentHealth{Status: web.StatusDown, Message: err.Error()}
+		}
+
+		return web.ComponentHealth{Status: web.StatusOK}
+	})
+
+	webServerStartErr := make(chan error, 1)
+
+	go func() {
+		defer recoverAndReport("Web server start")
+
+		err := webServer.Start(context.Background())
+		if err != nil {
+			webServerStartErr <- err
+		}
+	}()
+
+	select {
+	case err := <-webServerStartErr:
+		return nil, err
+	case <-time.After(2 * time.Second):
+		return webServer, nil
+	}
+}
+
+// startBackgroundWorkers запускает фоновые goroutine-воркеры: сбор метрик пула БД,
+// бэкапы, heartbeat, очистку trial, повтор запросов комиссий провайдера,
+// истечение и напоминания подписок и прогрев клиентов. Синхронизации с
+// VPN-панелями нет: доступ — локальное состояние, выдачу собирает Builder.
+// Возвращает WaitGroup для ожидания завершения при штатном выключении.
+func startBackgroundWorkers(ctx context.Context, handler *bot.Handler, subService *service.SubscriptionService, orderSvc *service.OrderService, dbService *database.Service, cfg *config.Config) *sync.WaitGroup {
+	var wg sync.WaitGroup
+	wg.Add(8)
+
+	// Customer warm-up: /start records contacts (wired before the update loop
+	// starts), the worker sends the scenarios through the handler's sender.
+	warmupSvc := service.NewWarmupService(dbService, subService.TrialDefaults())
+	handler.SetWarmupContacts(warmupSvc)
+
+	go func() {
+		defer recoverAndReport("DB pool metrics collector")
+		defer wg.Done()
+
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				metrics.CollectDBPoolMetrics(ctx, dbService.GetDB())
+			}
+		}
+	}()
+
+	backupSched := scheduler.NewBackupScheduler(cfg.DatabasePath, config.DefaultBackupHour, config.DefaultBackupRetention)
+
+	go func() {
+		defer recoverAndReport("Backup scheduler")
+		defer wg.Done()
+
+		backupSched.Start(ctx)
+	}()
+
+	go func() {
+		defer recoverAndReport("Heartbeat scheduler")
+		defer wg.Done()
+
+		heartbeat.Start(ctx, cfg.HeartbeatURL, cfg.HeartbeatInterval)
+	}()
+
+	go func() {
+		defer recoverAndReport("Trial cleanup scheduler")
+		defer wg.Done()
+
+		trialSched := scheduler.NewTrialCleanupScheduler(subService)
+		trialSched.Start(ctx)
+	}()
+
+	go func() {
+		defer recoverAndReport("Provider fee worker")
+		defer wg.Done()
+
+		feeWorker := scheduler.NewProviderFeeWorker(orderSvc)
+		feeWorker.Run(ctx)
+	}()
+
+	go func() {
+		defer recoverAndReport("Subscription expire worker")
+		defer wg.Done()
+
+		expireWorker := scheduler.NewSubscriptionExpireWorker(dbService, subService)
+		expireWorker.Run(ctx)
+	}()
+
+	go func() {
+		defer recoverAndReport("Subscription reminder worker")
+		defer wg.Done()
+
+		reminderWorker := scheduler.NewSubscriptionReminderWorker(dbService, subService)
+		reminderWorker.Run(ctx)
+	}()
+
+	go func() {
+		defer recoverAndReport("Warmup worker")
+		defer wg.Done()
+
+		warmupWorker := scheduler.NewWarmupWorker(warmupSvc, handler.WarmupSender(dbService))
+		warmupWorker.Run(ctx)
+	}()
+
+	return &wg
+}
+
+// netMonitorStartDelay lets the bot finish startup before the first
+// resolution fetches provider sources.
+const netMonitorStartDelay = 15 * time.Second
+
+// startNetworkMonitor запускает фоновый мониторинг сети (раздел «Мониторинг»),
+// если он включён (NETMON_ENABLED). Ошибки мониторинга best-effort: они
+// логируются и не влияют на выдачу подписок.
+func startNetworkMonitor(ctx context.Context, wg *sync.WaitGroup, monitor *netmon.Service, cfg *config.Config) {
+	if monitor == nil || !cfg.NetMonEnabled {
+		logger.Info("Network monitor disabled")
+		return
+	}
+
+	wg.Add(1)
+
+	go func() {
+		defer recoverAndReport("Network monitor")
+		defer wg.Done()
+
+		monitor.Run(ctx, netMonitorStartDelay)
+	}()
+}
+
+// main — точка входа: инициализирует конфигурацию и сервисы, запускает фоновые
+// воркеры и веб-сервер, обрабатывает обновления Telegram с ограниченным
+// параллелизмом и выполняет корректное завершение при получении сигнала.
+// Инициализация опциональных компонентов (Sentry, БД, бот) делается
+// по принципу best-effort, чтобы сервис стартовал даже при недоступности части
+// зависимостей.
+func main() {
+	// 1. Load configuration
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 2. Initialize Sentry (before logger)
+	initSentry(cfg)
+
+	// 3. Initialize logger
+	logService, err := initLogger(cfg)
+	if err != nil {
+		// The logger failed to initialize, so the deferred flush below is not
+		// registered yet: flush Sentry explicitly before exiting.
+		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
+		sentry.Flush(logger.SentryFlushTimeout)
+		os.Exit(1)
+	}
+	defer sentry.Flush(logger.SentryFlushTimeout)
+	defer func() {
+		err := logService.Close()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to close logger: %v\n", err)
+		}
+	}()
+
+	// 4. Initialize database (no VPN node clients: access is local state)
+	dbService, err := initDatabase(cfg)
+	if err != nil {
+		logger.Fatal("Failed to initialize database", zap.Error(err))
+	}
+	defer func() {
+		err := dbService.Close()
+		if err != nil {
+			logger.Error("Failed to close database", zap.Error(err))
+		}
+	}()
+
+	logger.Info("Database initialized successfully")
+	// 5. Wire application services with a placeholder bot; initBot runs below
+	// (step 7) and replaces it with the real bot before any update is processed.
+	// The real username comes from Telegram getMe inside initBot — it is NOT
+	// configured manually. The placeholder carries no username; the real one is
+	// injected via SetBotConfig once initBot returns.
+	botConfig := &bot.BotConfig{}
+	botAPI := &tgbotapi.BotAPI{Self: tgbotapi.User{UserName: ""}}
+	svc := initServices(cfg, dbService, botAPI, botConfig)
+
+	// 6. Start web server so subscriptions are served; bot is initialised next.
+	// The web server starts with an empty bot username; initBot injects the real
+	// username (from Telegram getMe) via SetBotUsername once the bot is ready, so
+	// the share/invite page shows the correct @username after startup.
+	webServer, err := startWebServer(svc.subService, cfg, botConfig, svc.subServer, dbService, svc.orderService, svc.adminService, svc.builderService, svc.netMonitor, botAPI)
+	if err != nil {
+		logger.Fatal("Failed to start web server", zap.Error(err))
+	}
+	defer func() {
+		if webServer == nil {
+			return
+		}
+
+		webServer.SetReady(false)
+		webServer.SetPaymentReady(false)
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		err := webServer.Stop(shutdownCtx)
+		if err != nil {
+			logger.Error("Failed to stop web server", zap.Error(err))
+		}
+	}()
+
+	// 7. Initialize Telegram bot (initBot retries internally and calls Fatal on total failure).
+	logger.Info("Initializing Telegram bot...")
+
+	api, bc, err := initBot(cfg)
+	if err != nil {
+		logger.Fatal("Telegram bot initialization failed", logger.SafeError(err, cfg.TelegramBotToken))
+	}
+
+	svc.handler.SetBot(api)
+	svc.subService.SetBot(api)
+	svc.handler.SetBotConfig(bc)
+
+	if svc.orderService != nil {
+		svc.orderService.SetBotUsername(bc.Username)
+		svc.orderService.SetAdminBot(api)
+	}
+
+	botAPI = api
+	if webServer != nil {
+		webServer.SetBot(api)
+		webServer.SetBotUsername(bc.Username)
+	} else {
+		logger.Warn("web server not running; share/invite page username not updated")
+	}
+
+	// Stars is independent of legacy Platega configuration. Only explicit XTR
+	// purchase offers are payable, after the real bot and sync service are ready.
+	stars := service.NewStarsPaymentService(svc.orderService, telegramstars.New(api))
+	svc.handler.SetStarsPaymentService(stars)
+	if webServer != nil {
+		webServer.SetStarsPaymentService(stars)
+	}
+
+	// 9. Setup graceful shutdown context before starting durable payment polling.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	defer stop()
+	updates := telegramstars.Updates(ctx, botAPI, config.BotUpdateTimeout, stars.CaptureUpdate)
+
+	// 10. Start background goroutines
+	svc.handler.StartCacheCleanup(ctx, bot.CacheTTL/2)
+	svc.handler.StartRateLimiterCleanup(ctx, bot.CacheTTL, bot.CacheTTL*2)
+	svc.handler.StartReferralCacheSync(ctx)
+	svc.handler.StartBroadcastWorker(ctx)
+	svc.handler.StartStarsPaymentWorker(ctx)
+	bgWg := startBackgroundWorkers(ctx, svc.handler, svc.subService, svc.orderService, dbService, cfg)
+	startNetworkMonitor(ctx, bgWg, svc.netMonitor, cfg)
+
+	if webServer != nil {
+		webServer.SetPaymentReady(true)
+	}
+
+	logger.Debug("Bot started successfully")
+
+	if webServer != nil {
+		webServer.SetReady(true)
+	}
+
+	// 11. Run the main event loop (blocks until shutdown)
+	runEventLoop(ctx, botAPI, svc.handler, updates)
+
+	// 12. Graceful shutdown of background workers
+	gracefulShutdown(bgWg, svc.handler, svc.subServer)
+}
+
+// recoverAndReport recovers from panics, reports to Sentry, and logs the error.
+// Usage: defer recoverAndReport("Component name")
+func recoverAndReport(component string) {
+	if r := recover(); r != nil {
+		stack := debug.Stack()
+
+		sentry.CurrentHub().Recover(r)
+		sentry.Flush(logger.SentryPanicFlushTimeout)
+		logger.Error(component+" panicked",
+			// Only the log representation is a string; Sentry received r above.
+			zap.String("panic", logger.Sanitize(fmt.Sprint(r))),
+			zap.String("stack", string(stack)),
+		)
+	}
+}
+
+// handleUpdateSafely handles a Telegram update with panic recovery.
+func handleUpdateSafely(ctx context.Context, handler *bot.Handler, update tgbotapi.Update) {
+	defer recoverAndReport("Update handler")
+
+	handler.HandleUpdate(ctx, update)
+}

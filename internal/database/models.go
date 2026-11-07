@@ -1,0 +1,671 @@
+// Package database provides persistence, migrations, models, and repositories.
+package database
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/utils"
+	"gorm.io/gorm"
+)
+
+// Sentinel errors returned by Get* functions when a record is not found.
+// Callers should use errors.Is to distinguish "not found" from infrastructure/DB errors.
+var (
+	ErrInviteNotFound             = errors.New("invite not found")
+	ErrSubscriptionNotFound       = errors.New("subscription not found")
+	ErrInvalidSubscriptionToken   = errors.New("invalid subscription token")
+	ErrPlanNotFound               = errors.New("plan not found")
+	ErrOrderNotFound              = errors.New("order not found")
+	ErrProductNotFound            = errors.New("product not found")
+	ErrProductImmutable           = errors.New("product immutable after order")
+	ErrProviderSourceNotFound     = errors.New("provider source not found")
+	ErrTrialAlreadyActivated      = errors.New("trial already activated")
+	ErrBroadcastNotFound          = errors.New("broadcast not found")
+	ErrBroadcastRecipientStale    = errors.New("broadcast recipient claim is stale")
+	ErrBroadcastRecipientNotFound = errors.New("broadcast recipient not found")
+)
+
+const (
+	TrialPlanName = "trial"
+	FreePlanName  = "free"
+)
+
+// SubscriptionStatus represents the lifecycle state of a subscription.
+//
+// Это единственный допустимый набор значений: колонка subscriptions.status
+// ограничена CHECK-constraint из миграции 033_enforce_subscription_status_check.
+// Добавление нового статуса требует и изменения констант, и новой миграции.
+//
+//   - active   — активная: выдача через субсервер, рассылки, метрики.
+//   - expired  — истекла по сроку (зарезервирован; сейчас истечение понижает
+//     план до free, оставляя статус active).
+//   - paused   — на паузе (зарезервирован, в коде не используется).
+//   - canceled — отменена (зарезервирован, в коде не используется).
+//   - revoked  — отозвана: VPN-доступ снят, субсервер отдаёт 404, но запись
+//     в БД сохраняется (политика «подписки не удаляем»). При повторном
+//     заходе пользователя может быть «оживлена» (reanimateRevokedSubscription).
+type SubscriptionStatus string
+
+const (
+	SubscriptionStatusActive   SubscriptionStatus = "active"
+	SubscriptionStatusExpired  SubscriptionStatus = "expired"
+	SubscriptionStatusPaused   SubscriptionStatus = "paused"
+	SubscriptionStatusCanceled SubscriptionStatus = "canceled"
+	SubscriptionStatusRevoked  SubscriptionStatus = "revoked"
+)
+
+// Subscription represents a user's VPN subscription.
+//
+// Telegram ID conventions:
+//   - Positive values: привязанные пользователи (уникальный constraint)
+//   - Negative values: непривязанные trial подписки (генерируются через generateTrialTelegramID())
+//   - 0: не используется (историческая совместимость)
+//
+// См. generateTrialTelegramID() в trials.go для генерации уникальных отрицательных ID.
+type Subscription struct {
+	ID uint `gorm:"primaryKey"`
+	// TelegramID — уникальный для каждой подписки. Trial подписки используют отрицательные ID.
+	TelegramID     int64  `gorm:"uniqueIndex"`
+	Username       string `gorm:"size:255;index"`
+	ClientID       string `gorm:"size:255;not null;uniqueIndex"`
+	SubscriptionID string `gorm:"size:255;not null;uniqueIndex"`
+	Token          string `gorm:"size:64;not null;uniqueIndex"`
+	// ExpiresAt — срок действия подписки. NULL = бессрочная (free-план).
+	ExpiresAt        *time.Time `gorm:"index"`
+	Status           string     `gorm:"default:active;size:50;index"`
+	InviteCode       *string    `gorm:"size:16;index"`
+	PlanID           uint       `gorm:"index"`
+	ReferredBy       *int64     `gorm:"index"`
+	ProductID        *uint      `gorm:"index"`
+	ProviderSourceID *uint      `gorm:"index"`
+	// SubscriptionBuilderID is an optional per-subscription builder override
+	// (migration 045). NULL falls back to the plan's default builder.
+	SubscriptionBuilderID *uint `gorm:"column:subscription_builder_id;index"`
+	StartedAt             *time.Time
+	PricePaidCents        int64   `gorm:"default:0"`
+	Currency              *string `gorm:"size:3"`
+	Devices               string  `gorm:"type:text;default:'[]'"` // JSON array of {header_key: value} device entries
+	Ips                   string  `gorm:"type:text;default:'[]'"` // JSON array of {ip: timestamp} entries
+	// LastRequest — дата/время последнего запроса подписки через субсервер (/sub/:id).
+	// Обновляется best-effort при каждом запросе клиента. NULL до первого запроса.
+	LastRequest   *time.Time `gorm:"index"`
+	CreatedAt     time.Time  `gorm:"autoCreateTime"`
+	UpdatedAt     time.Time  `gorm:"autoUpdateTime"`
+	RemindersSent int        `gorm:"not null;default:0"` // bitmask: 1<<0=3d, 1<<1=1d, 1<<2=3h
+
+	Plan           *Plan           `gorm:"foreignKey:PlanID"`
+	Product        *Product        `gorm:"foreignKey:ProductID"`
+	ProviderSource *ProviderSource `gorm:"foreignKey:ProviderSourceID;references:ID"`
+	Orders         []Order         `gorm:"foreignKey:SubscriptionID"`
+}
+
+// BeforeCreate ensures every GORM creation path receives a public token. The
+// repository creation path additionally retries the unique-constraint collision
+// case; this hook covers the few internal helpers that create rows directly.
+func (s *Subscription) BeforeCreate(_ *gorm.DB) error {
+	if s.Token == "" {
+		token, err := utils.GenerateSubscriptionToken()
+		if err != nil {
+			return err
+		}
+		s.Token = token
+
+		return nil
+	}
+
+	if !utils.IsValidSubscriptionToken(s.Token) {
+		return fmt.Errorf("validate subscription token: %w", ErrInvalidSubscriptionToken)
+	}
+
+	return nil
+}
+
+// BeforeSave stores the subscription timestamps in UTC. SQLite compares the
+// text-encoded times lexically, so a value written in a non-UTC local zone
+// would be mis-ordered against the UTC bounds used by expiry queries.
+func (s *Subscription) BeforeSave(_ *gorm.DB) error {
+	s.ExpiresAt = utcTimePtr(s.ExpiresAt)
+	s.StartedAt = utcTimePtr(s.StartedAt)
+	s.LastRequest = utcTimePtr(s.LastRequest)
+	if !s.CreatedAt.IsZero() {
+		s.CreatedAt = s.CreatedAt.UTC()
+	}
+
+	return nil
+}
+
+func utcTimePtr(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+
+	u := t.UTC()
+
+	return &u
+}
+
+// ProviderSource represents an external VPN provider subscription feed: a
+// ready-made subscription URL fetched server-side. Builders select and order
+// entries of one or more sources; a subscription may also be linked to a single
+// source directly (customer lifecycle).
+type ProviderSource struct {
+	ID              uint      `gorm:"primaryKey;column:id"`
+	Name            string    `gorm:"size:255;not null;column:name"`
+	Type            string    `gorm:"size:50;not null;index;column:type"`
+	SubscriptionURL string    `gorm:"size:2048;not null;column:subscription_url"`
+	HWID            string    `gorm:"size:255;not null;default:'';column:hwid"`
+	UserAgent       string    `gorm:"size:512;not null;default:'';column:user_agent"`
+	Headers         string    `gorm:"type:text;not null;default:'{}';column:headers"`
+	Enabled         bool      `gorm:"not null;index;column:enabled"`
+	CreatedAt       time.Time `gorm:"not null;autoCreateTime;column:created_at"`
+	UpdatedAt       time.Time `gorm:"not null;autoUpdateTime;column:updated_at"`
+	// Admin metadata and last catalogue refresh (migration 045). Errors are
+	// stable codes only and never contain upstream URLs or credentials.
+	Description    string     `gorm:"type:text;not null;default:'';column:description"`
+	LastSyncAt     *time.Time `gorm:"column:last_sync_at"`
+	LastSyncStatus string     `gorm:"size:16;not null;default:'';column:last_sync_status"`
+	LastSyncError  string     `gorm:"size:64;not null;default:'';column:last_sync_error"`
+}
+
+// ProviderSourceEntry is one entry (server/node) seen in a provider source on
+// the last catalogue refresh. Only metadata is stored; share links with
+// credentials are always fetched live from the upstream URL.
+// (migration 045)
+//
+// The JSON form is the admin wire shape (snake_case). Source is never
+// serialized: ProviderSource carries the upstream URL and credentials.
+type ProviderSourceEntry struct {
+	ID               uint      `gorm:"primaryKey;column:id" json:"id"`
+	SourceID         uint      `gorm:"not null;index;column:source_id" json:"source_id"`
+	Fingerprint      string    `gorm:"size:64;not null;column:fingerprint" json:"fingerprint"`
+	OriginalName     string    `gorm:"size:255;not null;default:'';column:original_name" json:"original_name"`
+	Protocol         string    `gorm:"size:32;not null;default:'';column:protocol" json:"protocol"`
+	CountryCode      string    `gorm:"size:2;not null;default:'';column:country_code" json:"country_code"`
+	UpstreamPosition int       `gorm:"not null;default:0;column:upstream_position" json:"upstream_position"`
+	Present          bool      `gorm:"not null;default:true;column:present" json:"present"`
+	LastSeenAt       time.Time `gorm:"not null;column:last_seen_at" json:"last_seen_at"`
+
+	Source *ProviderSource `gorm:"foreignKey:SourceID" json:"-"`
+}
+
+// SubscriptionBuilder is an output configuration that selects and orders
+// entries from one or more ProviderSources. Plans reference a default builder;
+// individual subscriptions may override it. (migration 045)
+type SubscriptionBuilder struct {
+	ID           uint   `gorm:"primaryKey;column:id"`
+	Name         string `gorm:"size:128;not null;uniqueIndex;column:name"`
+	Description  string `gorm:"type:text;not null;default:'';column:description"`
+	Enabled      bool   `gorm:"not null;default:true;column:enabled"`
+	ProfileTitle string `gorm:"size:128;not null;default:'';column:profile_title"`
+	SupportURL   string `gorm:"size:512;not null;default:'';column:support_url"`
+	Announce     string `gorm:"size:512;not null;default:'';column:announce"`
+	// Version is incremented on every update and used for optimistic locking.
+	Version   int       `gorm:"not null;default:1;column:version"`
+	CreatedAt time.Time `gorm:"not null;autoCreateTime;column:created_at"`
+	UpdatedAt time.Time `gorm:"not null;autoUpdateTime;column:updated_at"`
+
+	Sources []SubscriptionBuilderSource `gorm:"foreignKey:BuilderID"`
+	Items   []SubscriptionBuilderItem   `gorm:"foreignKey:BuilderID"`
+}
+
+// SubscriptionBuilderSource links a builder to one of its input sources and
+// defines the order in which sources are consulted. (migration 045)
+type SubscriptionBuilderSource struct {
+	BuilderID uint `gorm:"primaryKey;column:builder_id"`
+	SourceID  uint `gorm:"primaryKey;column:source_id"`
+	Position  int  `gorm:"not null;default:0;column:position"`
+
+	Builder *SubscriptionBuilder `gorm:"foreignKey:BuilderID"`
+	Source  *ProviderSource      `gorm:"foreignKey:SourceID"`
+}
+
+// SubscriptionBuilderItem is one selection rule inside a builder.
+//
+// kind = "country": dynamically includes every present entry of the source
+// whose country_code matches. Resolved on every build — new nodes appear
+// automatically after the next source refresh.
+//
+// kind = "node": targets one concrete entry matched first by fingerprint
+// (exact), then by original_name (unique fallback). Fingerprint match
+// semantics follow the fallback fingerprint spec:
+//   - 1 match  → use it (+ warning when matched by name only)
+//   - 0 matches → missing (entry omitted)
+//   - >1 matches → conflict (entry omitted)
+//
+// custom_name overrides the display name in the assembled subscription.
+// enabled = false excludes the item from the build (soft exclude).
+// (migration 045)
+type SubscriptionBuilderItem struct {
+	ID           uint    `gorm:"primaryKey;column:id"`
+	BuilderID    uint    `gorm:"not null;index;column:builder_id"`
+	Kind         string  `gorm:"size:16;not null;column:kind"` // "country" | "node"
+	SourceID     uint    `gorm:"not null;column:source_id"`
+	CountryCode  string  `gorm:"size:2;not null;default:'';column:country_code"`
+	Fingerprint  string  `gorm:"size:64;not null;default:'';column:fingerprint"`
+	OriginalName string  `gorm:"size:255;not null;default:'';column:original_name"`
+	CustomName   *string `gorm:"size:128;column:custom_name"`
+	Description  string  `gorm:"type:text;not null;default:'';column:description"`
+	Position     int     `gorm:"not null;default:0;column:position"`
+	Enabled      bool    `gorm:"not null;default:true;column:enabled"`
+
+	Builder *SubscriptionBuilder `gorm:"foreignKey:BuilderID"`
+	Source  *ProviderSource      `gorm:"foreignKey:SourceID"`
+}
+
+// BuilderItemKind enumerates the two selection strategies.
+const (
+	BuilderItemKindCountry = "country"
+	BuilderItemKindNode    = "node"
+)
+
+// Plan represents a subscription plan. Its content is served by the plan's
+// default SubscriptionBuilder. Traffic and device limits are not enforced
+// locally (upstream providers report their own quota in subscription-userinfo),
+// so the plan carries no limit fields (migration 051).
+type Plan struct {
+	ID       uint   `gorm:"primaryKey;column:id"`
+	Name     string `gorm:"size:50;uniqueIndex;column:name"`
+	IsActive bool   `gorm:"not null;default:true;column:is_active"`
+	// SubscriptionBuilderID is the plan's default builder (migration 045).
+	SubscriptionBuilderID *uint     `gorm:"column:subscription_builder_id"`
+	CreatedAt             time.Time `gorm:"autoCreateTime;column:created_at"`
+	UpdatedAt             time.Time `gorm:"autoUpdateTime;column:updated_at"`
+
+	Products []Product `gorm:"foreignKey:PlanID"`
+}
+
+// Product represents a purchasable subscription product bound to a plan.
+type Product struct {
+	// OfferID is an opaque public reference, not a credential or database ID.
+	OfferID      string     `gorm:"column:offer_id"`
+	OfferEndsAt  *time.Time `gorm:"column:offer_ends_at"`
+	ID           uint       `gorm:"primaryKey;column:id"`
+	PlanID       uint       `gorm:"not null;column:plan_id"`
+	Name         string     `gorm:"size:255;not null;column:name"`
+	DurationDays int        `gorm:"not null;column:duration_days"`
+	PriceCents   int64      `gorm:"not null;column:price_cents"`
+	Currency     string     `gorm:"size:3;not null;default:RUB;column:currency"`
+	IsActive     bool       `gorm:"not null;default:true;column:is_active"`
+	// Card presentation (migration 046). Display only: never part of the
+	// immutable purchase terms. Features is a JSON array of strings.
+	Description string `gorm:"type:text;not null;default:'';column:description"`
+	Features    string `gorm:"type:text;not null;default:'[]';column:features"`
+	Badge       string `gorm:"size:32;not null;default:'';column:badge"`
+	// SortOrder is the catalogue position (ascending; ties by price, then ID).
+	SortOrder int `gorm:"not null;default:0;column:sort_order"`
+	// Version is incremented on every admin change (optimistic locking).
+	Version int `gorm:"not null;default:1;column:version"`
+	// PreviousID is the product this row replaced when the admin changed the
+	// purchase terms of a product already referenced by orders/subscriptions.
+	PreviousID *uint     `gorm:"column:previous_id"`
+	CreatedAt  time.Time `gorm:"autoCreateTime;column:created_at"`
+	UpdatedAt  time.Time `gorm:"autoUpdateTime;column:updated_at"`
+
+	Plan   *Plan   `gorm:"foreignKey:PlanID"`
+	Orders []Order `gorm:"foreignKey:ProductID"`
+}
+
+// ChargebackResult describes the atomic order/subscription transition performed
+// for a provider chargeback callback. Result.SubscriptionID is intentionally
+// absent: callers read it off result.Order.SubscriptionID to avoid a second
+// repository lookup.
+type ChargebackResult struct {
+	Order        *Order
+	WasPaid      bool
+	Transitioned bool
+	Downgraded   bool
+}
+
+// Order represents a recorded purchase event for a subscription.
+// Statuses: pending | paid | expired | canceled.
+//
+// Fields:
+//   - provider_payment_id — external payment ID from provider.
+//   - paid_at — payment confirmation timestamp.
+//   - activated_at — subscription activation timestamp.
+//   - expires_at — subscription validity granted by this purchase (a snapshot of
+//     subscriptions.expires_at at payment time), not an invoice timeout.
+
+type OrderStatus string
+
+const (
+	OrderStatusPending  OrderStatus = "pending"
+	OrderStatusPaid     OrderStatus = "paid"
+	OrderStatusExpired  OrderStatus = "expired"
+	OrderStatusCanceled OrderStatus = "canceled"
+)
+
+type Order struct {
+	// Purchase fields are nullable for historical/provider-created orders.
+	// PurchaseExpiresAt is the intent deadline, never entitlement ExpiresAt.
+	StarsCheckoutID          *string     `gorm:"column:stars_checkout_id"`
+	StarsCheckoutAt          *time.Time  `gorm:"column:stars_checkout_at"`
+	PurchaseID               *string     `gorm:"column:purchase_id"`
+	BuyerTelegramID          *int64      `gorm:"column:buyer_telegram_id"`
+	PurchaseKey              *string     `gorm:"column:purchase_key"`
+	PurchaseExpiresAt        *time.Time  `gorm:"column:purchase_expires_at"`
+	ID                       uint        `gorm:"primaryKey;column:id"`
+	SubscriptionID           uint        `gorm:"not null;column:subscription_id"`
+	ProductID                uint        `gorm:"not null;column:product_id"`
+	Status                   OrderStatus `gorm:"not null;size:16;column:status"`
+	AmountCents              int64       `gorm:"not null;column:amount_cents"`
+	CallbackAmountCents      *int64      `gorm:"column:callback_amount_cents"` // фактически списано с клиента (с учётом комиссии)
+	ProviderFeeCents         *int64      `gorm:"column:provider_fee_cents"`    // комиссия провайдера из API транзакции (best-effort)
+	Currency                 string      `gorm:"size:3;not null;default:RUB;column:currency"`
+	PaymentProvider          string      `gorm:"column:payment_provider"`
+	ProviderPaymentID        string      `gorm:"column:provider_payment_id"`
+	CreatedAt                time.Time   `gorm:"not null;column:created_at"`
+	PaidAt                   *time.Time  `gorm:"column:paid_at"`
+	ActivatedAt              *time.Time  `gorm:"column:activated_at"`
+	ExpiresAt                *time.Time  `gorm:"column:expires_at"`
+	PaymentURL               string      `gorm:"column:payment_url"`
+	PaymentExpiresAt         *time.Time  `gorm:"column:payment_expires_at"`
+	PaymentCreationUncertain bool        `gorm:"not null;default:false;column:payment_creation_uncertain"`
+
+	Subscription *Subscription `gorm:"foreignKey:SubscriptionID"`
+	Product      *Product      `gorm:"foreignKey:ProductID"`
+}
+
+// Invite represents a referral invite code.
+type Invite struct {
+	Code         string    `gorm:"primaryKey;size:16"`
+	ReferrerTGID int64     `gorm:"index;not null"`
+	CreatedAt    time.Time `gorm:"autoCreateTime"`
+
+	Subscriptions []Subscription `gorm:"foreignKey:InviteCode"`
+}
+
+// BroadcastStatus represents the lifecycle state of a broadcast.
+//
+// Это единственный допустимый набор значений: колонка broadcasts.status
+// ограничена CHECK-constraint из миграции 036_create_broadcasts.
+// Добавление нового статуса требует и изменения констант, и новой миграции.
+//
+//   - scheduled — рассылка создана (запланирована), отправка не начиналась.
+//   - running   — отправка в процессе.
+//   - completed — отправка завершена полностью.
+//   - failed    — прервана ошибкой БД при получении батчей получателей.
+//   - canceled  — прервана таймаутом/отменой; в отчёте только обработанные.
+type BroadcastStatus string
+
+const (
+	BroadcastStatusScheduled BroadcastStatus = "scheduled"
+	BroadcastStatusRunning   BroadcastStatus = "running"
+	BroadcastStatusCompleted BroadcastStatus = "completed"
+	BroadcastStatusFailed    BroadcastStatus = "failed"
+	BroadcastStatusCanceled  BroadcastStatus = "canceled"
+)
+
+// Broadcast — карточка одной массовой рассылки (таблица broadcasts).
+//
+// Поля:
+//   - Filters        — JSON-таргетинг аудитории (см. BroadcastFilter,
+//     ParseBroadcastFilter, applyBroadcastFilter); '{}' = без ограничений.
+//   - DeliveryReport — JSON-отчёт по получателям: delivered/blocked/errors
+//     (см. BroadcastDeliveryReport). Счётчики Sent/Blocked/FailedCount хранятся
+//     отдельно, чтобы список рассылок не читал большой JSON.
+//   - RecipientsState — JSON snapshot аудитории и состояния доставки каждого
+//     получателя; хранится в этой же строке для восстановления без отдельной
+//     таблицы.
+type Broadcast struct {
+	ID               uint   `gorm:"primaryKey"`
+	Name             string `gorm:"size:255;not null"`
+	Filters          string `gorm:"type:text;not null;default:'{}'"`
+	MessageText      string `gorm:"type:text;not null"`
+	Status           string `gorm:"not null;size:16;default:scheduled"`
+	PlannedAt        *time.Time
+	StartedAt        *time.Time
+	FinishedAt       *time.Time
+	RecipientsTotal  int64      `gorm:"not null;default:0"`
+	SentCount        int64      `gorm:"not null;default:0"`
+	BlockedCount     int64      `gorm:"not null;default:0"`
+	FailedCount      int64      `gorm:"not null;default:0"`
+	UnreachableCount int64      `gorm:"not null;default:0"`
+	DeliveryReport   string     `gorm:"type:text;not null;default:'{}'"`
+	LastError        string     `gorm:"type:text;not null;default:''"`
+	RetryAt          *time.Time `gorm:"index"`
+	RetryCount       int        `gorm:"not null;default:0"`
+	// RecipientsState stores the immutable audience snapshot and per-recipient
+	// delivery state as JSON. It keeps broadcast recovery durable without a
+	// separate recipient table.
+	RecipientsState string    `gorm:"type:text;not null;default:'{\"snapshot\":false,\"recipients\":[]}'"`
+	CreatedAt       time.Time `gorm:"autoCreateTime"`
+	UpdatedAt       time.Time `gorm:"autoUpdateTime"`
+}
+
+// BroadcastSendError описывает одного получателя, которому сообщение не
+// доставлено по причине, отличной от блокировки бота.
+type BroadcastSendError struct {
+	TelegramID int64  `json:"telegram_id"`
+	Error      string `json:"error"`
+}
+
+// BroadcastDeliveryReport — JSON-отчёт рассылки: списки telegram_id по исходам.
+type BroadcastDeliveryReport struct {
+	Delivered    []int64              `json:"delivered"`
+	Blocked      []int64              `json:"blocked"`
+	Unreachable  []int64              `json:"unreachable"`
+	Errors       []BroadcastSendError `json:"errors"`
+	NotProcessed []int64              `json:"not_processed"`
+}
+
+// BroadcastRecipientStatus represents the durable delivery state of one
+// recipient in a broadcast snapshot. Delivery outcomes are copied to
+// BroadcastDeliveryReport so the admin can inspect delivered and blocked IDs.
+type BroadcastRecipientStatus string
+
+const (
+	BroadcastRecipientPending     BroadcastRecipientStatus = "pending"
+	BroadcastRecipientSending     BroadcastRecipientStatus = "sending"
+	BroadcastRecipientSent        BroadcastRecipientStatus = "sent"
+	BroadcastRecipientBlocked     BroadcastRecipientStatus = "blocked"
+	BroadcastRecipientUnreachable BroadcastRecipientStatus = "unreachable"
+	BroadcastRecipientFailed      BroadcastRecipientStatus = "failed"
+)
+
+// TrialRequest tracks trial requests for rate limiting.
+type TrialRequest struct {
+	ID        uint      `gorm:"primaryKey"`
+	IP        string    `gorm:"size:45;index"`
+	CreatedAt time.Time `gorm:"autoCreateTime"`
+}
+
+// PoolStats contains database connection pool statistics.
+type PoolStats struct {
+	MaxOpen       int
+	Open          int
+	InUse         int
+	Idle          int
+	WaitCount     int64
+	WaitDuration  time.Duration
+	MaxIdleClosed int64
+}
+
+func (Product) TableName() string {
+	return "products"
+}
+
+func (Order) TableName() string {
+	return "orders"
+}
+
+func (ProviderSource) TableName() string {
+	return "provider_sources"
+}
+
+func (Plan) TableName() string {
+	return "plans"
+}
+
+func (Subscription) TableName() string {
+	return "subscriptions"
+}
+
+func (Invite) TableName() string {
+	return "invites"
+}
+
+func (TrialRequest) TableName() string {
+	return "trial_requests"
+}
+
+func (Broadcast) TableName() string {
+	return "broadcasts"
+}
+
+func (ProviderSourceEntry) TableName() string {
+	return "provider_source_entries"
+}
+
+func (SubscriptionBuilder) TableName() string {
+	return "subscription_builders"
+}
+
+func (SubscriptionBuilderSource) TableName() string {
+	return "subscription_builder_sources"
+}
+
+func (SubscriptionBuilderItem) TableName() string {
+	return "subscription_builder_items"
+}
+
+// IsExpired returns true if the subscription has expired.
+// A nil ExpiresAt means the subscription is perpetual (no expiry set).
+func (s *Subscription) IsExpired() bool {
+	if s.ExpiresAt == nil {
+		return false
+	}
+
+	return time.Now().After(*s.ExpiresAt)
+}
+
+// IsActive returns true if the subscription is active and not expired.
+func (s *Subscription) IsActive() bool {
+	return s.Status == string(SubscriptionStatusActive) && !s.IsExpired()
+}
+
+// IsPaid reports whether the subscription is on a paid (premium) tier, i.e. a
+// product was purchased and/or money was actually paid. Both fields are set by
+// the payment flow and cleared on any downgrade to the free plan (chargeback,
+// expiry, reanimation, admin /setplan on free). Admin plan overrides that do not
+// involve payment (e.g. /setplan onto a premium plan) intentionally do NOT count
+// as paid here.
+func (s *Subscription) IsPaid() bool {
+	return s != nil && (s.ProductID != nil || s.PricePaidCents > 0)
+}
+
+// ParseDevices parses the Devices JSON string into a slice of header maps.
+func (s *Subscription) ParseDevices() ([]map[string]string, error) {
+	if s.Devices == "" {
+		return []map[string]string{}, nil
+	}
+
+	var devices []map[string]string
+
+	err := json.Unmarshal([]byte(s.Devices), &devices)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal devices: %w", err)
+	}
+
+	return devices, nil
+}
+
+// SetDevices serializes a slice of header maps into the Devices JSON string.
+func (s *Subscription) SetDevices(devices []map[string]string) error {
+	data, err := json.Marshal(devices)
+	if err != nil {
+		return fmt.Errorf("failed to marshal devices: %w", err)
+	}
+
+	s.Devices = string(data)
+
+	return nil
+}
+
+// ParseIPs parses the Ips JSON string into a slice of ip->timestamp maps.
+func (s *Subscription) ParseIPs() ([]map[string]string, error) {
+	if s.Ips == "" {
+		return []map[string]string{}, nil
+	}
+
+	var ips []map[string]string
+
+	err := json.Unmarshal([]byte(s.Ips), &ips)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal ips: %w", err)
+	}
+
+	return ips, nil
+}
+
+// SetIPs serializes a slice of ip->timestamp maps into the Ips JSON string.
+func (s *Subscription) SetIPs(ips []map[string]string) error {
+	data, err := json.Marshal(ips)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ips: %w", err)
+	}
+
+	s.Ips = string(data)
+
+	return nil
+}
+
+// ParseDeliveryReport декодирует JSON-отчёт рассылки. Пустая строка возвращает
+// пустой отчёт с инициализированными (не nil) списками; некорректный JSON —
+// ошибку.
+func (c *Broadcast) ParseDeliveryReport() (*BroadcastDeliveryReport, error) {
+	report := &BroadcastDeliveryReport{}
+	if c.DeliveryReport == "" {
+		report.Delivered = []int64{}
+		report.Blocked = []int64{}
+		report.Unreachable = []int64{}
+		report.Errors = []BroadcastSendError{}
+		report.NotProcessed = []int64{}
+
+		return report, nil
+	}
+
+	err := json.Unmarshal([]byte(c.DeliveryReport), report)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal broadcast delivery report: %w", err)
+	}
+
+	if report.Delivered == nil {
+		report.Delivered = []int64{}
+	}
+	if report.Blocked == nil {
+		report.Blocked = []int64{}
+	}
+	if report.Unreachable == nil {
+		report.Unreachable = []int64{}
+	}
+	if report.Errors == nil {
+		report.Errors = []BroadcastSendError{}
+	}
+	if report.NotProcessed == nil {
+		report.NotProcessed = []int64{}
+	}
+
+	return report, nil
+}
+
+// SetDeliveryReport сериализует отчёт рассылки в JSON-поле.
+func (c *Broadcast) SetDeliveryReport(report *BroadcastDeliveryReport) error {
+	if report == nil {
+		c.DeliveryReport = "{}"
+
+		return nil
+	}
+
+	data, err := json.Marshal(report)
+	if err != nil {
+		return fmt.Errorf("failed to marshal broadcast delivery report: %w", err)
+	}
+
+	c.DeliveryReport = string(data)
+
+	return nil
+}

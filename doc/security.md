@@ -1,0 +1,308 @@
+# Security Policy — rs8kvn_bot
+
+---
+
+Use the latest stable image tag. For reproducible deployments, pin a concrete SemVer or commit SHA tag.
+
+---
+
+## Reporting a Vulnerability
+
+**Please do not report security vulnerabilities through public GitHub issues.**
+
+Instead, contact us privately:
+
+📧 **Email:** security@example.com (example — replace with actual email)  
+
+**Include in report:**
+1. Affected version(s)
+2. Steps to reproduce
+3. Proof of concept (if applicable)
+4. Potential impact assessment
+5. Suggested fix (optional)
+
+**Response time:**
+- Initial acknowledgment: **within 48 hours**
+- Fix timeline: Depends on severity (critical: 72h, high: 7d, medium: 30d)
+- Coordinated disclosure: We'll work with you on public announcement timing
+
+---
+
+## Security Measures Implemented
+
+### 1. Authentication & Authorization
+
+| Component | Protection |
+|-----------|------------|
+| Telegram bot | User identification via `chat_id`; admin commands check `TELEGRAM_ADMIN_ID` |
+| Provider sources | URL and headers stored server-side in `provider_sources`; fetch errors never expose URLs or credentials; HTTPS is recommended for production |
+| Trial Telegram IDs | Positive = bound users, Negative = unbound trial subscriptions, 0 = unused |
+
+### 2. Input Validation
+
+- **URLs (S3):** `validateURL()` restricts schemes to `http` and `https` only — prevents `file://`, `gopher://`, and other schemes that could enable SSRF
+- **Provider source transport:** ProviderSource URLs accept HTTP or HTTPS; use HTTPS for production and keep HTTP limited to trusted private networks
+- **Invite codes:** Alphanumeric regex validation
+- **Telegram IDs:** Integer parsing with overflow protection
+- **Type-safe env vars:** `internal/flag/` typed registry validates and parses all env vars at config load time
+
+### 3. Network Security
+
+- **Non-root Docker container** (UID 1000)
+- **`no-new-privileges:true`** — prevents privilege escalation
+- **Read-only config volume** (`/.env:ro`)
+- **Health checks** exposed only on localhost by default
+- **RetryWithBackoff** on VPN client handles transient failures
+- **Rate limiting** per Telegram user (30 tokens, 5/sec refill)
+- **IP rate limiting** on trial endpoint (3/hour per IP)
+- **Trusted proxy IP extraction (S2):** `getClientIP()` uses the **rightmost** IP from `X-Forwarded-For` (set by the trusted reverse proxy) instead of the leftmost value (which is client-controllable and spoofable). This prevents IP spoofing to bypass rate limits.
+
+### 4. Data Protection
+
+- **Database:** SQLite with WAL mode (atomic commits)
+- **Migrations:** Embedded, no external files at runtime
+- **Backups:** Daily rotation (30 files by default), same directory (consider off-site)
+- **Logging:** Sensitive data masked in `Config.String()`; no secrets in logs
+- **Secrets:** Stored in `.env` (not in code), file permissions recommended `600`
+- **Provider source credentials:** stored only in the database (`provider_sources` URL/headers); fetch failures are reduced to stable error codes that never contain upstream URLs, headers or response content
+
+### 5. Error Handling
+
+- **Panic recovery** in all goroutines (`recoverAndReport`)
+- **Graceful shutdown** — in-flight requests allowed to complete
+- **RetryWithBackoff** retries VPN panel calls on transient errors (exponential backoff + jitter, up to 3 retries)
+- **Fail-closed cache revalidation** for the Subscription server: cached access is not served when subscription status cannot be checked
+
+### 6. Code Quality
+
+- **Static analysis:** `golangci-lint` with strict config, `gosec` security scanner
+- **Race detection:** All tests run with `-race`
+- **Fuzzing:** Markdown sanitization fuzz tests
+- **Leak detection:** Goroutine leak tests in `tests/leak/`
+- **Test coverage:** 66.2% aggregate in the latest documented run; regenerate with `go test -coverprofile=coverage.out ./...`
+- **Prometheus metrics** (`internal/metrics/`): HTTP requests, bot updates, DB queries, cache hits/misses, active subscriptions, reminder delivery, and payment events
+
+### 7. Architecture Security
+
+- **Decoupled web layer (A1):** The `web` package no longer imports the `bot` package. `NewServer` accepts a `botUsername string` instead of `*bot.BotConfig`, reducing coupling and attack surface — a compromise of the web/subscription server cannot reach into bot internals.
+- **Builder pipeline:** `/sub` content is assembled from ProviderSource catalogues by Subscription Builders. The bot manages no clients on external panels, so there are no panel credentials to protect.
+- **Error classification:** Typed errors (`ErrSubscriptionAlreadyExists`, `ErrSubscriptionNotFound`) prevent information leakage through generic error messages.
+
+### 8. Provider Source Credentials
+
+ProviderSource URLs and request headers (which may carry upstream credentials) are stored server-side in `provider_sources` and are used only by the subserver and the admin catalogue sync.
+
+- **Storage:** database only. `.env` file permissions must be `600` if used for other secrets.
+- **Exposure:** fetch failures collapse to stable error codes (`ErrProviderSourceUnavailable` and the catalogue-sync failure codes) that never contain upstream URLs, headers or response content.
+- **Transport:** use HTTPS provider URLs and restrict outbound network access of the bot host to the providers you use. A ProviderSource URL can point to any reachable address, so only trusted admins may create sources (SSRF).
+- **Rotation / compromise:** rotate the credential at the provider, update the ProviderSource in the admin UI, then check the provider's access logs for the window between compromise and rotation.
+- **Monitoring:** watch `subserver_source_fetch_total{result="error"}`; `SUBSERVER_ACCESS_LOG` enables subscription server access logging.
+
+### 9. Payment Webhook Security (Platega)
+
+- **Callback auth:** `POST /payment/callback` requires `X-MerchantId` and `X-Secret` compared with `subtle.ConstantTimeCompare` (`platega.VerifyHeaders`). Empty credentials — configured or received — are rejected **before** comparison, so an unconfigured server never verifies. Unauthorized requests are rejected (401) **before the body is read or logged**; the raw payload is debug-logged only for authenticated callbacks.
+- **Body hardening:** `http.MaxBytesReader(256 KiB)`, `json.Decoder.UseNumber` (fixed-point amounts), exactly one JSON document (trailing data → 400).
+- **Business validation:** callback currency must equal the stored order and the callback amount must not be below the order amount (→ 400). Platega may include its payment-method commission in the callback total, so larger authenticated amounts are accepted; provider transaction ID must be a UUID v4 (→ 400). Underpayments cannot activate an order.
+- **Idempotent transitions:** `ConfirmOrderPaidCAS`/`CancelOrderCAS` are guarded CAS transitions (`pending → paid`, `pending/canceled`); duplicate callbacks are no-ops. A late `CONFIRMED` for an expired/canceled order never activates it.
+- **Chargebacks:** `CHARGEBACKED` on a paid order auto-downgrades the subscription to the free plan unless another paid order exists. On the successful paid-order path (`WasPaid=true`), the admin receives exactly one dedicated `notifyAdminChargeback` alert with the buyer link and access status (downgraded or preserved). `NotifyPaymentIssue` is reserved for infrastructure or integration failures and is not a normal duplicate chargeback notification.
+- **Secrets:** payment credentials are **not** included in `Config.String()` (masked by absence) and are never logged.
+- **Monitoring:** `payment_issues_total{event}` + `payment_amounts_cents_total{operation,currency}` for alerting on anomalies (unexpected chargebacks, callback mismatches, late confirmations).
+
+---
+
+## Security Hardening Checklist
+
+### Before Deployment
+
+- [ ] **Use HTTPS** for all ProviderSource URLs (no HTTP in prod)
+- [ ] Set `GLOBAL_SUB_URL` to your subscription server's public HTTPS URL
+- [ ] Set `TELEGRAM_ADMIN_ID` to real admin user ID
+- [ ] `.env` file permissions: `chmod 600 .env`
+- [ ] Docker volumes: owned by non-root user (UID 1000)
+- [ ] Enable `SENTRY_DSN` for error monitoring
+- [ ] Configure firewall: block all except 127.0.0.1:8880 (or proxy through nginx)
+- [ ] Run `gosec ./...` and fix HIGH severity findings
+- [ ] Run `govulncheck ./...` and update vulnerable dependencies
+
+### Operational Security
+
+- [ ] **Rotate secrets** every 90 days (panel API tokens)
+- [ ] Monitor `/healthz` with external service (UptimeRobot, healthchecks.io)
+- [ ] Monitor Prometheus metrics for anomalies (provider source fetch errors, payment issues, error-rate spikes)
+- [ ] Review logs daily for `error`/`warn` level
+- [ ] Watch for repeated provider fetch errors (`subserver_source_fetch_total{result="error"}`) that may indicate a rotated or revoked provider credential
+- [ ] Backup verification: monthly restore test
+- [ ] OS security updates: at least monthly
+- [ ] Enable audit logging on all VPN panels
+- [ ] Use VPN/private network for panel hosts (not exposed to internet)
+- [ ] Set `GOGC=40` (already in Dockerfile) to limit memory
+- [ ] Limit container resources (memory 128M, CPU 0.5)
+
+### Advanced Hardening
+
+- [ ] **Reverse proxy (nginx)** in front with:
+  - SSL termination
+  - Rate limiting on `/i/` and `/sub/` endpoints
+  - IP allowlist for `/healthz` (monitoring only)
+  - Request size limits
+- [ ] **SELinux/AppArmor** profile for container
+- [ ] **Read-only root filesystem** (except `/app/data`)
+- [ ] **Seccomp** profile: block unnecessary syscalls
+- [ ] **Network segmentation:** Place bot and VPN panels on private VLAN
+- [ ] **Audit trail:** Forward logs to SIEM (Graylog, ELK)
+- [ ] **WAF** (ModSecurity) if exposed to internet
+
+---
+
+## Known Security Limitations
+
+| Limitation | Reason | Mitigation |
+|------------|--------|------------|
+| SQLite single-writer bottleneck | DB engine choice | Monitor write latency; migrate to PostgreSQL if >10k writes/day |
+| No built-in DDoS protection | Layer 7 | Use nginx rate limiting or cloud WAF |
+| No request signing for API | Bearer token only | Use HTTPS + rotate token regularly |
+| Trial rate limit per IP (not per user) | IPs can be changed via VPN | Acceptable for free tier; paid users get unique links |
+| ProviderSource SSRF | A ProviderSource URL can point to arbitrary internal addresses | Only trusted admins create sources; restrict outbound traffic with a firewall; use only expected provider hosts |
+
+---
+
+## Incident Response
+
+### If Bot is Compromised
+
+1. **Isolate:** Stop container / kill process
+2. **Preserve evidence:** Copy logs (`data/bot.log`), DB (`rs8kvn.db`), memory dump if possible
+3. **Analyze:** Check logs for unauthorized access, unusual API calls, new admin users in Telegram
+4. **Rotate secrets:**
+   - New Telegram bot token (via @BotFather)
+   - ProviderSource credentials (URLs/headers; rotate at the provider)
+5. **Restore from clean backup:** If DB tampered, restore from known-good backup
+6. **Update:** Deploy latest version with security fixes
+7. **Notify:** Inform users if personal data potentially exposed
+
+### If a Provider Source Credential is Compromised
+
+1. Rotate the credential at the provider (the old one must stop working).
+2. Update the ProviderSource URL/headers in the admin UI.
+3. Check the provider's access logs for unauthorized use.
+4. Review the time window between compromise and rotation.
+
+### Data Breach Notification
+
+If subscriber data (Telegram IDs, usernames, subscription links) is exposed:
+- Assess scope: which tables affected?
+- Notify affected users via Telegram (if possible)
+- Rotate all subscription links (force re-issue — requires DB migration)
+- Review access controls
+
+---
+
+## Secure Configuration Example
+
+`.env` production example:
+```bash
+# Telegram
+TELEGRAM_BOT_TOKEN=1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi
+TELEGRAM_ADMIN_ID=123456789
+
+# ProviderSources and Builders are managed in the admin UI (stored in the database).
+
+# Subscription server (required)
+GLOBAL_SUB_URL=https://sub.example.com  # Public HTTPS URL for subscription links
+SUBSERVER_ACCESS_LOG=/app/data/subserver.log  # Empty disables access logging
+
+# Database (on persistent volume)
+DATABASE_PATH=/app/data/rs8kvn.db
+
+# Logging
+LOG_LEVEL=warn  # Less verbose in prod
+LOG_FILE_PATH=/app/data/bot.log
+
+# Monitoring
+HEARTBEAT_URL=https://healthchecks.io/ping/your-uuid
+HEARTBEAT_INTERVAL=300
+SENTRY_DSN=https://your-key@o123456.ingest.sentry.io/1234567
+WEB_SERVER_PORT=8880
+
+# Trial
+TRIAL_DURATION_HOURS=3
+TRIAL_RATE_LIMIT=3
+```
+
+> **Note:** ProviderSources and Builders live in the database. `GLOBAL_SUB_URL` is required and provides the subscription URL prefix.
+
+**Docker run:**
+```bash
+docker run -d \
+  --name rs8kvn_bot \
+  --restart unless-stopped \
+  --security-opt no-new-privileges:true \
+  --pids-limit=100 \
+  --memory=128M \
+  --memory-swap=256M \
+  --cpus=0.5 \
+  -v $(pwd)/.env:/app/.env:ro \
+  -v $(pwd)/data:/app/data \
+  -p 127.0.0.1:8880:8880 \
+  ghcr.io/hdjsjsdhdhhs-prog/dictatorvpn:latest
+```
+
+**Docker daemon hardening** (`/etc/docker/daemon.json`):
+```json
+{
+  "userns-remap": "default",
+  "no-new-privileges": true,
+  "default-ulimits": {
+    "nofile": {"Name": "nofile", "Hard": 65535, "Soft": 65535}
+  },
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+```
+
+---
+
+## Dependency Security
+
+**Current dependencies** (selected):
+
+| Package | Version | Known vulns? |
+|---------|---------|--------------|
+| `gorm.io/gorm` | v1.31.2 | None |
+| `github.com/mattn/go-sqlite3` | v1.14.48 | None (CVE-2023-32636 patched) |
+| `go.uber.org/zap` | v1.28.0 | None |
+| `github.com/prometheus/client_golang` | v1.23.2 | None |
+
+**Check regularly:**
+```bash
+govulncheck ./...
+```
+
+**Update dependencies:**
+```bash
+go get -u ./...
+go mod tidy
+go mod verify
+```
+
+---
+
+## Security Audits
+
+**Past audits:**
+- 2026-04-17: Internal audit (SEC-01..SEC-12) — see `docs/review-sf35.md`
+- 2026-07-02: Pre-release audit (v2.3.0) — S2 (X-Forwarded-For spoofing: `getClientIP` now reads rightmost IP from trusted proxy), S3 (URL scheme restriction: `validateURL` now restricts to http/https only, preventing SSRF via `file://`/`gopher://`), A1 (web→bot dependency break: `web` package no longer imports `bot`, reducing attack surface)
+
+**Future audits:** Schedule annual external pentest if handling >10k users.
+
+---
+
+## Contact
+
+Security issues: **security@example.com** (replace with the maintained security contact before publication)  
+General questions: GitHub Issues (public)
+
+*This policy is maintained against the current codebase.*

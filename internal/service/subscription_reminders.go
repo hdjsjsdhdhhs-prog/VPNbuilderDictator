@@ -1,0 +1,108 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/interfaces"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/metrics"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/utils"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+)
+
+const (
+	// ReminderBit3Days marks the 3-day reminder.
+	ReminderBit3Days = 1 << iota
+	// ReminderBit1Day marks the 1-day reminder.
+	ReminderBit1Day
+	// ReminderBit3Hours marks the 3-hour reminder.
+	ReminderBit3Hours
+)
+
+var expiryReminderWindows = [3]interfaces.SubscriptionReminderWindow{
+	{Name: "3d", Bit: ReminderBit3Days, LeadTime: 72 * time.Hour},
+	{Name: "1d", Bit: ReminderBit1Day, LeadTime: 24 * time.Hour},
+	{Name: "3h", Bit: ReminderBit3Hours, LeadTime: 3 * time.Hour},
+}
+
+// ExpiryReminderWindows returns the configured reminder windows by value.
+func ExpiryReminderWindows() [3]interfaces.SubscriptionReminderWindow {
+	return expiryReminderWindows
+}
+
+// ReminderWindowBounds returns the scan range for a worker tick.
+func ReminderWindowBounds(w interfaces.SubscriptionReminderWindow, now time.Time) (time.Time, time.Time) {
+	const halfTick = 30 * time.Minute
+
+	center := now.Add(w.LeadTime)
+
+	return center.Add(-halfTick), center.Add(halfTick)
+}
+
+// ReminderWindowRemaining converts time left into values shown to users.
+func ReminderWindowRemaining(now, expiresAt time.Time) (daysLeft, hoursLeft int) {
+	remaining := expiresAt.Sub(now)
+	if remaining <= 0 {
+		return 0, 0
+	}
+
+	return int(remaining.Hours() / 24), int(remaining.Hours()) % 24
+}
+
+// SendExpiryReminder claims a reminder bit before sending and releases it on send failure.
+func (s *SubscriptionService) SendExpiryReminder(ctx context.Context, sub *database.Subscription, window interfaces.SubscriptionReminderWindow) error {
+	if s.bot == nil || sub == nil || sub.TelegramID == 0 || sub.ExpiresAt == nil {
+		return nil
+	}
+
+	claimed, err := s.reminderRepo.ClaimReminder(ctx, sub.ID, window.Bit, *sub.ExpiresAt)
+	if err != nil {
+		metrics.SubscriptionRemindersTotal.WithLabelValues(window.Name, "error").Inc()
+		return fmt.Errorf("claim reminder: %w", err)
+	}
+
+	if !claimed {
+		return nil
+	}
+
+	daysLeft, hoursLeft := ReminderWindowRemaining(time.Now().UTC(), *sub.ExpiresAt)
+	text := utils.EscapeMarkdownV2(reminderText(daysLeft, hoursLeft, s.cfg.SubURL(sub.Token)))
+	msg := tgbotapi.NewMessage(sub.TelegramID, text)
+	renewalKeyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("💎 Продлить Premium", "buy_premium_list"),
+		),
+	)
+	msg.ReplyMarkup = &renewalKeyboard
+
+	msg.ParseMode = tgbotapi.ModeMarkdownV2
+
+	_, err = s.bot.Send(msg)
+	if err != nil {
+		releaseErr := s.reminderRepo.ReleaseReminder(ctx, sub.ID, window.Bit, *sub.ExpiresAt)
+		if releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+		}
+
+		metrics.SubscriptionRemindersTotal.WithLabelValues(window.Name, "error").Inc()
+
+		return fmt.Errorf("send reminder: %w", err)
+	}
+
+	metrics.SubscriptionRemindersTotal.WithLabelValues(window.Name, "success").Inc()
+
+	return nil
+}
+
+func reminderText(daysLeft int, hoursLeft int, subURL string) string {
+	const benefits = "Сохраните преимущества Premium:\n♾️ Безлимитный трафик\n🌍 Больше серверов и вариантов подключения\n🧪 Дополнительные и экспериментальные функции"
+	if daysLeft > 0 {
+		return fmt.Sprintf("⏳ *Premium заканчивается через %d дн.*\n\n%s\n\n🔗 Ссылка на подписку\n%s\n\nПродлите Premium заранее — новые дни прибавятся к текущему сроку.", daysLeft, benefits, subURL)
+	}
+
+	return fmt.Sprintf("🚨 *Premium закончится примерно через %d ч.*\n\n%s\n\n🔗 Ссылка на подписку\n%s\n\nПродлите Premium сейчас, чтобы сохранить доступ без перерыва.", hoursLeft, benefits, subURL)
+}

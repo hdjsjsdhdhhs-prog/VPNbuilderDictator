@@ -1,0 +1,193 @@
+package e2e
+
+import (
+	"context"
+	"net/http"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/bot"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/logger"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/service"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/testutil"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/stretchr/testify/require"
+)
+
+func init() {
+	_, _ = logger.Init("", "error")
+}
+
+func setupTestDB(t *testing.T) *database.Service {
+	t.Helper()
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := database.NewService(dbPath)
+	require.NoError(t, err, "Failed to create database service")
+
+	t.Cleanup(func() {
+		err := db.Close()
+		if err != nil {
+			t.Logf("Warning: failed to close database: %v", err)
+		}
+	})
+
+	return db
+}
+
+// createE2ESub inserts a subscription, defaulting its plan to the seeded free
+// plan: the test DSN enables SQLite foreign-key enforcement, so a subscription
+// must reference an existing plan row.
+func createE2ESub(t *testing.T, db *database.Service, sub *database.Subscription) {
+	t.Helper()
+
+	ctx := context.Background()
+	if sub.PlanID == 0 {
+		plan, err := db.GetPlanByName(ctx, database.FreePlanName)
+		require.NoError(t, err, "Failed to resolve free plan")
+		sub.PlanID = plan.ID
+	}
+
+	require.NoError(t, db.CreateSubscription(ctx, sub, ""))
+}
+
+// createE2ESellablePlan stores an active paid plan served by an enabled
+// subscription builder: a plan without a builder is not sold.
+func createE2ESellablePlan(t *testing.T, db *database.Service, name string) *database.Plan {
+	t.Helper()
+
+	builder := &database.SubscriptionBuilder{Name: name + "-builder", Enabled: true}
+	require.NoError(t, db.GetDB().Create(builder).Error)
+
+	plan := &database.Plan{Name: name, IsActive: true, SubscriptionBuilderID: &builder.ID}
+	require.NoError(t, db.GetDB().Create(plan).Error)
+
+	return plan
+}
+
+type e2eTestEnv struct {
+	t          *testing.T
+	db         *database.Service
+	botAPI     *testutil.BotAPI
+	handler    *bot.Handler
+	cfg        *config.Config
+	botConfig  *bot.BotConfig
+	chatID     int64
+	username   string
+	subService *service.SubscriptionService
+}
+
+// waitForServerReady polls the server's /healthz endpoint until it responds
+// with HTTP 200 or the timeout expires. This is more reliable than a fixed
+// time.Sleep because it works correctly even under heavy CI load.
+func waitForServerReady(t *testing.T, addr string, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	url := "http://" + addr + "/healthz"
+
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(url)
+		if err == nil {
+			err := resp.Body.Close()
+			if err != nil {
+				t.Logf("Warning: failed to close health check body: %v", err)
+			}
+
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatalf("server at %s did not become ready within %v", addr, timeout)
+}
+
+func setupE2EEnv(t *testing.T) *e2eTestEnv {
+	t.Helper()
+
+	db := setupTestDB(t)
+
+	cfg := &config.Config{
+		TelegramAdminID:  123456,
+		SiteURL:          "https://example.com",
+		TelegramBotToken: "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+		GlobalSubURL:     "https://example.com/sub/",
+		PaymentEnabled:   true,
+	}
+
+	mockBotAPI := testutil.NewBotAPI()
+
+	botCfg := &bot.BotConfig{
+		Username:  "testbot",
+		ID:        123456789,
+		FirstName: "TestBot",
+		IsBot:     true,
+	}
+
+	subService := service.NewSubscriptionService(db, cfg)
+	handler := bot.NewHandler(mockBotAPI, cfg, db, botCfg, subService, "")
+
+	return &e2eTestEnv{
+		t:          t,
+		db:         db,
+		botAPI:     mockBotAPI,
+		handler:    handler,
+		cfg:        cfg,
+		botConfig:  botCfg,
+		chatID:     987654321,
+		username:   "testuser",
+		subService: subService,
+	}
+}
+
+func waitForBroadcastFinished(t *testing.T, env *e2eTestEnv) database.Broadcast {
+	t.Helper()
+
+	var finished database.Broadcast
+	require.Eventually(t, func() bool {
+		broadcasts, err := env.db.ListBroadcasts(context.Background(), 1)
+		if err != nil || len(broadcasts) == 0 {
+			return false
+		}
+		status := broadcasts[0].Status
+		if status == string(database.BroadcastStatusScheduled) || status == string(database.BroadcastStatusRunning) {
+			return false
+		}
+		finished = broadcasts[0]
+		return strings.Contains(env.botAPI.LastSentTextSafe(), "Рассылка завершена")
+	}, 5*time.Second, 10*time.Millisecond)
+
+	return finished
+}
+
+func resetBotAPI(m *testutil.BotAPI) {
+	m.SetSendCalled(false)
+	m.SetRequestCalled(false)
+	m.LastSentText = ""
+	m.LastChatID = 0
+	m.SendCount = 0
+	m.SendError = nil
+	m.RequestError = nil
+}
+
+func newCommandMessage(chatID int64, userID int64, username, text string, cmdLen int) *tgbotapi.Message {
+	return &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: chatID},
+		From: &tgbotapi.User{
+			ID:       userID,
+			UserName: username,
+		},
+		Text: text,
+		Entities: []tgbotapi.MessageEntity{
+			{Type: "bot_command", Offset: 0, Length: cmdLen},
+		},
+	}
+}

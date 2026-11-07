@@ -1,0 +1,700 @@
+package database
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/utils"
+	"github.com/mattn/go-sqlite3"
+	"gorm.io/gorm"
+)
+
+const subscriptionTokenCreateAttempts = 5
+
+// GetByTelegramID retrieves an active subscription by Telegram ID.
+func (s *Service) GetByTelegramID(ctx context.Context, telegramID int64) (*Subscription, error) {
+	var sub Subscription
+
+	result := s.db.WithContext(ctx).
+		Where("telegram_id = ? AND status = ?", telegramID, string(SubscriptionStatusActive)).
+		Order("created_at DESC").
+		First(&sub)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, ErrSubscriptionNotFound
+		}
+
+		return nil, fmt.Errorf("failed to get subscription by telegram ID: %w", result.Error)
+	}
+
+	return &sub, nil
+}
+
+// GetAnyByTelegramID retrieves a subscription by Telegram ID regardless of status.
+// Unlike GetByTelegramID (which only returns active subscriptions), this is used
+// to recover a subscription that was left in a non-active state (e.g. "revoked")
+// after a partially-failed delete, so it can be reanimated instead of creating a
+// duplicate row that violates the telegram_id uniqueness expectation.
+func (s *Service) GetAnyByTelegramID(ctx context.Context, telegramID int64) (*Subscription, error) {
+	var sub Subscription
+
+	result := s.db.WithContext(ctx).
+		Where("telegram_id = ?", telegramID).
+		Order("created_at DESC").
+		First(&sub)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, ErrSubscriptionNotFound
+		}
+
+		return nil, fmt.Errorf("failed to get subscription by telegram ID: %w", result.Error)
+	}
+
+	return &sub, nil
+}
+
+// GetByID retrieves a subscription by its database ID.
+func (s *Service) GetByID(ctx context.Context, id uint) (*Subscription, error) {
+	var sub Subscription
+
+	result := s.db.WithContext(ctx).First(&sub, id)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, ErrSubscriptionNotFound
+		}
+
+		return nil, fmt.Errorf("failed to get subscription: %w", result.Error)
+	}
+
+	return &sub, nil
+}
+
+// GetByToken resolves a subscription by its public bearer token.
+func (s *Service) GetByToken(ctx context.Context, token string) (*Subscription, error) {
+	var sub Subscription
+
+	result := s.db.WithContext(ctx).Where("token = ?", token).First(&sub)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, ErrSubscriptionNotFound
+		}
+
+		return nil, fmt.Errorf("failed to get subscription by token: %w", result.Error)
+	}
+
+	return &sub, nil
+}
+
+// GetSubscriptionWithProviderSource retrieves a currently servable subscription
+// by its public subscription ID and explicitly preloads its optional provider
+// source. Serving is resolved by the builder chain first (see
+// ResolveSubscriptionBuilder); the linked source is used only without a builder.
+func (s *Service) GetSubscriptionWithProviderSource(ctx context.Context, subscriptionID string) (*Subscription, error) {
+	var sub Subscription
+
+	result := s.db.WithContext(ctx).
+		Preload("ProviderSource").
+		Where("subscription_id = ? AND status = ? AND (expires_at IS NULL OR expires_at > ?)",
+			subscriptionID, string(SubscriptionStatusActive), time.Now().UTC()).
+		First(&sub)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, ErrSubscriptionNotFound
+		}
+
+		return nil, fmt.Errorf("failed to get subscription with provider source: %w", result.Error)
+	}
+
+	return &sub, nil
+}
+
+// BindProviderSource links a subscription to an existing provider source.
+func (s *Service) BindProviderSource(ctx context.Context, id, providerSourceID uint) error {
+	result := s.db.WithContext(ctx).
+		Model(&Subscription{}).
+		Where("id = ?", id).
+		Update("provider_source_id", providerSourceID)
+	if result.Error != nil {
+		return fmt.Errorf("bind provider source to subscription: %w", result.Error)
+	}
+
+	if result.RowsAffected == 0 {
+		return ErrSubscriptionNotFound
+	}
+
+	return nil
+}
+
+// UnbindProviderSource removes the optional provider source link; the
+// subscription is then served only through its builder chain.
+func (s *Service) UnbindProviderSource(ctx context.Context, id uint) error {
+	result := s.db.WithContext(ctx).
+		Model(&Subscription{}).
+		Where("id = ?", id).
+		Update("provider_source_id", nil)
+	if result.Error != nil {
+		return fmt.Errorf("unbind provider source from subscription: %w", result.Error)
+	}
+
+	if result.RowsAffected == 0 {
+		return ErrSubscriptionNotFound
+	}
+
+	return nil
+}
+
+// CreateSubscription creates a new subscription.
+// If inviteCode is non-empty and resolves to a valid Invite, sub.InviteCode and sub.ReferredBy
+// are populated atomically inside the same transaction.
+func (s *Service) CreateSubscription(ctx context.Context, sub *Subscription, inviteCode string) error {
+	if sub == nil {
+		return errors.New("create subscription: nil subscription")
+	}
+	// Publish generated IDs/token to the caller only after a successful commit.
+	created := *sub
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		sub := &created
+		if sub.ProviderSourceID != nil {
+			// Read and validate assignment in the same SQLite transaction as the
+			// INSERT. A concurrent writer cannot change the source and let this
+			// transaction commit a stale assignment (it either commits first or
+			// this transaction fails with contention). Never auto-save associations.
+			var source ProviderSource
+			if err := tx.First(&source, *sub.ProviderSourceID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return ErrProviderSourceNotFound
+				}
+				return fmt.Errorf("load subscription provider source: %w", err)
+			}
+			if _, _, err := source.RequestConfiguration(); err != nil {
+				return err
+			}
+			var plan Plan
+			if err := tx.First(&plan, sub.PlanID).Error; err != nil {
+				return fmt.Errorf("load subscription plan: %w", err)
+			}
+			if !plan.IsActive {
+				return errors.New("subscription plan is inactive")
+			}
+			sub.ProviderSource = nil
+		}
+		if inviteCode != "" {
+			var inv Invite
+
+			err := tx.Where("code = ?", inviteCode).First(&inv).Error
+			if err == nil {
+				inviteVal := inviteCode
+				sub.InviteCode = &inviteVal
+				referredBy := inv.ReferrerTGID
+				sub.ReferredBy = &referredBy
+			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("failed to resolve invite: %w", err)
+			}
+		}
+
+		err := createSubscriptionWithToken(tx, sub)
+		if err != nil {
+			return fmt.Errorf("failed to create new subscription: %w", err)
+		}
+
+		recordJournal(ctx, tx, subscriptionCreatedJournal(sub))
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	*sub = created
+	return nil
+}
+
+// subscriptionCreatedJournal is the journal event of a newly inserted row: a
+// Telegram customer registers; a row with a negative ID is an anonymous trial.
+func subscriptionCreatedJournal(sub *Subscription) JournalRecord {
+	rec := JournalRecord{
+		Type: JournalUserRegistered, Actor: JournalActorUser, Subscription: sub,
+		Description: "Пользователь зарегистрирован, подписка подключена",
+		After:       JournalStateOf(sub), DedupKey: journalKey("subscription_created", sub.ID),
+	}
+	if sub.TelegramID <= 0 {
+		rec.Type = JournalTrialStarted
+		rec.Description = "Активирована пробная подписка"
+	}
+	return rec
+}
+
+func createSubscriptionWithToken(db *gorm.DB, sub *Subscription) error {
+	providedToken := sub.Token != ""
+
+	for attempt := 0; attempt < subscriptionTokenCreateAttempts; attempt++ {
+		if !providedToken {
+			token, err := utils.GenerateSubscriptionToken()
+			if err != nil {
+				return err
+			}
+			sub.Token = token
+		}
+
+		err := db.Create(sub).Error
+		if err == nil {
+			return nil
+		}
+		if providedToken || !isSubscriptionTokenUniqueConstraint(err) {
+			return err
+		}
+
+		// The failed INSERT may have populated the in-memory primary key.
+		sub.ID = 0
+	}
+
+	return fmt.Errorf("generate unique subscription token: collision retry limit reached")
+}
+
+func isSubscriptionTokenUniqueConstraint(err error) bool {
+	var sqliteErr sqlite3.Error
+	return errors.As(err, &sqliteErr) &&
+		sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique &&
+		strings.Contains(sqliteErr.Error(), "subscriptions.token")
+}
+
+// UpdateSubscription updates an existing subscription.
+// UpdateSubscription updates lifecycle fields without touching reminder state
+// unless the caller explicitly modified RemindersSent (all callers load the row
+// first, so persisting it is a no-op unless changed).
+func (s *Service) UpdateSubscription(ctx context.Context, sub *Subscription) error {
+	result := s.db.WithContext(ctx).Model(&Subscription{}).
+		Where("id = ?", sub.ID).
+		Select("telegram_id", "username", "client_id", "subscription_id", "expires_at", "status", "invite_code", "plan_id", "referred_by", "devices", "ips", "product_id", "started_at", "price_paid_cents", "currency", "reminders_sent").
+		Updates(sub)
+	if result.Error != nil {
+		return fmt.Errorf("failed to update subscription: %w", result.Error)
+	}
+
+	if result.RowsAffected == 0 {
+		return ErrSubscriptionNotFound
+	}
+
+	return nil
+}
+
+// DeleteSubscriptionByID hard-deletes a subscription by its database ID.
+// This is the ONLY physical subscription deletion in the product, used by the
+// admin /del flow. Everything else only changes subscription status.
+func (s *Service) DeleteSubscriptionByID(ctx context.Context, id uint) (*Subscription, error) {
+	var deleted Subscription
+
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.First(&deleted, id)
+		if result.Error != nil {
+			return result.Error
+		}
+
+		result = tx.Delete(&deleted)
+		if result.Error != nil {
+			return result.Error
+		}
+
+		if result.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrSubscriptionNotFound
+		}
+
+		return nil, fmt.Errorf("failed to delete subscription: %w", err)
+	}
+
+	return &deleted, nil
+}
+
+// GetLatestSubscriptions retrieves the latest N subscriptions ordered by creation date.
+func (s *Service) GetLatestSubscriptions(ctx context.Context, limit int) ([]Subscription, error) {
+	var subs []Subscription
+
+	result := s.db.WithContext(ctx).
+		Where("status = ?", string(SubscriptionStatusActive)).
+		Order("created_at DESC").
+		Limit(limit).
+		Find(&subs)
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to get latest subscriptions: %w", result.Error)
+	}
+
+	return subs, nil
+}
+
+// GetAllSubscriptions retrieves all subscriptions (for admin stats and reconciliation).
+func (s *Service) GetAllSubscriptions(ctx context.Context) ([]Subscription, error) {
+	var subs []Subscription
+
+	result := s.db.WithContext(ctx).Find(&subs)
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to get all subscriptions: %w", result.Error)
+	}
+
+	return subs, nil
+}
+
+// CountAllSubscriptions returns the total number of subscriptions.
+func (s *Service) CountAllSubscriptions(ctx context.Context) (int64, error) {
+	var count int64
+
+	result := s.db.WithContext(ctx).
+		Model(&Subscription{}).
+		Count(&count)
+	if result.Error != nil {
+		return 0, fmt.Errorf("failed to count all subscriptions: %w", result.Error)
+	}
+
+	return count, nil
+}
+
+// CountActiveSubscriptions returns the number of active subscriptions.
+func (s *Service) CountActiveSubscriptions(ctx context.Context) (int64, error) {
+	var count int64
+
+	result := s.db.WithContext(ctx).
+		Model(&Subscription{}).
+		Where("status = ?", string(SubscriptionStatusActive)).
+		Count(&count)
+	if result.Error != nil {
+		return 0, fmt.Errorf("failed to count active subscriptions: %w", result.Error)
+	}
+
+	return count, nil
+}
+
+// CountPremiumSubscriptions returns active subscriptions that use a paid plan.
+func (s *Service) CountPremiumSubscriptions(ctx context.Context) (int64, error) {
+	var count int64
+
+	result := s.db.WithContext(ctx).
+		Table("subscriptions").
+		Joins("JOIN plans ON plans.id = subscriptions.plan_id").
+		Where("subscriptions.status = ? AND (subscriptions.product_id IS NOT NULL OR subscriptions.price_paid_cents > 0)", string(SubscriptionStatusActive)).
+		Count(&count)
+	if result.Error != nil {
+		return 0, fmt.Errorf("failed to count premium subscriptions: %w", result.Error)
+	}
+
+	return count, nil
+}
+
+// CountFreeSubscriptions returns active non-trial subscriptions without a paid purchase.
+func (s *Service) CountFreeSubscriptions(ctx context.Context) (int64, error) {
+	var count int64
+
+	result := s.db.WithContext(ctx).
+		Model(&Subscription{}).
+		Where("status = ? AND telegram_id > 0 AND product_id IS NULL AND price_paid_cents = 0", string(SubscriptionStatusActive)).
+		Count(&count)
+	if result.Error != nil {
+		return 0, fmt.Errorf("failed to count free subscriptions: %w", result.Error)
+	}
+
+	return count, nil
+}
+
+// CountTrialSubscriptions returns the number of trial subscriptions (telegram_id < 0).
+func (s *Service) CountTrialSubscriptions(ctx context.Context) (int64, error) {
+	var count int64
+
+	result := s.db.WithContext(ctx).
+		Model(&Subscription{}).
+		Where("telegram_id < 0").
+		Count(&count)
+	if result.Error != nil {
+		return 0, fmt.Errorf("failed to count trial subscriptions: %w", result.Error)
+	}
+
+	return count, nil
+}
+
+// GetSubscriptionStatus returns subscription status and expiry time for the
+// subscription server (since v2.3.0) without loading the plan or sources.
+// Returns ErrSubscriptionNotFound if no row matches.
+//
+// For Free (unlimited) subscriptions, ExpiresAt is time.Time{} (zero value),
+// since the database stores NULL. Callers should check !expiryTime.IsZero()
+// before comparing against time.Now().
+func (s *Service) GetSubscriptionStatus(ctx context.Context, subscriptionID string) (string, time.Time, error) {
+	var row struct {
+		Status    string
+		ExpiresAt time.Time
+	}
+
+	result := s.db.WithContext(ctx).
+		Table("subscriptions").
+		Select("status, expires_at").
+		Where("subscription_id = ?", subscriptionID).
+		Take(&row)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return "", time.Time{}, ErrSubscriptionNotFound
+		}
+
+		return "", time.Time{}, result.Error
+	}
+
+	return row.Status, row.ExpiresAt, nil
+}
+
+// UpdateDevices updates only the devices JSON column for a subscription.
+func (s *Service) UpdateDevices(ctx context.Context, id uint, devicesJSON string) error {
+	result := s.db.WithContext(ctx).Model(&Subscription{}).Where("id = ?", id).Update("devices", devicesJSON)
+	if result.Error != nil {
+		return fmt.Errorf("failed to update subscription devices: %w", result.Error)
+	}
+
+	if result.RowsAffected == 0 {
+		return ErrSubscriptionNotFound
+	}
+
+	return nil
+}
+
+// UpdateIPs updates only the ips JSON column for a subscription.
+func (s *Service) UpdateIPs(ctx context.Context, id uint, ipsJSON string) error {
+	result := s.db.WithContext(ctx).Model(&Subscription{}).Where("id = ?", id).Update("ips", ipsJSON)
+	if result.Error != nil {
+		return fmt.Errorf("failed to update subscription ips: %w", result.Error)
+	}
+
+	if result.RowsAffected == 0 {
+		return ErrSubscriptionNotFound
+	}
+
+	return nil
+}
+
+// UpdateLastRequest обновляет колонку last_request текущим временем
+// для подписки, идентифицированной строковым subscription_id.
+// Используется субсервером при каждом запросе клиента (best-effort):
+// ошибки логируются вызывающим кодом и не блокируют выдачу подписки.
+func (s *Service) UpdateLastRequest(ctx context.Context, subscriptionID string) error {
+	now := time.Now().UTC()
+
+	result := s.db.WithContext(ctx).Model(&Subscription{}).
+		Where("subscription_id = ?", subscriptionID).
+		Update("last_request", now)
+	if result.Error != nil {
+		return fmt.Errorf("failed to update subscription last_request: %w", result.Error)
+	}
+
+	if result.RowsAffected == 0 {
+		return ErrSubscriptionNotFound
+	}
+
+	return nil
+}
+
+// ExpireSubscriptionWithPlanCAS atomically downgrades an expired subscription
+// to the free plan. The compare-and-swap on the current expiry guarantees that
+// a queued expiry scan never undoes a renewal committed meanwhile. The free
+// plan's builder serves the subscription from the next /sub request on.
+func (s *Service) ExpireSubscriptionWithPlanCAS(ctx context.Context, id uint, freePlanID uint) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Snapshot for the journal; the CAS below stays the authority. Take the
+		// SQLite writer reservation first (as renewSubscription does) so the
+		// read cannot be followed by a failing lock upgrade.
+		prior, err := claimSubscriptionSnapshot(tx, id)
+		if err != nil {
+			return err
+		}
+		result := tx.Model(&Subscription{}).Where("id = ? AND status = ? AND expires_at IS NOT NULL AND expires_at <= ?", id, string(SubscriptionStatusActive), time.Now().UTC()).
+			Updates(map[string]any{
+				"status":           string(SubscriptionStatusActive),
+				"expires_at":       nil,
+				"plan_id":          freePlanID,
+				"product_id":       nil,
+				"started_at":       nil,
+				"price_paid_cents": 0,
+				"currency":         nil,
+			})
+		if result.Error != nil {
+			return fmt.Errorf("expire subscription: %w", result.Error)
+		}
+
+		if result.RowsAffected == 0 {
+			var current Subscription
+
+			err := tx.First(&current, id).Error
+			switch {
+			case errors.Is(err, gorm.ErrRecordNotFound):
+				return ErrSubscriptionNotFound
+			case err != nil:
+				return fmt.Errorf("reload subscription after expiry race: %w", err)
+			case current.Status == string(SubscriptionStatusActive) &&
+				current.PlanID == freePlanID &&
+				current.ExpiresAt == nil &&
+				current.ProductID == nil &&
+				current.StartedAt == nil &&
+				current.PricePaidCents == 0 &&
+				current.Currency == nil:
+				return nil
+			}
+
+			return fmt.Errorf("expire subscription %d: state changed concurrently", id)
+		}
+
+		recordJournal(ctx, tx, expiredToFreeJournal(prior, freePlanID))
+
+		return nil
+	})
+}
+
+// claimSubscriptionSnapshot takes SQLite's writer reservation on the row
+// (no-op UPDATE, like renewSubscription) and then reads it, so the snapshot
+// cannot be invalidated by a concurrent writer before this transaction's own
+// write. Returns ErrSubscriptionNotFound for a missing row.
+func claimSubscriptionSnapshot(tx *gorm.DB, id uint) (*Subscription, error) {
+	claim := tx.Model(&Subscription{}).Where("id = ?", id).UpdateColumn("id", gorm.Expr("id"))
+	if claim.Error != nil {
+		return nil, fmt.Errorf("lock subscription: %w", claim.Error)
+	}
+	if claim.RowsAffected == 0 {
+		return nil, ErrSubscriptionNotFound
+	}
+	var sub Subscription
+	if err := tx.First(&sub, id).Error; err != nil {
+		return nil, fmt.Errorf("load subscription: %w", err)
+	}
+	return &sub, nil
+}
+
+// expiredToFreeJournal describes a finite term ending with a downgrade to the
+// free plan. The event carries the plan that expired, not the free plan.
+func expiredToFreeJournal(prior *Subscription, freePlanID uint) JournalRecord {
+	after := JournalStateOf(prior)
+	after.Status, after.ExpiresAt, after.PlanID = string(SubscriptionStatusActive), nil, freePlanID
+	return JournalRecord{
+		Type: JournalExpired, Actor: JournalActorSystem, Subscription: prior,
+		Description: "Срок подписки истёк, подписка переведена на бесплатный тариф",
+		Before:      JournalStateOf(prior), After: after,
+		DedupKey: journalExpiryKey("subscription_expired", prior.ID, prior.ExpiresAt),
+	}
+}
+
+// ExpireSubscription downgrades the subscription to the free plan and clears expires_at.
+func (s *Service) ExpireSubscription(ctx context.Context, id uint, freePlanID uint) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		prior, err := claimSubscriptionSnapshot(tx, id)
+		if err != nil {
+			return err
+		}
+		result := tx.Model(&Subscription{}).Where("id = ?", id).
+			Updates(map[string]any{
+				"status":           string(SubscriptionStatusActive),
+				"expires_at":       nil,
+				"plan_id":          freePlanID,
+				"product_id":       nil,
+				"started_at":       nil,
+				"price_paid_cents": 0,
+				"currency":         nil,
+			})
+		if result.Error != nil {
+			return fmt.Errorf("failed to expire subscription: %w", result.Error)
+		}
+
+		if result.RowsAffected == 0 {
+			return ErrSubscriptionNotFound
+		}
+
+		recordJournal(ctx, tx, expiredToFreeJournal(prior, freePlanID))
+
+		return nil
+	})
+}
+
+// GetExpiredPaidSubscriptions returns active subscriptions that have expired and are not on free or trial plans.
+func (s *Service) GetExpiredPaidSubscriptions(ctx context.Context, now time.Time) ([]Subscription, error) {
+	var subs []Subscription
+
+	nonExpiringPlanSubQuery := s.db.WithContext(ctx).
+		Select("id").
+		Table("plans").
+		Where("name IN ?", []string{FreePlanName, TrialPlanName})
+
+	result := s.db.WithContext(ctx).
+		Where("expires_at <= ? AND status = ? AND (provider_source_id IS NOT NULL OR plan_id NOT IN (?))",
+			now, string(SubscriptionStatusActive), nonExpiringPlanSubQuery).
+		Find(&subs)
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to get expired paid subscriptions: %w", result.Error)
+	}
+
+	return subs, nil
+}
+
+// GetTelegramIDByUsername returns the Telegram ID for a given username.
+func (s *Service) GetTelegramIDByUsername(ctx context.Context, username string) (int64, error) {
+	var sub Subscription
+
+	result := s.db.WithContext(ctx).Where("username = ?", username).First(&sub)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return 0, ErrSubscriptionNotFound
+		}
+
+		return 0, fmt.Errorf("failed to find user by username: %w", result.Error)
+	}
+
+	return sub.TelegramID, nil
+}
+
+// GetTelegramIDsBatch returns a batch of unique Telegram IDs for active subscriptions eligible for broadcast.
+// offset is the starting position, limit is the maximum number of IDs to return.
+func (s *Service) GetTelegramIDsBatch(ctx context.Context, offset, limit int) ([]int64, error) {
+	var ids []int64
+
+	result := s.db.WithContext(ctx).
+		Model(&Subscription{}).
+		Where("telegram_id > 0 AND status = ?", string(SubscriptionStatusActive)).
+		Distinct("telegram_id").
+		Order("telegram_id ASC").
+		Limit(limit).
+		Offset(offset).
+		Pluck("telegram_id", &ids)
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to get telegram IDs batch: %w", result.Error)
+	}
+
+	return ids, nil
+}
+
+// GetFilteredTelegramIDCount возвращает количество уникальных telegram_id с учётом фильтра.
+func (s *Service) GetFilteredTelegramIDCount(ctx context.Context, filter BroadcastFilter) (int64, error) {
+	var count int64
+
+	q := applyBroadcastFilter(s.db.WithContext(ctx).Model(&Subscription{}), filter).
+		Where("telegram_id > 0")
+	result := q.Distinct("telegram_id").Count(&count)
+	if result.Error != nil {
+		return 0, fmt.Errorf("failed to get filtered telegram ID count: %w", result.Error)
+	}
+
+	return count, nil
+}
+
+// GetTotalTelegramIDCount returns the count of unique Telegram IDs for active subscriptions eligible for broadcast.
+func (s *Service) GetTotalTelegramIDCount(ctx context.Context) (int64, error) {
+	var count int64
+
+	result := s.db.WithContext(ctx).
+		Model(&Subscription{}).
+		Where("telegram_id > 0 AND status = ?", string(SubscriptionStatusActive)).
+		Distinct("telegram_id").
+		Count(&count)
+	if result.Error != nil {
+		return 0, fmt.Errorf("failed to count telegram IDs: %w", result.Error)
+	}
+
+	return count, nil
+}

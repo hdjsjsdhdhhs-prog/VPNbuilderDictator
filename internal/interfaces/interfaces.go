@@ -1,0 +1,211 @@
+// Package interfaces defines narrow dependency-injection contracts for the application.
+package interfaces
+
+import (
+	"context"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"gorm.io/gorm"
+)
+
+var _ DatabaseService = (*database.Service)(nil)
+var _ WebRepository = (*database.Service)(nil)
+
+// SubscriptionCRUD provides basic CRUD operations for subscriptions.
+// DeleteSubscriptionByID is the only physical deletion (admin /del); all other
+// lifecycle changes are status updates via UpdateSubscription.
+type SubscriptionCRUD interface {
+	CreateSubscription(ctx context.Context, sub *database.Subscription, inviteCode string) error
+	UpdateSubscription(ctx context.Context, sub *database.Subscription) error
+	DeleteSubscriptionByID(ctx context.Context, id uint) (*database.Subscription, error)
+}
+
+// SubscriptionQueries retrieves subscriptions by various criteria.
+type SubscriptionQueries interface {
+	GetByTelegramID(ctx context.Context, telegramID int64) (*database.Subscription, error)
+	GetAnyByTelegramID(ctx context.Context, telegramID int64) (*database.Subscription, error)
+	GetByID(ctx context.Context, id uint) (*database.Subscription, error)
+	GetByToken(ctx context.Context, token string) (*database.Subscription, error)
+	GetLatestSubscriptions(ctx context.Context, limit int) ([]database.Subscription, error)
+	GetAllSubscriptions(ctx context.Context) ([]database.Subscription, error)
+	GetSubscriptionWithProviderSource(ctx context.Context, subscriptionID string) (*database.Subscription, error)
+	// ResolveSubscriptionBuilder returns the enabled builder serving the
+	// subscription (subscription override > plan default) or nil when none is
+	// assigned/enabled; /sub then answers 503 (see subserver.ErrBuilderUnavailable).
+	ResolveSubscriptionBuilder(ctx context.Context, sub *database.Subscription) (*database.ResolvedBuilder, error)
+	// GetSourceEntries returns the present catalogue entries of a provider
+	// source ("*" = all countries).
+	GetSourceEntries(ctx context.Context, sourceID uint, countryCode string) ([]database.ProviderSourceEntry, error)
+}
+
+// SubscriptionCounts retrieves subscription statistics.
+type SubscriptionCounts interface {
+	CountAllSubscriptions(ctx context.Context) (int64, error)
+	CountActiveSubscriptions(ctx context.Context) (int64, error)
+	CountPremiumSubscriptions(ctx context.Context) (int64, error)
+	CountFreeSubscriptions(ctx context.Context) (int64, error)
+	CountTrialSubscriptions(ctx context.Context) (int64, error)
+	GetTelegramIDByUsername(ctx context.Context, username string) (int64, error)
+	GetTelegramIDsBatch(ctx context.Context, offset, limit int) ([]int64, error)
+	GetTotalTelegramIDCount(ctx context.Context) (int64, error)
+	GetFilteredTelegramIDCount(ctx context.Context, filter database.BroadcastFilter) (int64, error)
+}
+
+// SubscriptionStatus manages subscription lifecycle operations.
+type SubscriptionStatus interface {
+	GetSubscriptionStatus(ctx context.Context, subscriptionID string) (string, time.Time, error)
+	ExpireSubscription(ctx context.Context, id uint, freePlanID uint) error
+	GetExpiredPaidSubscriptions(ctx context.Context, now time.Time) ([]database.Subscription, error)
+}
+
+// SubscriptionJSONFields updates JSON-encoded fields on subscriptions.
+type SubscriptionJSONFields interface {
+	UpdateDevices(ctx context.Context, id uint, devicesJSON string) error
+	UpdateIPs(ctx context.Context, id uint, ipsJSON string) error
+}
+
+// SubscriptionReminderRepository provides the atomic reminder workflow and expiry query.
+type SubscriptionReminderRepository interface {
+	GetSubscriptionsExpiringInRange(ctx context.Context, from, to time.Time) ([]database.Subscription, error)
+	ClaimReminder(ctx context.Context, id uint, bit int, expiresAt time.Time) (bool, error)
+	ReleaseReminder(ctx context.Context, id uint, bit int, expiresAt time.Time) error
+}
+
+// SubscriptionReminderWindow identifies one expiry reminder touch.
+type SubscriptionReminderWindow struct {
+	Name     string
+	Bit      int
+	LeadTime time.Duration
+}
+
+// SubscriptionReminderService is the narrow contract the reminder worker needs
+// from the subscription service.
+type SubscriptionReminderService interface {
+	SendExpiryReminder(ctx context.Context, sub *database.Subscription, window SubscriptionReminderWindow) error
+}
+
+// SubscriptionLastRequest updates the last_request timestamp on subscriptions.
+type SubscriptionLastRequest interface {
+	UpdateLastRequest(ctx context.Context, subscriptionID string) error
+}
+
+// SubscriptionLookup provides methods for external subscription ID lookups.
+type SubscriptionLookup interface {
+	GetReferralCount(ctx context.Context, referrerTGID int64) (int64, error)
+}
+
+// SubscriptionRepository combines all subscription interfaces.
+type SubscriptionRepository interface {
+	SubscriptionCRUD
+	SubscriptionQueries
+	SubscriptionCounts
+	SubscriptionStatus
+	SubscriptionJSONFields
+	SubscriptionReminderRepository
+	SubscriptionLastRequest
+	SubscriptionLookup
+}
+
+// TrialRepository provides operations for trial subscriptions.
+type TrialRepository interface {
+	CreateTrialSubscription(ctx context.Context, inviteCode, subscriptionID, clientID string, expiryTime time.Time) (*database.Subscription, error)
+	GetTrialSubscriptionBySubID(ctx context.Context, subscriptionID string) (*database.Subscription, error)
+	BindTrialSubscription(ctx context.Context, subscriptionID string, telegramID int64, username string) (*database.Subscription, error)
+	CountTrialRequestsByIPLastHour(ctx context.Context, ip string) (int, error)
+	CreateTrialRequest(ctx context.Context, ip string) error
+	CleanupExpiredTrials(ctx context.Context, hours int) ([]database.Subscription, error)
+	ClaimExpiredTrials(ctx context.Context, hours int) ([]database.Subscription, error)
+	DeleteClaimedTrial(ctx context.Context, id uint) error
+}
+
+// InviteRepository provides referral invite and referral-count operations.
+type InviteRepository interface {
+	GetOrCreateInvite(ctx context.Context, referrerTGID int64, code string) (*database.Invite, error)
+	GetInviteByReferrer(ctx context.Context, referrerTGID int64) (*database.Invite, error)
+	GetInviteByCode(ctx context.Context, code string) (*database.Invite, error)
+	GetReferralCount(ctx context.Context, referrerTGID int64) (int64, error)
+	GetAllReferralCounts(ctx context.Context) (map[int64]int64, error)
+}
+
+// PlanRepository provides plan lookup operations.
+type PlanRepository interface {
+	GetPlanByName(ctx context.Context, name string) (*database.Plan, error)
+	GetPlanByID(ctx context.Context, id uint) (*database.Plan, error)
+}
+
+// ProductRepository provides product listing, lookup, and guarded update operations.
+type ProductRepository interface {
+	ListActiveProducts(ctx context.Context) ([]database.Product, error)
+	GetProductByID(ctx context.Context, id uint) (*database.Product, error)
+	UpdateProductGuarded(ctx context.Context, product *database.Product) error
+}
+
+// OrderRepository provides order lifecycle and payment-intent operations.
+type OrderRepository interface {
+	GetOrderByID(ctx context.Context, id uint) (*database.Order, error)
+	GetOrderByProviderPaymentID(ctx context.Context, provider string, providerPaymentID uuid.UUID) (*database.Order, error)
+	FindPendingPaymentOrder(ctx context.Context, subscriptionID, productID uint, now time.Time) (*database.Order, error)
+	FindOrCreatePendingPaymentOrder(ctx context.Context, subscriptionID, productID uint, amountCents int64, currency string, now time.Time) (*database.Order, error)
+	MarkPaymentCreationUncertain(ctx context.Context, orderID uint, uncertain bool) (bool, error)
+	SavePaymentDetails(ctx context.Context, orderID uint, providerPaymentID uuid.UUID, paymentURL string, paymentExpiresAt time.Time) error
+	SaveOrderPaymentAmounts(ctx context.Context, orderID uint, callbackAmountCents int64, providerFeeCents *int64) error
+	GetPaidOrdersWithoutProviderFee(ctx context.Context, limit int) ([]database.Order, error)
+	GetPaidOrdersWithoutProviderFeeAfterID(ctx context.Context, afterID uint, limit int) ([]database.Order, error)
+	ConfirmOrderPaidCAS(ctx context.Context, orderID uint, paidAt, activatedAt time.Time, sub *database.Subscription, product *database.Product, callbackAmountCents int64) (bool, error)
+	CancelOrderCAS(ctx context.Context, provider string, providerPaymentID uuid.UUID, fromStatuses []database.OrderStatus) (bool, error)
+	CancelPaidOrderAndDowngradeCAS(ctx context.Context, provider string, providerPaymentID uuid.UUID, now time.Time, freePlanID uint) (*database.ChargebackResult, error)
+}
+
+// BroadcastRepository provides CRUD for broadcast cards
+// (название, текст, статус, даты, счётчики, JSON-отчёт).
+type BroadcastRepository interface {
+	CreateBroadcast(ctx context.Context, b *database.Broadcast) error
+	GetBroadcast(ctx context.Context, id uint) (*database.Broadcast, error)
+	ListBroadcasts(ctx context.Context, limit int) ([]database.Broadcast, error)
+	UpdateBroadcast(ctx context.Context, b *database.Broadcast) error
+	SnapshotBroadcastRecipients(ctx context.Context, broadcastID uint, filter database.BroadcastFilter) (int64, error)
+	ClaimBroadcast(ctx context.Context, id uint, now time.Time) (bool, error)
+	CancelBroadcast(ctx context.Context, id uint, now time.Time) (bool, error)
+	GetRunnableBroadcasts(ctx context.Context, now time.Time) ([]database.Broadcast, error)
+	RecoverStaleBroadcastRecipients(ctx context.Context, broadcastID uint, before time.Time) error
+	ClaimBroadcastRecipients(ctx context.Context, broadcastID uint, now time.Time, limit int) ([]database.BroadcastRecipient, error)
+	FinishBroadcastRecipient(ctx context.Context, broadcastID uint, id uint, expectedAttempts int, status database.BroadcastRecipientStatus, lastError string, now time.Time) error
+	UpdateBroadcastRecipientProgress(ctx context.Context, broadcastID uint, id uint, expectedAttempts int, nextChunk int, now time.Time) error
+	ResetBroadcastFailedRecipients(ctx context.Context, id uint, now time.Time) error
+	GetBroadcastRecipientsStats(ctx context.Context, broadcastID uint) (total, sent, blocked, unreachable, failed int64, report database.BroadcastDeliveryReport, err error)
+}
+
+// DatabaseService is the composed persistence contract used by application services.
+type DatabaseService interface {
+	SubscriptionRepository
+	TrialRepository
+	InviteRepository
+	PlanRepository
+	ProductRepository
+	OrderRepository
+	BroadcastRepository
+	Ping(ctx context.Context) error
+	Close() error
+	GetPoolStats() (*database.PoolStats, error)
+	Transaction(ctx context.Context, fn func(*gorm.DB) error) error
+}
+
+// BotAPI is the narrow Telegram client contract required by handlers and services.
+type BotAPI interface {
+	Send(c tgbotapi.Chattable) (tgbotapi.Message, error)
+	Request(c tgbotapi.Chattable) (*tgbotapi.APIResponse, error)
+}
+
+// WebRepository is the composed DB seam for the web/HTTP server: subscription
+// aggregation handoff (SubscriptionRepository) plus the invite/trial/plan reads
+// its landing pages need. It deliberately drops Order/Product.
+type WebRepository interface {
+	SubscriptionRepository
+	InviteRepository
+	TrialRepository
+	PlanRepository
+}

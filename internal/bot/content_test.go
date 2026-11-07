@@ -1,0 +1,289 @@
+package bot
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/testutil"
+
+	"github.com/stretchr/testify/assert"
+)
+
+// === getMainMenuContent tests ===
+
+func TestGetMainMenuContent(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		TelegramAdminID: 12345,
+	}
+	handler := &Handler{cfg: cfg, botConfig: NewTestBotConfig(), keyboards: NewKeyboardBuilder("testbot", cfg.ContactUsername, cfg.DonateCardNumber, cfg.DonateURL, cfg.SiteURL, true)}
+
+	tests := []struct {
+		name            string
+		username        string
+		hasSubscription bool
+		chatID          int64
+	}{
+		{
+			name:            "with subscription",
+			username:        "testuser",
+			hasSubscription: true,
+			chatID:          99999,
+		},
+		{
+			name:            "without subscription",
+			username:        "newuser",
+			hasSubscription: false,
+			chatID:          88888,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			text, keyboard := handler.getMainMenuContent(context.Background(), tt.username, tt.hasSubscription, tt.chatID, nil)
+
+			assert.Contains(t, text, tt.username, "getMainMenuContent() text should contain username")
+			assert.NotEmpty(t, text, "getMainMenuContent() text should not be empty")
+			assert.NotEmpty(t, keyboard.InlineKeyboard, "getMainMenuContent() keyboard should have buttons")
+		})
+	}
+}
+
+func TestGetMainMenuContent_WithSubscription(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		TelegramAdminID: 0,
+	}
+	handler := &Handler{
+		cfg: cfg,
+	}
+
+	text, keyboard := handler.getMainMenuContent(context.Background(), "testuser", true, 123456789, nil)
+
+	assert.NotEmpty(t, text, "Expected non-empty text for user with subscription")
+	assert.Contains(t, text, "testuser", "Expected text to contain username")
+	assert.GreaterOrEqual(t, len(keyboard.InlineKeyboard), 2, "Expected at least 2 keyboard rows")
+}
+
+func TestGetMainMenuContent_FreeSubscriptionShowsPremiumTeaser(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{TelegramAdminID: 0, PaymentEnabled: true}
+	db := &testutil.DatabaseService{
+		GetPlanByIDFunc: func(context.Context, uint) (*database.Plan, error) {
+			return &database.Plan{ID: 2, Name: database.FreePlanName}, nil
+		},
+	}
+	handler := &Handler{
+		cfg:            cfg,
+		db:             db,
+		paymentEnabled: true,
+		keyboards:      NewKeyboardBuilder("testbot", "", "", "", "", true),
+	}
+
+	text, _ := handler.getMainMenuContent(context.Background(), "testuser", true, 123456789, &database.Subscription{PlanID: 2})
+
+	assert.Contains(t, text, "💎 Premium — безлимитный трафик и больше серверов")
+	assert.NotContains(t, text, "Вы — 💎 Premium")
+}
+
+func TestGetMainMenuContent_PaidSubscriptionShowsPremiumBadge(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{TelegramAdminID: 0}
+	handler := &Handler{
+		cfg:       cfg,
+		keyboards: NewKeyboardBuilder("testbot", "", "", "", "", true),
+	}
+
+	productID := uint(5)
+
+	text, _ := handler.getMainMenuContent(context.Background(), "testuser", true, 123456789, &database.Subscription{ProductID: &productID})
+
+	assert.Contains(t, text, "Вы — 💎 Premium")
+	assert.NotContains(t, text, "💎 Premium — безлимитный трафик и больше серверов")
+}
+
+func TestGetMainMenuContent_PaidByAmountShowsPremiumBadge(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{TelegramAdminID: 0}
+	handler := &Handler{
+		cfg:       cfg,
+		keyboards: NewKeyboardBuilder("testbot", "", "", "", "", true),
+	}
+
+	text, _ := handler.getMainMenuContent(context.Background(), "testuser", true, 123456789, &database.Subscription{PricePaidCents: 25000})
+
+	assert.Contains(t, text, "Вы — 💎 Premium")
+}
+
+func TestGetMainMenuContent_WithoutSubscription(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		TelegramAdminID: 0,
+	}
+	handler := &Handler{
+		cfg: cfg,
+	}
+
+	text, keyboard := handler.getMainMenuContent(context.Background(), "testuser", false, 123456789, nil)
+
+	assert.NotEmpty(t, text, "Expected non-empty text for user without subscription")
+	assert.Contains(t, text, "testuser", "Expected text to contain username")
+	assert.GreaterOrEqual(t, len(keyboard.InlineKeyboard), 1, "Expected at least 1 keyboard row")
+
+	found := false
+
+	for _, row := range keyboard.InlineKeyboard {
+		for _, button := range row {
+			if button.CallbackData != nil && *button.CallbackData == "create_subscription" {
+				found = true
+				break
+			}
+		}
+	}
+
+	assert.True(t, found, "Expected create_subscription callback in keyboard for user without subscription")
+}
+
+func TestGetMainMenuContent_AdminButtons(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		TelegramAdminID: 123456789,
+	}
+	handler := &Handler{
+		cfg: cfg,
+	}
+
+	_, keyboard := handler.getMainMenuContent(context.Background(), "admin", true, 123456789, nil)
+
+	foundStats := false
+	foundLastReg := false
+
+	for _, row := range keyboard.InlineKeyboard {
+		for _, button := range row {
+			if button.CallbackData != nil && *button.CallbackData == "admin_stats" {
+				foundStats = true
+			}
+
+			if button.CallbackData != nil && *button.CallbackData == "admin_lastreg" {
+				foundLastReg = true
+			}
+		}
+	}
+
+	assert.True(t, foundStats, "Expected admin_stats button for admin user")
+	assert.True(t, foundLastReg, "Expected admin_lastreg button for admin user")
+}
+
+func TestHandler_GetMainMenuContent_SpecialCharacters(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{TelegramAdminID: 12345}
+	handler := &Handler{cfg: cfg, botConfig: NewTestBotConfig(), keyboards: NewKeyboardBuilder("testbot", cfg.ContactUsername, cfg.DonateCardNumber, cfg.DonateURL, cfg.SiteURL, true)}
+
+	text, keyboard := handler.getMainMenuContent(context.Background(), "test_user_123", true, 12345, nil)
+	assert.Contains(t, text, "test_user_123", "Text should contain username")
+	assert.NotEmpty(t, keyboard.InlineKeyboard, "Keyboard should not be empty")
+}
+
+func TestHandler_GetMainMenuContent_AdminUser(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{TelegramAdminID: 12345}
+	handler := &Handler{cfg: cfg, botConfig: NewTestBotConfig(), keyboards: NewKeyboardBuilder("testbot", cfg.ContactUsername, cfg.DonateCardNumber, cfg.DonateURL, cfg.SiteURL, true)}
+
+	text, keyboard := handler.getMainMenuContent(context.Background(), "admin", true, 12345, nil)
+	assert.Contains(t, text, "admin", "Text should contain username")
+	assert.GreaterOrEqual(t, len(keyboard.InlineKeyboard), 3, "Admin should see admin buttons")
+}
+
+// === getDonateText tests ===
+
+func TestGetDonateText(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{}
+	handler := &Handler{cfg: cfg, botConfig: NewTestBotConfig(), keyboards: NewKeyboardBuilder("testbot", cfg.ContactUsername, cfg.DonateCardNumber, cfg.DonateURL, cfg.SiteURL, true)}
+
+	text := handler.getDonateText()
+	assert.NotEmpty(t, text, "Donate text should not be empty")
+
+	expected := []string{"☕", "Поддержка проекта"}
+	for _, exp := range expected {
+		assert.True(t, strings.Contains(text, exp), "Expected donate text to contain '%s'", exp)
+	}
+}
+
+func TestHandler_GetDonateText_Content(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{ContactUsername: "dictatorsupport", DonateCardNumber: "2200110022334455", DonateURL: "https://www.tbank.ru/collection/abc"}
+	handler := &Handler{cfg: cfg, botConfig: NewTestBotConfig(), keyboards: NewKeyboardBuilder("testbot", cfg.ContactUsername, cfg.DonateCardNumber, cfg.DonateURL, cfg.SiteURL, true)}
+
+	text := handler.getDonateText()
+
+	assert.Contains(t, text, "Поддержка проекта", "Should contain header")
+	assert.Contains(t, text, "2200110022334455", "Should contain card number from config")
+	assert.Contains(t, text, "https://www.tbank.ru/collection/abc", "Should contain donate URL from config")
+	assert.Contains(t, text, "t.me/dictatorsupport", "Should contain contact link")
+}
+
+func TestHandler_GetDonateText_EmptyConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{}
+	handler := &Handler{cfg: cfg, botConfig: NewTestBotConfig(), keyboards: NewKeyboardBuilder("testbot", cfg.ContactUsername, cfg.DonateCardNumber, cfg.DonateURL, cfg.SiteURL, true)}
+
+	text := handler.getDonateText()
+	assert.Contains(t, text, "Поддержка проекта", "Should contain header even with empty config")
+	t.Logf("Donate text with empty config: %q", text)
+}
+
+// === getHelpText tests ===
+
+func TestGetHelpText(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{}
+	handler := &Handler{cfg: cfg, botConfig: NewTestBotConfig(), keyboards: NewKeyboardBuilder("testbot", cfg.ContactUsername, cfg.DonateCardNumber, cfg.DonateURL, cfg.SiteURL, true)}
+
+	text := handler.getHelpText("http://localhost/sub/test")
+	assert.NotEmpty(t, text, "Help text should not be empty")
+}
+
+func TestHandler_GetHelpText_NoTrafficQuota(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{}
+	handler := &Handler{cfg: cfg, botConfig: NewTestBotConfig(), keyboards: NewKeyboardBuilder("testbot", cfg.ContactUsername, cfg.DonateCardNumber, cfg.DonateURL, cfg.SiteURL, true)}
+
+	text := handler.getHelpText("http://test.url/sub")
+
+	// The bot does not meter traffic, so the help text must not promise a quota.
+	assert.NotContains(t, text, "Трафик", "Should not mention a traffic quota")
+	assert.NotContains(t, text, "Гб", "Should not mention a traffic quota")
+	assert.Contains(t, text, "http://test.url/sub", "Should contain subscription URL")
+}
+
+func TestHandler_GetHelpText_SpecialCharacters(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{}
+	handler := &Handler{cfg: cfg, botConfig: NewTestBotConfig(), keyboards: NewKeyboardBuilder("testbot", cfg.ContactUsername, cfg.DonateCardNumber, cfg.DonateURL, cfg.SiteURL, true)}
+
+	subURL := "http://test.url/sub/abc123?param=value&other=test"
+	text := handler.getHelpText(subURL)
+
+	assert.Contains(t, text, subURL, "Should contain full subscription URL")
+}

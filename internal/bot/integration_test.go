@@ -1,0 +1,553 @@
+package bot
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/service"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/testutil"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/utils"
+	"github.com/stretchr/testify/assert"
+)
+
+type IntegrationTestFixture struct {
+	DB          *database.Service
+	Handler     *Handler
+	Cfg         *config.Config
+	Ctx         context.Context
+	Cancel      context.CancelFunc
+	AdminChatID int64
+	UserChatID  int64
+}
+
+func NewTestFixture(t *testing.T) *IntegrationTestFixture {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	dbService, err := database.NewService(":memory:")
+	if err != nil {
+		t.Fatalf("Failed to create in-memory database: %v", err)
+	}
+
+	cfg := &config.Config{
+		TelegramAdminID:  123456789,
+		TelegramBotToken: "test_token",
+		LogFilePath:      "/dev/null",
+		LogLevel:         "error",
+		DatabasePath:     ":memory:",
+	}
+
+	handler := NewHandler(testutil.NewBotAPI(), cfg, dbService, NewTestBotConfig(), nil, "")
+	subService := service.NewSubscriptionService(dbService, cfg)
+	handler.subscriptionService = subService
+	handler.subscriptionService.SetInvalidateFunc(handler.cache.Invalidate)
+
+	return &IntegrationTestFixture{
+		DB:          dbService,
+		Handler:     handler,
+		Cfg:         cfg,
+		Ctx:         ctx,
+		Cancel:      cancel,
+		AdminChatID: 123456789,
+		UserChatID:  987654321,
+	}
+}
+
+func (f *IntegrationTestFixture) Close() {
+	f.Cancel()
+
+	if f.DB != nil {
+		_ = f.DB.Close()
+	}
+}
+
+func CreateTestSubscriptionInDB(t *testing.T, db *database.Service, chatID int64, username string, status string, expiry *time.Time) *database.Subscription {
+	t.Helper()
+
+	clientID, err := utils.GenerateUUID()
+	if err != nil {
+		t.Fatalf("Failed to generate client ID: %v", err)
+	}
+
+	subscriptionID, err := utils.GenerateUUID()
+	if err != nil {
+		t.Fatalf("Failed to generate subscription ID: %v", err)
+	}
+
+	// The test DSN enables SQLite foreign-key enforcement: reference the seeded
+	// free plan so the insert is valid.
+	plan, planErr := db.GetPlanByName(context.Background(), database.FreePlanName)
+	if planErr != nil {
+		t.Fatalf("Failed to resolve free plan: %v", planErr)
+	}
+
+	sub := &database.Subscription{
+		TelegramID:     chatID,
+		Username:       username,
+		ClientID:       clientID,
+		SubscriptionID: subscriptionID,
+		ExpiresAt:      expiry,
+		Status:         status,
+		PlanID:         plan.ID,
+	}
+
+	err = db.CreateSubscription(context.Background(), sub, "")
+	if err != nil {
+		t.Fatalf("Failed to create test subscription: %v", err)
+	}
+
+	return sub
+}
+
+func TestSubscriptionFlow_CreateAndGet(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	ctx := context.Background()
+
+	sub, err := f.DB.GetByTelegramID(ctx, f.UserChatID)
+	if err == nil {
+		t.Fatalf("Expected no subscription, got: %v", sub)
+	}
+
+	activeSub := CreateTestSubscriptionInDB(t, f.DB, f.UserChatID, "testuser", "active", testutil.PtrTime(time.Now().Add(30*24*time.Hour)))
+
+	retrieved, err := f.DB.GetByTelegramID(ctx, f.UserChatID)
+	if err != nil {
+		t.Fatalf("Failed to get subscription: %v", err)
+	}
+
+	if retrieved.TelegramID != activeSub.TelegramID {
+		t.Errorf("TelegramID = %d, want %d", retrieved.TelegramID, activeSub.TelegramID)
+	}
+
+	if retrieved.Status != "active" {
+		t.Errorf("Status = %s, want active", retrieved.Status)
+	}
+}
+
+func TestSubscriptionFlow_ExpiredSubscription(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	ctx := context.Background()
+
+	CreateTestSubscriptionInDB(t, f.DB, f.UserChatID, "testuser", "active", testutil.PtrTime(time.Now().Add(-24*time.Hour)))
+
+	sub, err := f.DB.GetByTelegramID(ctx, f.UserChatID)
+	if err != nil {
+		t.Fatalf("Failed to get subscription: %v", err)
+	}
+
+	if !sub.IsExpired() {
+		t.Error("Expected subscription to be expired")
+	}
+
+	if sub.IsActive() {
+		t.Error("Expected subscription to not be active")
+	}
+}
+
+func TestSubscriptionFlow_RevokeOldSubscription(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	ctx := context.Background()
+
+	CreateTestSubscriptionInDB(t, f.DB, f.UserChatID, "testuser1", "active", testutil.PtrTime(time.Now().Add(30*24*time.Hour)))
+
+	clientID, err := utils.GenerateUUID()
+	if err != nil {
+		t.Fatalf("Failed to generate client ID: %v", err)
+	}
+
+	plan, planErr := f.DB.GetPlanByName(ctx, database.FreePlanName)
+	if planErr != nil {
+		t.Fatalf("Failed to resolve free plan: %v", planErr)
+	}
+
+	// Creating another subscription with the same telegram_id should fail
+	// due to UNIQUE constraint
+	err = f.DB.CreateSubscription(ctx, &database.Subscription{
+		TelegramID:     f.UserChatID,
+		Username:       "testuser2",
+		ClientID:       clientID,
+		SubscriptionID: "testuser2",
+		ExpiresAt:      testutil.PtrTime(time.Now().Add(30 * 24 * time.Hour)),
+		Status:         "active",
+		PlanID:         plan.ID,
+	}, "")
+	if err == nil {
+		t.Fatal("Expected error due to UNIQUE constraint on telegram_id")
+	}
+
+	subs, err := f.DB.GetLatestSubscriptions(ctx, 10)
+	if err != nil {
+		t.Fatalf("Failed to get subscriptions: %v", err)
+	}
+
+	var activeCount int
+
+	for _, s := range subs {
+		if s.TelegramID == f.UserChatID && s.Status == "active" {
+			activeCount++
+		}
+	}
+
+	if activeCount != 1 {
+		t.Errorf("Expected 1 active subscription, got %d", activeCount)
+	}
+}
+
+func TestAdminStats(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	ctx := context.Background()
+
+	CreateTestSubscriptionInDB(t, f.DB, 111, "user1", "active", testutil.PtrTime(time.Now().Add(30*24*time.Hour)))
+	CreateTestSubscriptionInDB(t, f.DB, 222, "user2", "active", testutil.PtrTime(time.Now().Add(30*24*time.Hour)))
+	CreateTestSubscriptionInDB(t, f.DB, 333, "user3", "revoked", testutil.PtrTime(time.Now().Add(-24*time.Hour)))
+
+	allSubs, err := f.DB.GetAllSubscriptions(ctx)
+	if err != nil {
+		t.Fatalf("Failed to get all subscriptions: %v", err)
+	}
+
+	if len(allSubs) != 3 {
+		t.Errorf("Expected 3 subscriptions, got %d", len(allSubs))
+	}
+
+	activeCount, err := f.DB.CountActiveSubscriptions(ctx)
+	if err != nil {
+		t.Fatalf("Failed to count active subscriptions: %v", err)
+	}
+
+	if activeCount != 2 {
+		t.Errorf("Expected 2 active subscriptions, got %d", activeCount)
+	}
+}
+
+func TestDatabaseService_GetTelegramIDsBatch(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	ctx := context.Background()
+
+	CreateTestSubscriptionInDB(t, f.DB, 111, "user1", "active", testutil.PtrTime(time.Now().Add(30*24*time.Hour)))
+	CreateTestSubscriptionInDB(t, f.DB, 222, "user2", "active", testutil.PtrTime(time.Now().Add(30*24*time.Hour)))
+	CreateTestSubscriptionInDB(t, f.DB, 333, "user3", "revoked", testutil.PtrTime(time.Now().Add(-24*time.Hour)))
+
+	ids, err := f.DB.GetTelegramIDsBatch(ctx, 0, 100)
+	if err != nil {
+		t.Fatalf("Failed to get telegram IDs batch: %v", err)
+	}
+
+	if len(ids) != 2 {
+		t.Errorf("Expected 2 active telegram IDs, got %d", len(ids))
+	}
+}
+
+func TestDatabaseService_GetByUsername(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	ctx := context.Background()
+
+	CreateTestSubscriptionInDB(t, f.DB, 111, "testuser", "active", testutil.PtrTime(time.Now().Add(30*24*time.Hour)))
+
+	id, err := f.DB.GetTelegramIDByUsername(ctx, "testuser")
+	if err != nil {
+		t.Fatalf("Failed to get telegram ID by username: %v", err)
+	}
+
+	if id != 111 {
+		t.Errorf("Expected telegram ID 111, got %d", id)
+	}
+
+	_, err = f.DB.GetTelegramIDByUsername(ctx, "nonexistent")
+	if err == nil {
+		t.Error("Expected error for nonexistent username")
+	}
+}
+
+func TestHandler_GetMainMenuContent_Admin(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	_, _ = f.Handler.getMainMenuContent(context.Background(), "testuser", true, f.AdminChatID, nil)
+
+	text, keyboard := f.Handler.getMainMenuContent(context.Background(), "testuser", false, f.UserChatID, nil)
+
+	assert.Contains(t, text, "testuser")
+	assert.NotEmpty(t, keyboard.InlineKeyboard)
+}
+
+func TestHandler_GetDonateText(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	text := f.Handler.getDonateText()
+	assert.NotEmpty(t, text)
+}
+
+func TestHandler_GetHelpText(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	text := f.Handler.getHelpText("https://example.com/sub")
+	assert.Contains(t, text, "https://example.com/sub")
+	assert.Contains(t, text, "Happ")
+}
+
+func TestHandler_GetUsername(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	tests := []struct {
+		name string
+		user *tgbotapi.User
+		want string
+	}{
+		{"with username", &tgbotapi.User{UserName: "testuser"}, "testuser"},
+		{"first name only", &tgbotapi.User{ID: 0, FirstName: "Test"}, ""},
+		{"both username and first", &tgbotapi.User{UserName: "testuser", FirstName: "Test"}, "testuser"},
+		{"empty user", &tgbotapi.User{ID: 0}, ""},
+		{"nil user", nil, "unknown"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := f.Handler.getUsername(tc.user)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func resetBotAPI(m *testutil.BotAPI) {
+	m.SetSendCalled(false)
+	m.SetRequestCalled(false)
+	m.LastSentText = ""
+	m.LastChatID = 0
+	m.SendCount = 0
+	m.SendError = nil
+	m.RequestError = nil
+}
+
+// ==================== Additional Integration Tests ====================
+
+func TestIntegration_HandleStart_NoSubscription(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	ctx := context.Background()
+
+	resetBotAPI(f.Handler.bot.(*testutil.BotAPI))
+
+	update := tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: f.UserChatID},
+			From: &tgbotapi.User{
+				ID:       f.UserChatID,
+				UserName: "testuser",
+			},
+			Text:     "/start",
+			Entities: []tgbotapi.MessageEntity{{Type: "bot_command", Offset: 0, Length: 6}},
+		},
+	}
+	f.Handler.HandleStart(ctx, update)
+
+	assert.True(t, f.Handler.bot.(*testutil.BotAPI).SendCalledSafe())
+}
+
+func TestIntegration_HandleStart_WithSubscription(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	ctx := context.Background()
+
+	CreateTestSubscriptionInDB(t, f.DB, f.UserChatID, "testuser", "active", testutil.PtrTime(time.Now().Add(30*24*time.Hour)))
+	resetBotAPI(f.Handler.bot.(*testutil.BotAPI))
+
+	update := tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: f.UserChatID},
+			From: &tgbotapi.User{
+				ID:       f.UserChatID,
+				UserName: "testuser",
+			},
+			Text:     "/start",
+			Entities: []tgbotapi.MessageEntity{{Type: "bot_command", Offset: 0, Length: 6}},
+		},
+	}
+	f.Handler.HandleStart(ctx, update)
+
+	assert.True(t, f.Handler.bot.(*testutil.BotAPI).SendCalledSafe())
+}
+
+func TestIntegration_HandleHelp(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	ctx := context.Background()
+
+	resetBotAPI(f.Handler.bot.(*testutil.BotAPI))
+
+	update := tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: f.UserChatID},
+			From: &tgbotapi.User{
+				ID:       f.UserChatID,
+				UserName: "testuser",
+			},
+			Text:     "/help",
+			Entities: []tgbotapi.MessageEntity{{Type: "bot_command", Offset: 0, Length: 5}},
+		},
+	}
+	f.Handler.HandleHelp(ctx, update)
+
+	assert.True(t, f.Handler.bot.(*testutil.BotAPI).SendCalledSafe())
+}
+
+func TestIntegration_HandleInvite(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	ctx := context.Background()
+
+	resetBotAPI(f.Handler.bot.(*testutil.BotAPI))
+
+	update := tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: f.UserChatID},
+			From: &tgbotapi.User{
+				ID:       f.UserChatID,
+				UserName: "testuser",
+			},
+			Text:     "/invite",
+			Entities: []tgbotapi.MessageEntity{{Type: "bot_command", Offset: 0, Length: 7}},
+		},
+	}
+	f.Handler.HandleInvite(ctx, update)
+
+	assert.True(t, f.Handler.bot.(*testutil.BotAPI).SendCalledSafe())
+}
+
+func TestIntegration_Callback_CreateSubscription(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	ctx := context.Background()
+
+	resetBotAPI(f.Handler.bot.(*testutil.BotAPI))
+
+	update := tgbotapi.Update{
+		CallbackQuery: &tgbotapi.CallbackQuery{
+			From: &tgbotapi.User{
+				ID:       f.UserChatID,
+				UserName: "testuser",
+			},
+			Data: "create_subscription",
+			Message: &tgbotapi.Message{
+				Chat:      &tgbotapi.Chat{ID: f.UserChatID},
+				MessageID: 100,
+			},
+		},
+	}
+	f.Handler.HandleCallback(ctx, update)
+
+	assert.True(t, f.Handler.bot.(*testutil.BotAPI).SendCalledSafe())
+}
+
+func TestIntegration_Callback_MenuSubscription(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	CreateTestSubscriptionInDB(t, f.DB, f.UserChatID, "testuser", "active", testutil.PtrTime(time.Now().Add(30*24*time.Hour)))
+	resetBotAPI(f.Handler.bot.(*testutil.BotAPI))
+
+	ctx := context.Background()
+	update := tgbotapi.Update{
+		CallbackQuery: &tgbotapi.CallbackQuery{
+			From: &tgbotapi.User{
+				ID:       f.UserChatID,
+				UserName: "testuser",
+			},
+			Data: "menu_subscription",
+			Message: &tgbotapi.Message{
+				Chat:      &tgbotapi.Chat{ID: f.UserChatID},
+				MessageID: 100,
+			},
+		},
+	}
+	f.Handler.HandleCallback(ctx, update)
+
+	assert.True(t, f.Handler.bot.(*testutil.BotAPI).SendCalledSafe())
+}
+
+func TestIntegration_Callback_QRCode(t *testing.T) {
+	t.Parallel()
+
+	f := NewTestFixture(t)
+	defer f.Close()
+
+	CreateTestSubscriptionInDB(t, f.DB, f.UserChatID, "testuser", "active", testutil.PtrTime(time.Now().Add(30*24*time.Hour)))
+	resetBotAPI(f.Handler.bot.(*testutil.BotAPI))
+
+	ctx := context.Background()
+	update := tgbotapi.Update{
+		CallbackQuery: &tgbotapi.CallbackQuery{
+			From: &tgbotapi.User{
+				ID:       f.UserChatID,
+				UserName: "testuser",
+			},
+			Data: "qr_code",
+			Message: &tgbotapi.Message{
+				Chat:      &tgbotapi.Chat{ID: f.UserChatID},
+				MessageID: 100,
+			},
+		},
+	}
+	f.Handler.HandleCallback(ctx, update)
+
+	assert.True(t, f.Handler.bot.(*testutil.BotAPI).SendCalledSafe())
+}

@@ -1,0 +1,159 @@
+package bot
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/interfaces"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/logger"
+	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/utils"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"go.uber.org/zap"
+)
+
+// ReferralHandler manages all referral-related operations: invite generation,
+// sharing links, and QR code presentation for referral links.
+type ReferralHandler struct {
+	db        interfaces.DatabaseService
+	cfg       *config.Config
+	bot       interfaces.BotAPI
+	botConfig *BotConfig
+	sender    *MessageSender
+	keyboards *KeyboardBuilder
+}
+
+// NewReferralHandler creates a new ReferralHandler.
+func NewReferralHandler(
+	db interfaces.DatabaseService,
+	cfg *config.Config,
+	bot interfaces.BotAPI,
+	botConfig *BotConfig,
+	sender *MessageSender,
+	keyboards *KeyboardBuilder,
+) *ReferralHandler {
+	return &ReferralHandler{
+		db:        db,
+		cfg:       cfg,
+		bot:       bot,
+		botConfig: botConfig,
+		sender:    sender,
+		keyboards: keyboards,
+	}
+}
+
+// effectiveBotUsername returns the bot username for generated invite/share links.
+// It comes from the runtime-injected bot config (set via SetBotConfig from the
+// initBot getMe result), not from configuration.
+func (rh *ReferralHandler) effectiveBotUsername() string {
+	if rh.botConfig != nil {
+		return rh.botConfig.Username
+	}
+
+	return ""
+}
+
+// SetBotConfig updates the runtime bot config so generated invite/share links
+// always carry the real bot username (from Telegram getMe via initBot).
+func (rh *ReferralHandler) SetBotConfig(botConfig *BotConfig) {
+	rh.botConfig = botConfig
+	// Rebuild keyboards so InviteLinkText shows the real @username (not the
+	// empty value captured at construction time before initBot ran).
+	rh.keyboards = NewKeyboardBuilder(
+		botConfig.Username,
+		rh.cfg.ContactUsername,
+		rh.cfg.DonateCardNumber,
+		rh.cfg.DonateURL,
+		rh.cfg.SiteURL,
+		rh.cfg.DonateEnabled,
+	)
+}
+
+// HandleInvite handles the /invite command.
+func (rh *ReferralHandler) HandleInvite(ctx context.Context, chatID int64, username string, messageID int) error {
+	logger.Info("User requesting invite link",
+		zap.Int64("chat_id", chatID),
+		zap.String("username", username), zap.Int64("chat_id", chatID))
+
+	return rh.sendInviteLink(ctx, chatID, messageID)
+}
+
+// sendInviteLink returns (or creates on first use) the user's canonical invite code
+// and sends the invite links. After migration 005 every referrer has at most one code.
+func (rh *ReferralHandler) sendInviteLink(ctx context.Context, chatID int64, messageID int) error {
+	invite, err := rh.db.GetInviteByReferrer(ctx, chatID)
+	if errors.Is(err, database.ErrInviteNotFound) {
+		// First time — generate a fresh code
+		inviteCode, genErr := utils.GenerateInviteCode()
+		if genErr != nil {
+			logger.Error("Failed to generate invite code",
+				zap.Error(genErr),
+				zap.Int64("chat_id", chatID))
+			rh.sender.SendMessage(ctx, chatID, msg(MsgInviteCreateFailed))
+
+			return fmt.Errorf("generate invite code: %w", genErr)
+		}
+
+		invite, err = rh.db.GetOrCreateInvite(ctx, chatID, inviteCode)
+	}
+
+	if err != nil {
+		logger.Error("Failed to get or create invite",
+			zap.Error(err),
+			zap.Int64("chat_id", chatID))
+		rh.sender.SendMessage(ctx, chatID, msg(MsgInviteCreateFailed))
+
+		return fmt.Errorf("get or create invite: %w", err)
+	}
+
+	telegramLink := fmt.Sprintf("https://t.me/%s?start=share_%s", rh.effectiveBotUsername(), invite.Code)
+	webLink := fmt.Sprintf("%s/i/%s", rh.cfg.SiteURL, invite.Code)
+	text := rh.keyboards.InviteLinkText(telegramLink, webLink)
+	keyboard := rh.keyboards.Invite()
+
+	if messageID > 0 {
+		editMsg := tgbotapi.NewEditMessageText(chatID, messageID, text)
+		editMsg.ParseMode = "Markdown"
+		editMsg.DisableWebPagePreview = true
+		editMsg.ReplyMarkup = &keyboard
+		rh.sender.SafeSend(editMsg)
+	} else {
+		msg := tgbotapi.NewMessage(chatID, text)
+		msg.ParseMode = "Markdown"
+		msg.DisableWebPagePreview = true
+		msg.ReplyMarkup = &keyboard
+		rh.sender.Send(ctx, msg)
+	}
+
+	return nil
+}
+
+// generateInviteLink returns a Telegram or web invite link for the given user
+// using the user's canonical (oldest) invite code. Generates a code only on first use.
+func (rh *ReferralHandler) generateInviteLink(ctx context.Context, chatID int64, lt linkType) (string, error) {
+	invite, err := rh.db.GetInviteByReferrer(ctx, chatID)
+	if errors.Is(err, database.ErrInviteNotFound) {
+		inviteCode, genErr := utils.GenerateInviteCode()
+		if genErr != nil {
+			return "", fmt.Errorf("generate invite code: %w", genErr)
+		}
+
+		invite, err = rh.db.GetOrCreateInvite(ctx, chatID, inviteCode)
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("get or create invite: %w", err)
+	}
+
+	switch lt {
+	case linkTypeTelegram:
+		return fmt.Sprintf("https://t.me/%s?start=share_%s", rh.effectiveBotUsername(), invite.Code), nil
+	case linkTypeWeb:
+		return fmt.Sprintf("%s/i/%s", rh.cfg.SiteURL, invite.Code), nil
+	default:
+		return "", fmt.Errorf("unknown link type: %s", lt)
+	}
+}

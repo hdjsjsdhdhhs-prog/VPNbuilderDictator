@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ошибка</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+        .container { background: white; border-radius: 20px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); padding: 32px; max-width: 400px; width: 100%; text-align: center; }
+        h1 { color: #e74c3c; margin-bottom: 20px; }
+        p { color: #666; line-height: 1.6; }
+        .logo { margin-bottom: 24px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <img class="logo" src="/static/logo.png">
+        <h1>Ошибка</h1>
+        <p>{{.Message}}</p>
+    </div>
+</body>
+</html>

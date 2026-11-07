@@ -1,0 +1,322 @@
+name: CI/CD Pipeline
+
+on:
+    push:
+        branches:
+            - main
+        tags:
+            - "v*"
+    pull_request:
+        branches:
+            - main
+        types: [opened, synchronize, reopened]
+
+env:
+    REGISTRY: ghcr.io
+    IMAGE_NAME: ${{ github.repository }}
+
+# Least privilege by default; jobs that publish request more explicitly.
+permissions:
+    contents: read
+
+jobs:
+    test:
+        name: Run Tests
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v7
+              with:
+                fetch-depth: 0  # the lint baseline is the root commit of the repository
+                persist-credentials: false  # предотвращает утечку GITHUB_TOKEN в последующие шаги и PR из форков
+
+            - name: Set up Go
+              uses: actions/setup-go@v7
+              with:
+                  # Same toolchain as the release-binary container.
+                  go-version: "1.25.14"
+                  cache: true
+
+            - name: Download dependencies
+              run: go mod download
+
+            - name: Set up Node.js
+              uses: actions/setup-node@v6
+              with:
+                  node-version: "20"
+                  cache: npm
+                  cache-dependency-path: frontend/package-lock.json
+
+            - name: Frontend typecheck, lint and unit tests
+              working-directory: frontend
+              run: npm ci && npm run typecheck && npm run lint && npm test
+
+            - name: Build frontend production assets
+              working-directory: frontend
+              run: npm run build && npm run build:admin
+
+            - name: Run tests
+              # Per-package limit: internal/service takes ~5 minutes under -race.
+              # Includes the migration tests (fresh install and upgrade from 50).
+              run: go test -v -race -count=1 -coverprofile=coverage.out -timeout 20m ./...
+
+            - name: Run go vet
+              run: |
+                  go vet ./...
+                  go vet -tags adminsmoke ./internal/web/
+
+            - name: Build packages
+              run: go build ./...
+
+            - name: Resolve lint baseline
+              id: lint_base
+              # The repository has an independent history: the baseline is its
+              # root commit. Findings that exist there are a known backlog;
+              # every issue introduced afterwards fails the build.
+              run: echo "rev=$(git rev-list --max-parents=0 HEAD | tail -n 1)" >> "$GITHUB_OUTPUT"
+
+            - name: Run golangci-lint
+              uses: golangci/golangci-lint-action@v9
+              with:
+                  version: v2.12
+                  args: --timeout 5m --new-from-rev=${{ steps.lint_base.outputs.rev }}
+
+            - name: Run gosec security scan
+              uses: securego/gosec@v2.29.0
+              with:
+                  # Fail on every non-suppressed finding.
+                  args: -quiet ./...
+
+            - name: Upload coverage
+              uses: actions/upload-artifact@v7
+              with:
+                  name: coverage
+                  path: coverage.out
+                  retention-days: 7
+
+    browser:
+        name: Browser tests (Mini App, Admin Panel)
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
+
+            - name: Set up Node.js
+              uses: actions/setup-node@v6
+              with:
+                  node-version: "20"
+                  cache: npm
+                  cache-dependency-path: frontend/package-lock.json
+
+            - name: Install dependencies and Chromium
+              working-directory: frontend
+              run: npm ci && npx playwright install --with-deps chromium
+
+            - name: Mini App browser tests
+              working-directory: frontend
+              run: npx playwright test
+
+            - name: Admin Panel browser tests
+              working-directory: frontend
+              run: npx playwright test -c playwright.admin.config.ts
+
+            - name: Upload Playwright results
+              if: failure()
+              uses: actions/upload-artifact@v7
+              with:
+                  name: playwright-results
+                  path: frontend/test-results/
+                  retention-days: 7
+
+    release-binary:
+        # Runs on every push/PR so the verified build is checked without a
+        # release; only the release job below (v* tags) publishes it.
+        name: Build linux/amd64 release binary
+        runs-on: ubuntu-latest
+        needs: [test, browser]
+        container: golang:1.25.14-bookworm
+        permissions:
+            contents: read
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
+
+            - name: Verify clean checkout of the built commit
+              run: |
+                  git config --global --add safe.directory "$GITHUB_WORKSPACE"
+                  test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+                  test -z "$(git status --porcelain)"
+                  test "$(go env GOVERSION)" = "go1.25.14"
+
+            - name: Set up Node.js
+              uses: actions/setup-node@v6
+              with:
+                  node-version: "20"
+
+            - name: Build frontend production assets
+              working-directory: frontend
+              run: npm ci && npm run typecheck && npm run build && npm run build:admin
+
+            - name: Run go vet
+              run: |
+                  go vet ./...
+                  go vet -tags adminsmoke ./internal/web/
+
+            - name: Build release binary
+              run: |
+                  test -z "$(git status --porcelain)"
+                  CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath \
+                      -ldflags "-s -w -X main.version=${GITHUB_REF_NAME} -X main.commit=${GITHUB_SHA} -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                      -o "${RUNNER_TEMP:?}/rs8kvn-bot" ./cmd/bot
+                  test -z "$(git status --porcelain)"
+
+            - name: Verify build metadata and checksum
+              run: |
+                  mkdir release-assets
+                  go version -m "${RUNNER_TEMP:?}/rs8kvn-bot" | tee release-assets/buildinfo.txt
+                  grep -F "vcs.revision=${GITHUB_SHA}" release-assets/buildinfo.txt
+                  grep -F "vcs.modified=false" release-assets/buildinfo.txt
+                  grep -F "GOARCH=amd64" release-assets/buildinfo.txt
+                  grep -F "GOOS=linux" release-assets/buildinfo.txt
+                  grep -F "CGO_ENABLED=1" release-assets/buildinfo.txt
+                  grep -F -- "-trimpath=true" release-assets/buildinfo.txt
+                  grep -F "go1.25.14" release-assets/buildinfo.txt
+                  cp "${RUNNER_TEMP:?}/rs8kvn-bot" release-assets/rs8kvn-bot-linux-amd64
+                  cd release-assets
+                  sha256sum rs8kvn-bot-linux-amd64 | tee rs8kvn-bot-linux-amd64.sha256
+
+            - name: Upload release binary
+              uses: actions/upload-artifact@v7
+              with:
+                  name: rs8kvn-bot-linux-amd64
+                  path: release-assets/
+                  if-no-files-found: error
+                  retention-days: 90
+
+    build-and-push:
+        # The image is built on every run; it is pushed to GHCR only for v* tags.
+        name: Build (and on tags push) Docker Image
+        runs-on: ubuntu-latest
+        needs: [test, browser]
+        permissions:
+            contents: read
+            packages: write
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v7
+              with:
+                persist-credentials: false  # предотвращает утечку GITHUB_TOKEN в последующие шаги и PR из форков
+
+            - name: Set up QEMU
+              uses: docker/setup-qemu-action@v4
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v4
+
+            - name: Log in to Container Registry
+              if: startsWith(github.ref, 'refs/tags/v')
+              uses: docker/login-action@v4
+              with:
+                  registry: ${{ env.REGISTRY }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Extract metadata (tags, labels)
+              id: meta
+              uses: docker/metadata-action@v6
+              with:
+                  images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+                  tags: |
+                      type=ref,event=branch
+                      type=semver,pattern={{version}}
+                      type=semver,pattern={{major}}.{{minor}}
+                      type=sha,prefix=
+
+            - name: Get version
+              id: get_version
+              run: |
+                  if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+                      echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "VERSION=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Get build time
+              id: get_build_time
+              run: echo "BUILD_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+            - name: Build and push Docker image
+              uses: docker/build-push-action@v7
+              with:
+                  context: .
+                  push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+                  tags: ${{ steps.meta.outputs.tags }}
+                  labels: ${{ steps.meta.outputs.labels }}
+                  platforms: linux/amd64
+                  build-args: |
+                      VERSION=${{ steps.get_version.outputs.VERSION }}
+                      COMMIT_SHA=${{ github.sha }}
+                      BUILD_TIME=${{ steps.get_build_time.outputs.BUILD_TIME }}
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+
+    release:
+        name: Create GitHub Release
+        runs-on: ubuntu-latest
+        needs: [test, build-and-push, release-binary]
+        if: startsWith(github.ref, 'refs/tags/v')
+        permissions:
+            contents: write
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v7
+              with:
+                  fetch-depth: 0
+                  persist-credentials: false  # предотвращает утечку GITHUB_TOKEN в последующие шаги и PR из форков
+
+            - name: Get version from tag
+              id: get_version
+              run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+            - name: Download release binary
+              uses: actions/download-artifact@v8
+              with:
+                  name: rs8kvn-bot-linux-amd64
+                  path: release-assets
+
+            - name: Generate changelog
+              id: changelog
+              run: |
+                  # Get previous tag
+                  PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
+                  if [ -z "$PREV_TAG" ]; then
+                      # First release, get all commits
+                      CHANGELOG=$(git log --pretty=format:"- %s (%h)" --no-merges)
+                  else
+                      # Get commits since last tag
+                      CHANGELOG=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
+                  fi
+
+                  # Save changelog to file for multiline support
+                  echo "$CHANGELOG" > /tmp/changelog.txt
+                  echo "changelog_file=/tmp/changelog.txt" >> $GITHUB_OUTPUT
+
+            - name: Create Release
+              uses: ncipollo/release-action@v1
+              with:
+                  tag: ${{ steps.get_version.outputs.VERSION }}
+                  name: Release ${{ steps.get_version.outputs.VERSION }}
+                  bodyFile: ${{ steps.changelog.outputs.changelog_file }}
+                  artifacts: release-assets/*
+                  generateReleaseNotes: true
+                  draft: false
+                  prerelease: false
+                  token: ${{ secrets.GITHUB_TOKEN }}
