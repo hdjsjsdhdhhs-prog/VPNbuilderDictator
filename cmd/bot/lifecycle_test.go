@@ -7,8 +7,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
 )
 
 // Startup must not depend on any VPN node: a brand-new database comes up with

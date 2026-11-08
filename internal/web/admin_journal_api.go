@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/service"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/service"
 )
 
 const adminJournalMaxQuery = 128

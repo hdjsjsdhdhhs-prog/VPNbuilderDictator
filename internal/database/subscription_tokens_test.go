@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/utils"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

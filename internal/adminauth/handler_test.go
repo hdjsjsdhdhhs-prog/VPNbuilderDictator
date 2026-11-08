@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/config"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
 )

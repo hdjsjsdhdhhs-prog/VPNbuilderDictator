@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/testutil"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/testutil"
 )
 
 // TestReferralInviteLinkUsesRealBotUsername is a regression test for the bug

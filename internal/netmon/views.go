@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
 )
 
 // Admin views. Every field is credential-free: endpoints are protocol, host,

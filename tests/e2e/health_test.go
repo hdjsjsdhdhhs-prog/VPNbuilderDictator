@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/service"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/web"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/service"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/web"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

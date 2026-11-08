@@ -8,10 +8,10 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/logger"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/utils"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/logger"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/utils"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"go.uber.org/zap"

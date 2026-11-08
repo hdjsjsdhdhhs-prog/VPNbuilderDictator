@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/ratelimiter"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/service"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/ratelimiter"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/service"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/stretchr/testify/assert"

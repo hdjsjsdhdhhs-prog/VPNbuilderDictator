@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
 )
 
 // RenewalResult is for trusted application callers only, not an HTTP DTO.

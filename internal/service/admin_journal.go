@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
 )
 
 // JournalRepository is the read seam of the admin journal. *database.Service

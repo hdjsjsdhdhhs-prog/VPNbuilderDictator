@@ -5,7 +5,7 @@ import (
 	"errors"
 	"net/url"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
 )
 
 // SubscriptionManagementAction separates reading from granting access days.

@@ -1,4 +1,4 @@
-module github.com/hdjsjsdhdhhs-prog/dictatorvpn
+module github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator
 
 go 1.25.0
 

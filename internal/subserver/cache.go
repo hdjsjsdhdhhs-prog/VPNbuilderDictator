@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/metrics"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/metrics"
 )
 
 type noCopy struct{}

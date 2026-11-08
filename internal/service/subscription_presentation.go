@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/utils"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/utils"
 )
 
 // PremiumBenefitsText is the concise user-facing summary shared by purchase

@@ -19,12 +19,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/interfaces"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/service"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/subserver"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/testutil"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/interfaces"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/service"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/subserver"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/testutil"
 
 	"gorm.io/gorm"
 )

@@ -3,7 +3,7 @@ package bot
 import (
 	"fmt"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/service"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/service"
 )
 
 type MessageKey string

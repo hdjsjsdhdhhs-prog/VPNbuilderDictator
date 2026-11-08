@@ -3,7 +3,7 @@ package service
 import (
 	"context"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
 )
 
 type recentPurchaseRepository interface {

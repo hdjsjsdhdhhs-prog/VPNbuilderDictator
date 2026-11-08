@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/interfaces"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/metrics"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/utils"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/interfaces"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/metrics"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/utils"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )

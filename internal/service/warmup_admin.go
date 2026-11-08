@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
 )
 
 // Browser-admin boundary of the customer warm-up (Admin → «Прогрев

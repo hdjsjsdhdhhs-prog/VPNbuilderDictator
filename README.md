@@ -1,6 +1,6 @@
 # DictatorVPN
 
-[![CI](https://github.com/hdjsjsdhdhhs-prog/dictatorvpn/actions/workflows/docker.yml/badge.svg?branch=main)](https://github.com/hdjsjsdhdhhs-prog/dictatorvpn/actions/workflows/docker.yml)
+[![CI](https://github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/actions/workflows/docker.yml/badge.svg?branch=main)](https://github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/actions/workflows/docker.yml)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go)](https://go.dev/)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](LICENSE)
 
@@ -50,7 +50,7 @@ removed; see [doc/architecture.md](doc/architecture.md).
 ## Quick Start
 
 ```bash
-docker pull ghcr.io/hdjsjsdhdhhs-prog/dictatorvpn:latest
+docker pull ghcr.io/hdjsjsdhdhhs-prog/vpnbuilderdictator:latest
 
 docker run -d \
   --name rs8kvn_bot \
@@ -58,7 +58,7 @@ docker run -d \
   -v $(pwd)/.env:/app/.env:ro \
   -v $(pwd)/data:/app/data \
   -p 127.0.0.1:8880:8880 \
-  ghcr.io/hdjsjsdhdhhs-prog/dictatorvpn:latest
+  ghcr.io/hdjsjsdhdhhs-prog/vpnbuilderdictator:latest
 ```
 
 > The registry provides `latest`, SemVer (`X.Y.Z`, `X.Y`) and commit SHA tags. Pin a
@@ -157,7 +157,7 @@ panel-side traffic accounting.
 2. The CI/CD pipeline runs Go tests (with `-race`), `go vet`, golangci-lint, gosec,
    frontend typecheck/lint/unit tests and builds.
 3. A verified linux/amd64 binary (`-trimpath`, `CGO_ENABLED=1`, `vcs.modified=false`,
-   SHA-256) and the Docker image `ghcr.io/hdjsjsdhdhhs-prog/dictatorvpn` are built.
+   SHA-256) and the Docker image `ghcr.io/hdjsjsdhdhhs-prog/vpnbuilderdictator` are built.
 4. A GitHub Release is created with the binary and its checksum.
 
 ## Development

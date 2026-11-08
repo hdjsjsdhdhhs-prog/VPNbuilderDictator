@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/interfaces"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/logger"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/metrics"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/interfaces"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/logger"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/metrics"
 
 	"go.uber.org/zap"
 )

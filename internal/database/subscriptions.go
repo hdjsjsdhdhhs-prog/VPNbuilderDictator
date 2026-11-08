@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/utils"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/utils"
 	"github.com/mattn/go-sqlite3"
 	"gorm.io/gorm"
 )

@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/config"
 )
 
 func FuzzInviteCodeRegex(f *testing.F) {

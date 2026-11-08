@@ -3,7 +3,7 @@ package bot
 import (
 	"testing"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/utils"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/utils"
 
 	"github.com/stretchr/testify/assert"
 )

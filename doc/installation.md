@@ -62,7 +62,7 @@ chmod 755 data
 
 ```bash
 # Pull from GitHub Container Registry
-docker pull ghcr.io/hdjsjsdhdhhs-prog/dictatorvpn:latest
+docker pull ghcr.io/hdjsjsdhdhhs-prog/vpnbuilderdictator:latest
 
 # Run container
 docker run -d \
@@ -72,7 +72,7 @@ docker run -d \
   -v $(pwd)/.env:/app/.env:ro \
   -v $(pwd)/data:/app/data \
   -p 127.0.0.1:8880:8880 \
-  ghcr.io/hdjsjsdhdhhs-prog/dictatorvpn:latest
+  ghcr.io/hdjsjsdhdhhs-prog/vpnbuilderdictator:latest
 ```
 
 #### 5. View logs
@@ -103,7 +103,7 @@ version: '3.8'
 
 services:
   rs8kvn_bot:
-    image: ghcr.io/hdjsjsdhdhhs-prog/dictatorvpn:latest
+    image: ghcr.io/hdjsjsdhdhhs-prog/vpnbuilderdictator:latest
     container_name: rs8kvn_bot
     restart: unless-stopped
 
@@ -170,7 +170,7 @@ docker-compose logs -f
 
 ```bash
 # Clone repository
-git clone https://github.com/hdjsjsdhdhhs-prog/dictatorvpn.git
+git clone https://github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator.git
 cd rs8kvn_bot
 
 # Install dependencies
@@ -324,7 +324,7 @@ Admin-only commands:
 docker stop rs8kvn_bot && docker rm rs8kvn_bot
 
 # Remove image
-docker rmi ghcr.io/hdjsjsdhdhhs-prog/dictatorvpn:latest
+docker rmi ghcr.io/hdjsjsdhdhhs-prog/vpnbuilderdictator:latest
 
 # Remove data (⚠️  THIS DELETES ALL SUBSCRIPTIONS)
 rm -rf ./data
@@ -337,7 +337,7 @@ rm .env
 
 ## Support
 
-**Issues:** https://github.com/hdjsjsdhdhhs-prog/dictatorvpn/issues  
+**Issues:** https://github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/issues  
 **Documentation:** `doc/handover.md`, `doc/operations.md`
 
 **Before reporting:**

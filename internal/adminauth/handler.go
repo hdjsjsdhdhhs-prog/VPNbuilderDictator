@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/config"
 	"golang.org/x/crypto/bcrypt"
 )
 

@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
 )
 
 // Full Xray client configs: some panels (Remnawave and similar) answer with a

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/backup"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/logger"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/backup"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/logger"
 
 	"go.uber.org/zap"
 )

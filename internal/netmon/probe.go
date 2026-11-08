@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/subserver"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/subserver"
 
 	"github.com/quic-go/quic-go"
 )

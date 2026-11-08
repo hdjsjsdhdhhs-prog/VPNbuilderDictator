@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/testutil"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/testutil"
 	_ "github.com/mattn/go-sqlite3"
 	"go.uber.org/goleak"
 )

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/logger"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/logger"
 
 	"github.com/stretchr/testify/require"
 )

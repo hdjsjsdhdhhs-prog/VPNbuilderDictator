@@ -7,9 +7,9 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/metrics"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/utils"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/metrics"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/utils"
 )
 
 // CustomerSubscriptionTerms opts Create into the finite ProviderSource-backed

@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/subserver"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/testutil"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/subserver"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/testutil"
 
 	"github.com/quic-go/quic-go"
 	"github.com/stretchr/testify/assert"

@@ -11,9 +11,9 @@ import (
 	"maps"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/interfaces"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/logger"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/interfaces"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/logger"
 
 	"go.uber.org/zap"
 )

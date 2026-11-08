@@ -5,7 +5,7 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/netmon"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/netmon"
 )
 
 // NetworkMonitor is the read side of the network monitor behind the

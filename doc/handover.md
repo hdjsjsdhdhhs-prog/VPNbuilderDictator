@@ -1,7 +1,7 @@
 # Handover Summary — DictatorVPN
 
-**Repo:** https://github.com/hdjsjsdhdhhs-prog/dictatorvpn (independent repository; started from kereal/rs8kvn_bot, see `NOTICE.md`)
-**Module:** `github.com/hdjsjsdhdhhs-prog/dictatorvpn` (Go 1.25)
+**Repo:** https://github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator (independent repository; started from kereal/rs8kvn_bot, see `NOTICE.md`)
+**Module:** `github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator` (Go 1.25)
 **Branch:** `main` (feature branches from `main`, merged through pull requests)
 
 ---

@@ -244,7 +244,7 @@ docker run -d \
   -v $(pwd)/.env:/app/.env:ro \
   -v $(pwd)/data:/app/data \
   -p 127.0.0.1:8880:8880 \
-  ghcr.io/hdjsjsdhdhhs-prog/dictatorvpn:latest
+  ghcr.io/hdjsjsdhdhhs-prog/vpnbuilderdictator:latest
 ```
 
 **Docker daemon hardening** (`/etc/docker/daemon.json`):

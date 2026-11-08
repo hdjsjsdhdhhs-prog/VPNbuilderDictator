@@ -66,7 +66,7 @@ go run ./cmd/bot
 
 ```bash
 # 1. Pull new image
-docker pull ghcr.io/hdjsjsdhdhhs-prog/dictatorvpn:latest
+docker pull ghcr.io/hdjsjsdhdhhs-prog/vpnbuilderdictator:latest
 
 # 2. Stop old container
 docker stop rs8kvn_bot
@@ -81,7 +81,7 @@ docker run -d \
   -v $(pwd)/.env:/app/.env:ro \
   -v $(pwd)/data:/app/data \
   -p 127.0.0.1:8880:8880 \
-  ghcr.io/hdjsjsdhdhhs-prog/dictatorvpn:latest
+  ghcr.io/hdjsjsdhdhhs-prog/vpnbuilderdictator:latest
 ```
 
 **Using Docker Compose:**
@@ -93,7 +93,7 @@ docker-compose up -d
 
 **Rollback:** If something goes wrong, specify previous tag:
 ```bash
-docker run ... ghcr.io/hdjsjsdhdhhs-prog/dictatorvpn:v2.2.0
+docker run ... ghcr.io/hdjsjsdhdhhs-prog/vpnbuilderdictator:v2.2.0
 ```
 
 ### 2.2 Binary (manual build)
@@ -776,7 +776,7 @@ limit_req_zone $binary_remote_addr zone=sub:10m rate=30r/m;
 
 ## 8. Support
 
-**Issues:** https://github.com/hdjsjsdhdhhs-prog/dictatorvpn/issues  
+**Issues:** https://github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/issues  
 **Security:** security@example.com (example — configure real email)
 
 **Before reporting:**

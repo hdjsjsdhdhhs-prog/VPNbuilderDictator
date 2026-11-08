@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
 )
 
 // TariffRepository is the persistence seam of TariffService. *database.Service

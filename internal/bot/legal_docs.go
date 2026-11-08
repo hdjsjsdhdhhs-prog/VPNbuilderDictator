@@ -3,7 +3,7 @@ package bot
 import (
 	"strings"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/utils"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/utils"
 )
 
 const legalFooter = "\n\nБот «DictatorVPN», 28.07.2026"

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/subserver"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/subserver"
 )
 
 func BenchmarkExtractJSONConfigs(b *testing.B) {

@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/utils"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/utils"
 	"gorm.io/gorm"
 )
 

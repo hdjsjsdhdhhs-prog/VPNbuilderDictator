@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/config"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/service"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/telegramauth"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/config"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/service"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/telegramauth"
 )
 
 // This private context key can only be populated at the verified HTTP boundary.

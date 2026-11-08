@@ -4,7 +4,7 @@
 services:
     rs8kvn_bot:
         # :latest is convenient for automatic updates; pin a concrete SemVer or SHA tag for reproducibility
-        image: ghcr.io/hdjsjsdhdhhs-prog/dictatorvpn:latest
+        image: ghcr.io/hdjsjsdhdhhs-prog/vpnbuilderdictator:latest
         container_name: rs8kvn_bot
         restart: unless-stopped
 

@@ -3,7 +3,7 @@ package service
 import (
 	"slices"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
 )
 
 // Code registries of the customer warm-up. Scenarios are rows in the database

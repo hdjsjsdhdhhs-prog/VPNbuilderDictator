@@ -11,8 +11,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/database"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/interfaces"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/interfaces"
 )
 
 // Network monitor resolution. The monitor must check exactly the servers a

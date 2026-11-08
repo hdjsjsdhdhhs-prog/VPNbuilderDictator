@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/utils"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/utils"
 )
 
 func FuzzEscapeMarkdown(f *testing.F) {

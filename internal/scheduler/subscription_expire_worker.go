@@ -4,10 +4,10 @@ import (
 	"context"
 	"time"
 
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/interfaces"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/logger"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/metrics"
-	"github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/service"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/interfaces"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/logger"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/metrics"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/service"
 
 	"go.uber.org/zap"
 )

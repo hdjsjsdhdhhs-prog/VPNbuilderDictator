@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	flag "github.com/hdjsjsdhdhhs-prog/dictatorvpn/internal/flag"
+	flag "github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/flag"
 )
 
 // Config holds all configuration for the application.
