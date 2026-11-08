@@ -1,6 +1,6 @@
 module github.com/hdjsjsdhdhhs-prog/dictatorvpn
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/getsentry/sentry-go v0.49.0
@@ -12,7 +12,7 @@ require (
 	github.com/piglig/go-qr v1.1.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.2
-	github.com/quic-go/quic-go v0.61.0
+	github.com/quic-go/quic-go v0.65.0
 	github.com/stretchr/testify v1.12.1
 	go.uber.org/goleak v1.3.0
 	go.uber.org/zap v1.28.0
