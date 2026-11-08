@@ -82,7 +82,7 @@ jobs:
                   args: --timeout 5m --new-from-rev=${{ steps.lint_base.outputs.rev }}
 
             - name: Run gosec security scan
-              uses: securego/gosec@v2.29.0
+              uses: securego/gosec@v2.30.0
               with:
                   # Fail on every non-suppressed finding.
                   args: -quiet ./...
