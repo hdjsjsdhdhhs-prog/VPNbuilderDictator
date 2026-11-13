@@ -32,11 +32,14 @@ type adminAPI struct {
 	tariffSvc  *service.TariffService
 	trialSvc   *service.TrialService
 	warmupSvc  *service.WarmupService
-	monitor    NetworkMonitor
-	actor      string
+	// promoSvc and opsSvc are optional: nil answers 503 on their routes.
+	promoSvc *service.PromoService
+	opsSvc   *service.OpsService
+	monitor  NetworkMonitor
+	actor    string
 }
 
-func newAdminAPI(svc *service.AdminService, builderSvc *service.BuilderService, tariffSvc *service.TariffService, trialSvc *service.TrialService, warmupSvc *service.WarmupService, monitor NetworkMonitor, actor string) http.Handler {
+func newAdminAPI(svc *service.AdminService, builderSvc *service.BuilderService, tariffSvc *service.TariffService, trialSvc *service.TrialService, warmupSvc *service.WarmupService, monitor NetworkMonitor, actor string) *adminAPI {
 	return &adminAPI{svc: svc, builderSvc: builderSvc, tariffSvc: tariffSvc, trialSvc: trialSvc, warmupSvc: warmupSvc, monitor: monitor, actor: actor}
 }
 
@@ -84,6 +87,10 @@ func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.routeTrial(w, r, segments)
 	case segments[0] == "warmup":
 		a.routeWarmup(w, r, segments)
+	case segments[0] == "promos":
+		a.routePromos(w, r, segments)
+	case segments[0] == "ops":
+		a.routeOps(w, r, segments)
 	case len(segments) == 1 && segments[0] == "plans":
 		a.get(w, r, a.plansList)
 	case len(segments) == 2 && segments[0] == "subscriptions":
@@ -129,8 +136,10 @@ func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			a.builderGetSource(w, r, id)
 		case http.MethodPatch:
 			a.builderUpdateSource(w, r, id)
+		case http.MethodDelete:
+			a.builderDeleteSource(w, r, id)
 		default:
-			w.Header().Set("Allow", "GET, HEAD, PATCH")
+			w.Header().Set("Allow", "GET, HEAD, PATCH, DELETE")
 			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		}
 	case len(segments) == 3 && segments[0] == "sources" && segments[2] == "enable":
@@ -178,8 +187,10 @@ func (a *adminAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			a.builderGet(w, r, id)
 		case http.MethodPatch:
 			a.builderUpdate(w, r, id)
+		case http.MethodDelete:
+			a.builderDelete(w, r, id)
 		default:
-			w.Header().Set("Allow", "GET, HEAD, PATCH")
+			w.Header().Set("Allow", "GET, HEAD, PATCH, DELETE")
 			writeAdminError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		}
 	case len(segments) == 3 && segments[0] == "builders" && segments[2] == "sources":

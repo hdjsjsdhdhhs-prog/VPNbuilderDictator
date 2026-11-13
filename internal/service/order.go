@@ -621,6 +621,14 @@ func (o *OrderService) requestPayment(ctx context.Context, telegramID int64, use
 		}
 	}
 
+	// The amount to pay is the catalogue price lowered by the customer's
+	// active discount (promo code or warm-up coupon). Nothing to pay is not a
+	// provider payment: the caller activates it with ActivateFree.
+	amount, discount := o.payableAmount(ctx, telegramID, canonical, now)
+	if amount <= 0 && canonical.PriceCents > 0 {
+		return nil, nil, ErrNothingToPay
+	}
+
 	// Return a still-valid link before validating the current product flags: an
 	// operator may deactivate a product while an already-created payment link is
 	// still usable. Expiry is terminalized by the repository lookup.
@@ -632,6 +640,23 @@ func (o *OrderService) requestPayment(ctx context.Context, telegramID int64, use
 
 	if order != nil && order.Status == database.OrderStatusExpired {
 		order = nil
+	}
+
+	// A pending intent created for another amount (a discount was activated or
+	// used up since) is released and replaced. Its provider link keeps its own
+	// deadline, so a payment made on it is still settled at its own price.
+	if order != nil && order.Status == database.OrderStatusPending && order.AmountCents != amount && !order.PaymentCreationUncertain {
+		if repo := o.discounts(); repo != nil {
+			released, releaseErr := repo.ExpirePendingPaymentOrder(ctx, order.ID)
+			if releaseErr != nil {
+				o.notifyRequestIssue(ctx, "release_repriced_order_failed", releaseErr.Error(), "retry after database recovery", telegramID, canonical, order)
+				return nil, order, fmt.Errorf("release repriced payment order: %w", releaseErr)
+			}
+
+			if released {
+				order = nil
+			}
+		}
 	}
 
 	if order != nil && order.Status != database.OrderStatusPending {
@@ -655,10 +680,22 @@ func (o *OrderService) requestPayment(ctx context.Context, telegramID int64, use
 		// The repository transaction expires an old link and creates/reuses the
 		// single pending intent under the partial unique index. This is the only
 		// creation path, so concurrent requests cannot create duplicate intents.
-		order, err = o.db.FindOrCreatePendingPaymentOrder(ctx, sub.ID, canonical.ID, canonical.PriceCents, canonical.Currency, now)
+		order, err = o.db.FindOrCreatePendingPaymentOrder(ctx, sub.ID, canonical.ID, amount, canonical.Currency, now)
 		if err != nil {
 			o.notifyRequestIssue(ctx, "create_pending_order_failed", err.Error(), "retry after database recovery", telegramID, canonical, nil)
 			return nil, nil, fmt.Errorf("find or create pending payment order: %w", err)
+		}
+	}
+
+	// Record the discount on the intent, so the payment redeems it. A reused
+	// intent of the same amount is re-pointed at the current discount.
+	if discount != nil && order.Status == database.OrderStatusPending && order.AmountCents == amount {
+		if repo := o.discounts(); repo != nil {
+			err = repo.SetOrderDiscount(ctx, order.ID, discount, canonical.PriceCents)
+			if err != nil {
+				o.notifyRequestIssue(ctx, "attach_order_discount_failed", err.Error(), "retry after database recovery", telegramID, canonical, order)
+				return nil, order, fmt.Errorf("attach order discount: %w", err)
+			}
 		}
 	}
 
@@ -743,7 +780,7 @@ func (o *OrderService) requestPayment(ctx context.Context, telegramID int64, use
 
 	base := "https://t.me/" + strings.TrimPrefix(o.botUsername, "@")
 
-	response, err := o.payment.CreateTransaction(ctx, platega.CreateTransactionRequest{AmountCents: canonical.PriceCents, Currency: canonical.Currency, Description: canonical.Name, ReturnURL: base, FailedURL: base, Payload: fmt.Sprint(order.ID), UserID: fmt.Sprint(telegramID), UserName: username})
+	response, err := o.payment.CreateTransaction(ctx, platega.CreateTransactionRequest{AmountCents: order.AmountCents, Currency: canonical.Currency, Description: canonical.Name, ReturnURL: base, FailedURL: base, Payload: fmt.Sprint(order.ID), UserID: fmt.Sprint(telegramID), UserName: username})
 	if err != nil {
 		if errors.Is(err, platega.ErrBadRequest) || errors.Is(err, platega.ErrAuth) {
 			o.NotifyPaymentIssue(ctx, PaymentIssue{Event: "provider_create_rejected", Reason: err.Error(), Action: "inspect Platega credentials and request fields before retrying", OrderID: order.ID, TelegramID: telegramID, ProductID: canonical.ID, ProductName: canonical.Name, SubscriptionID: order.SubscriptionID, AmountCents: order.AmountCents, Currency: order.Currency, ProviderID: order.ProviderPaymentID, PaymentURL: order.PaymentURL})

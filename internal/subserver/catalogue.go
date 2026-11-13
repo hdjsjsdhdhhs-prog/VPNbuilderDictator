@@ -41,11 +41,14 @@ func (e *SourceSyncError) Error() string { return "provider source sync failed: 
 func (e *SourceSyncError) SyncCode() string { return e.Code }
 
 // FetchSourceCatalogue fetches and parses a provider source for the catalogue.
-// A disabled source can still be synced (to inspect it before enabling); every
-// other configuration check of the runtime fetch applies. The configured
-// source type is the expected format ("auto" accepts every format).
+// A disabled or expired source can still be synced (to inspect it before
+// enabling it or after renewing it at the provider): both are admin switches
+// that only take the source out of /sub. Every other configuration check of
+// the runtime fetch applies. The configured source type is the expected
+// format ("auto" accepts every format).
 func FetchSourceCatalogue(ctx context.Context, source database.ProviderSource) (*SourceCatalogue, error) {
 	source.Enabled = true
+	source.ExpiresAt = nil
 
 	resp, failure := fetchProviderSource(ctx, source)
 	if failure != "" {

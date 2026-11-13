@@ -566,6 +566,17 @@ export class AdminApi {
     return data as unknown as AdminSource;
   }
 
+  /**
+   * DELETE /admin/api/sources/{id}: the source and its catalogue, only while
+   * nothing depends on it (409 source_in_use otherwise). A retry with the same
+   * key replays the recorded deletion.
+   */
+  async deleteSource(id: number, requestKey: string): Promise<void> {
+    if (!Number.isSafeInteger(id) || id <= 0) throw new ApiError('not_found', 404);
+    const data = await this.#send('DELETE', `/admin/api/sources/${id}`, JSON.stringify({ request_key: requestKey }));
+    if (!isRecord(data) || data.deleted !== id) throw new ApiError('invalid_response');
+  }
+
   /** Present entries of a source (optionally one country), in upstream order. */
   async listSourceEntries(id: number, country = '*'): Promise<readonly SourceEntry[]> {
     const params = `?country=${encodeURIComponent(country)}`;
@@ -627,6 +638,17 @@ export class AdminApi {
     const data = await this.#send('POST', `/admin/api/builders/${id}/disable`);
     if (!isRecord(data)) throw new ApiError('invalid_response');
     return data as unknown as AdminBuilder;
+  }
+
+  /**
+   * DELETE /admin/api/builders/{id}: the builder with its source links and
+   * rules, only while no plan or subscription uses it (409 builder_in_use) and
+   * the loaded version is still current (409 version_conflict).
+   */
+  async deleteBuilder(id: number, version: number, requestKey: string): Promise<void> {
+    if (!Number.isSafeInteger(id) || id <= 0) throw new ApiError('not_found', 404);
+    const data = await this.#send('DELETE', `/admin/api/builders/${id}`, JSON.stringify({ request_key: requestKey, version }));
+    if (!isRecord(data) || data.deleted !== id) throw new ApiError('invalid_response');
   }
 
   async setBuilderSources(id: number, sourceIds: number[]): Promise<AdminBuilder> {
@@ -983,6 +1005,28 @@ export interface SourceCatalogue {
   readonly protocols: Readonly<Record<string, number>>;
 }
 
+/** database.DependentRef: one row that still relies on a source or a builder. */
+export interface DependentRef {
+  readonly id: number;
+  readonly name: string;
+}
+
+/** database.SourceDependents: a source is deletable only while both are empty. */
+export interface SourceDependents {
+  /** Builders that link the source or have a rule on it. */
+  readonly builders: readonly DependentRef[];
+  /** Subscriptions sold directly on the source. */
+  readonly subscriptions: number;
+}
+
+/** database.BuilderDependents: a builder is deletable only while both are empty. */
+export interface BuilderDependents {
+  /** Plans whose default builder it is (the trial plan included). */
+  readonly plans: readonly DependentRef[];
+  /** Subscriptions that override their plan with this builder. */
+  readonly subscriptions: number;
+}
+
 export interface AdminSource {
   readonly id: number;
   readonly name: string;
@@ -996,6 +1040,11 @@ export interface AdminSource {
   /** Stable code: failure code (error) or "skipped:N" (partial). */
   readonly last_sync_error: string;
   readonly catalogue: SourceCatalogue;
+  /** End of the provider subscription (RFC 3339); null = no limit. */
+  readonly expires_at: string | null;
+  /** Evaluated on the server clock: an expired source is skipped like a disabled one. */
+  readonly expired: boolean;
+  readonly dependents: SourceDependents;
   readonly created_at: string;
   readonly updated_at: string;
 }
@@ -1029,10 +1078,17 @@ function isCatalogue(v: unknown): v is SourceCatalogue {
     isRecord(v.protocols) && Object.values(v.protocols).every(isCount);
 }
 
+const isDependentRefs = (v: unknown): v is readonly DependentRef[] =>
+  Array.isArray(v) && v.every(r => isRecord(r) && isCount(r.id) && typeof r.name === 'string');
+
+const isSourceDependents = (v: unknown): v is SourceDependents =>
+  isRecord(v) && isDependentRefs(v.builders) && isCount(v.subscriptions);
+
 function isSource(v: unknown): v is AdminSource {
   return isRecord(v) && isCount(v.id) && typeof v.name === 'string' && typeof v.type === 'string' &&
     typeof v.enabled === 'boolean' && (v.last_sync_at === null || typeof v.last_sync_at === 'string') &&
-    typeof v.last_sync_status === 'string' && typeof v.last_sync_error === 'string' && isCatalogue(v.catalogue);
+    typeof v.last_sync_status === 'string' && typeof v.last_sync_error === 'string' && isCatalogue(v.catalogue) &&
+    isNullable(v.expires_at, isTime) && typeof v.expired === 'boolean' && isSourceDependents(v.dependents);
 }
 
 function isSourceEntry(v: unknown): v is SourceEntry {
@@ -1071,12 +1127,16 @@ export interface CreateSourceInput {
   readonly user_agent: string;
   readonly headers: string;
   readonly enabled: boolean;
+  /** End of the provider subscription (RFC 3339, in the future); null = no limit. */
+  readonly expires_at: string | null;
 }
 
 export interface UpdateSourceInput {
   readonly name: string;
   readonly description: string;
   readonly type: string;
+  /** Omitted keeps the stored end, null clears it, RFC 3339 sets it. */
+  readonly expires_at?: string | null;
 }
 
 export interface BuilderSource {
@@ -1108,6 +1168,7 @@ export interface AdminBuilder {
   readonly version: number;
   readonly sources: readonly BuilderSource[] | null;
   readonly items: readonly BuilderItem[] | null;
+  readonly dependents: BuilderDependents;
   readonly created_at: string;
   readonly updated_at: string;
 }

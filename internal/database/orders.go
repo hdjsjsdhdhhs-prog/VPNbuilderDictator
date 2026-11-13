@@ -326,6 +326,8 @@ func (s *Service) ConfirmOrderPaidCAS(ctx context.Context, orderID uint, paidAt,
 		sub.ExpiresAt = &expiryCopy
 
 		recordPaymentJournal(ctx, tx, orderID, &currentSub, product, newExpiry, activatedAt)
+		// The discount the order was created with is used up by this payment.
+		redeemOrderDiscount(tx, orderID, activatedAt)
 
 		activated = true
 

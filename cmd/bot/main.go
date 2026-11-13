@@ -142,12 +142,14 @@ func initBot(cfg *config.Config) (*tgbotapi.BotAPI, *bot.BotConfig, error) {
 // startWebServer создаёт и запускает HTTP-сервер (подписки, инвайт/trial-страницы).
 // Сервер стартует асинхронно; функция ждёт до 2 секунд первой ошибки запуска,
 // чтобы не блокировать старт бота, но вернуть ошибку, если сервер точно не поднялся.
-func startWebServer(subService *service.SubscriptionService, cfg *config.Config, botConfig *bot.BotConfig, subServer *subserver.Service, dbService *database.Service, orderService *service.OrderService, adminService *service.AdminService, builderService *service.BuilderService, netMonitor *netmon.Service, botAPI interfaces.BotAPI) (*web.Server, error) {
+func startWebServer(subService *service.SubscriptionService, cfg *config.Config, botConfig *bot.BotConfig, subServer *subserver.Service, dbService *database.Service, orderService *service.OrderService, adminService *service.AdminService, builderService *service.BuilderService, netMonitor *netmon.Service, opsService *service.OpsService, botAPI interfaces.BotAPI) (*web.Server, error) {
 	webServer := web.NewServer(fmt.Sprintf(":%d", cfg.WebServerPort), dbService, cfg, botConfig.Username, subService, subServer)
 	webServer.SetOrderService(orderService)
 	webServer.SetAdminService(adminService)
 	webServer.SetBuilderService(builderService)
 	webServer.SetTariffService(service.NewTariffService(dbService))
+	webServer.SetPromoService(service.NewPromoService(dbService))
+	webServer.SetOpsService(opsService)
 	webServer.SetTrialService(service.NewTrialService(dbService, subService.TrialDefaults()))
 	webServer.SetWarmupService(service.NewWarmupService(dbService, subService.TrialDefaults()))
 	if netMonitor != nil {
@@ -196,9 +198,18 @@ func startWebServer(subService *service.SubscriptionService, cfg *config.Config,
 // истечение и напоминания подписок и прогрев клиентов. Синхронизации с
 // VPN-панелями нет: доступ — локальное состояние, выдачу собирает Builder.
 // Возвращает WaitGroup для ожидания завершения при штатном выключении.
-func startBackgroundWorkers(ctx context.Context, handler *bot.Handler, subService *service.SubscriptionService, orderSvc *service.OrderService, dbService *database.Service, cfg *config.Config) *sync.WaitGroup {
+func startBackgroundWorkers(ctx context.Context, handler *bot.Handler, subService *service.SubscriptionService, orderSvc *service.OrderService, opsSvc *service.OpsService, dbService *database.Service, cfg *config.Config) *sync.WaitGroup {
 	var wg sync.WaitGroup
-	wg.Add(8)
+	wg.Add(9)
+
+	// Operational notifications: monitor outages, source/builder state
+	// changes and the daily report, delivered to Telegram (best-effort).
+	go func() {
+		defer recoverAndReport("Ops worker")
+		defer wg.Done()
+
+		scheduler.NewOpsWorker(opsSvc).Run(ctx)
+	}()
 
 	// Customer warm-up: /start records contacts (wired before the update loop
 	// starts), the worker sends the scenarios through the handler's sender.
@@ -364,7 +375,7 @@ func main() {
 	// The web server starts with an empty bot username; initBot injects the real
 	// username (from Telegram getMe) via SetBotUsername once the bot is ready, so
 	// the share/invite page shows the correct @username after startup.
-	webServer, err := startWebServer(svc.subService, cfg, botConfig, svc.subServer, dbService, svc.orderService, svc.adminService, svc.builderService, svc.netMonitor, botAPI)
+	webServer, err := startWebServer(svc.subService, cfg, botConfig, svc.subServer, dbService, svc.orderService, svc.adminService, svc.builderService, svc.netMonitor, svc.opsService, botAPI)
 	if err != nil {
 		logger.Fatal("Failed to start web server", zap.Error(err))
 	}
@@ -395,6 +406,7 @@ func main() {
 
 	svc.handler.SetBot(api)
 	svc.subService.SetBot(api)
+	svc.opsSender.SetBot(api)
 	svc.handler.SetBotConfig(bc)
 
 	if svc.orderService != nil {
@@ -429,7 +441,7 @@ func main() {
 	svc.handler.StartReferralCacheSync(ctx)
 	svc.handler.StartBroadcastWorker(ctx)
 	svc.handler.StartStarsPaymentWorker(ctx)
-	bgWg := startBackgroundWorkers(ctx, svc.handler, svc.subService, svc.orderService, dbService, cfg)
+	bgWg := startBackgroundWorkers(ctx, svc.handler, svc.subService, svc.orderService, svc.opsService, dbService, cfg)
 	startNetworkMonitor(ctx, bgWg, svc.netMonitor, cfg)
 
 	if webServer != nil {

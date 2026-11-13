@@ -1,7 +1,7 @@
 # Database migrations
 
 The migrations are embedded into the binary (`migrations.go`) and applied at startup
-with golang-migrate. The chain `001` … `051` is the **upgrade history** of the
+with golang-migrate. The chain `001` … `053` is the **upgrade history** of the
 database and must stay intact:
 
 - an existing installation (for example at schema `50`) upgrades with the normal

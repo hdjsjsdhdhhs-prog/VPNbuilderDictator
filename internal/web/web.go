@@ -103,6 +103,8 @@ type Server struct {
 	tariffService      *service.TariffService
 	trialService       *service.TrialService
 	warmupService      *service.WarmupService
+	promoService       *service.PromoService
+	opsService         *service.OpsService
 	networkMonitor     NetworkMonitor
 	paymentConfig      *PaymentConfig
 	subServer          *subserver.Service
@@ -288,7 +290,9 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.cfg != nil {
 		actor = s.cfg.AdminUsername
 	}
-	adminHandler := admin.Routes(newAdminAPI(s.adminService, s.builderService, s.tariffService, s.trialService, s.warmupService, s.networkMonitor, actor))
+	api := newAdminAPI(s.adminService, s.builderService, s.tariffService, s.trialService, s.warmupService, s.networkMonitor, actor)
+	api.promoSvc, api.opsSvc = s.promoService, s.opsService
+	adminHandler := admin.Routes(api)
 
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)

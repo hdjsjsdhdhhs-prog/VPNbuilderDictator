@@ -1188,7 +1188,10 @@ export class WarmupScreen {
     insertCode.addEventListener('click', () => applyEdit(insertText(message.value, message.selectionEnd, message.selectionEnd, '{{discount_code}}')));
     discountBody.append(row(percentField.root, ttlField.root), templateField.root, personal.root,
       el('p', 'field-hint', 'Сервер создаёт отдельный код каждому получателю в момент отправки. В тексте нужен {{discount_code}}.'),
-      example, insertCode, this.#notice({ tone: 'info', text: 'Купон пока не применяется автоматически при оплате.' }));
+      example, insertCode, this.#notice({
+        tone: 'info',
+        text: 'Клиент применяет купон одной кнопкой с действием «Применить скидку и открыть тарифы» или вводит код в боте как промокод: цены тарифов сразу становятся ниже.',
+      }));
     discountPanel.body.append(radios, discountBody);
     const paintDiscount = () => {
       const hours = /^\d{1,6}$/.test(form.coupon_ttl_hours.trim()) ? Number(form.coupon_ttl_hours.trim()) : null;
@@ -1941,7 +1944,7 @@ export class WarmupScreen {
       results.append(panel);
     }
     this.body.replaceChildren(this.#tabs('coupons'), form, filterError,
-      this.#notice({ tone: 'info', text: 'Купон пока не применяется автоматически при оплате: «Использован» и «Заказ» остаются пустыми.' }),
+      this.#notice({ tone: 'info', text: 'Купон применяется кнопкой «Применить скидку» в сообщении или вводом кода в боте. «Использован» и «Заказ» заполняются после оплаты со скидкой.' }),
       el('p', 'toolbar-meta', `Найдено: ${count(page.total)}`), results);
     if (focus) this.body.querySelector<HTMLElement>(`[data-pager='${focus}']:not(:disabled)`)?.focus();
   }

@@ -717,7 +717,7 @@ describe('20–21. discount and coupon TTL', () => {
     expect($('.wu-discount').hidden).toBe(false);
     expect(document.querySelector('.wu-variable-notes')?.textContent).toContain('{{discount_code}}');
     expect(text('#wu-coupon-example')).toBe('Пример кода: VPN-XXXXXXXX');
-    expect(document.body.textContent).toContain('Купон пока не применяется автоматически при оплате.');
+    expect(document.body.textContent).toContain('Клиент применяет купон одной кнопкой с действием «Применить скидку и открыть тарифы»');
     expect($<HTMLInputElement>('#wu-personal').checked).toBe(true);
     type('#wu-percent', '15');
     type('#wu-template', 'back');
@@ -959,7 +959,7 @@ describe('30. coupons', () => {
     expect(cells.slice(1, 3)).toEqual(['2000', '15%']);
     expect(cells[5]).toBe('Действует');
     expect(cells.slice(6)).toEqual(['—', '—']);
-    expect(document.body.textContent).toContain('Купон пока не применяется автоматически при оплате');
+    expect(document.body.textContent).toContain('«Использован» и «Заказ» заполняются после оплаты со скидкой');
     choose('#wu-c-status', 'expired');
     $<HTMLFormElement>('.wu-filters').requestSubmit();
     await flush();

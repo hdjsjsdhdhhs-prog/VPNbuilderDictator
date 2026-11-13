@@ -118,6 +118,30 @@ func (c *CallbackHandler) HandleCallback(ctx context.Context, update tgbotapi.Up
 		if err != nil {
 			return fmt.Errorf("handle buy_product: %w", err)
 		}
+	case strings.HasPrefix(data, "get_free_"):
+		raw := strings.TrimPrefix(data, "get_free_")
+
+		id64, _ := strconv.ParseUint(raw, 10, 64)
+		if id64 == 0 || id64 > uint64(^uint(0)) {
+			logger.Warn("invalid get_free callback payload", zap.String("data", data))
+
+			return nil
+		}
+
+		err := c.h.getSubHandler().handleGetFree(ctx, chatID, username, update.CallbackQuery.Message.MessageID, uint(id64))
+		if err != nil {
+			return fmt.Errorf("handle get_free: %w", err)
+		}
+	case data == "promo_enter":
+		err := c.h.getSubHandler().handlePromoEnter(ctx, chatID, update.CallbackQuery.Message.MessageID)
+		if err != nil {
+			return fmt.Errorf("handle promo_enter: %w", err)
+		}
+	case data == "apply_discount":
+		err := c.h.getSubHandler().handleApplyDiscount(ctx, chatID, update.CallbackQuery.Message.MessageID)
+		if err != nil {
+			return fmt.Errorf("handle apply_discount: %w", err)
+		}
 	case data == "menu_donate":
 		err := c.h.handleMenuDonate(ctx, chatID, username, update.CallbackQuery.Message.MessageID)
 		if err != nil {

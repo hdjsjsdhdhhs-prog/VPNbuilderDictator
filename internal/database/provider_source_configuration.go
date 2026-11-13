@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // ErrProviderSourceUnusable never includes upstream URLs or credentials.
@@ -14,7 +15,10 @@ var ErrProviderSourceUnusable = errors.New("provider source is disabled or unusa
 // local configuration only, not upstream availability, and returns normalized
 // headers and values that must never be reflected in a customer response.
 func (s ProviderSource) RequestConfiguration() (map[string]string, []string, error) {
-	if !s.Enabled || strings.TrimSpace(s.SubscriptionURL) == "" {
+	// An expired source is unusable exactly like a disabled one: this is the
+	// single check shared by /sub, the builder preview, the trial issuance
+	// check and the purchase policy.
+	if !s.Enabled || s.Expired(time.Now()) || strings.TrimSpace(s.SubscriptionURL) == "" {
 		return nil, nil, ErrProviderSourceUnusable
 	}
 	u, err := url.Parse(s.SubscriptionURL)

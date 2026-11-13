@@ -97,7 +97,9 @@ func (in TariffInput) Validate() error {
 		return invalidTariff("plan_id")
 	case in.DurationDays <= 0 || in.DurationDays > MaxSubscriptionRenewalDays:
 		return invalidTariff("duration_days")
-	case in.PriceCents <= 0 || in.PriceCents > TariffMaxPriceCents:
+	// A price of 0 is a free tariff: it is granted in the bot without a
+	// payment (ActivateFreeOrder) and never offered through a payment provider.
+	case in.PriceCents < 0 || in.PriceCents > TariffMaxPriceCents:
 		return invalidTariff("price_cents")
 	case !tariffCurrencyPattern.MatchString(in.Currency):
 		return invalidTariff("currency")

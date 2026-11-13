@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import { AdminApi, type AdminSource, type BuilderItem, type BuilderPreview, type SourceCatalogue, type SourceEntry, type SourceSyncResult } from '../admin/src/api';
 import {
-  EMPTY_FILTER, builderCardSummary, builderConfigItems, builderSourcesSummary, catalogueSummary, countryCount, countryLabel, filterEntries, flagEmoji,
+  EMPTY_FILTER, EXPIRY_SOON_MS, builderCardSummary, builderConfigItems, builderDeleteBlocker, builderSourcesSummary, catalogueSummary,
+  countryCount, countryLabel, expiryState, filterEntries, flagEmoji,
   formatLabel, matchOriginalName, normalizeFormat, pickableEntries, previewSummary, protocolsOf, resolveNode,
-  ruleSummary, syncErrorText, syncResultMessage, syncState,
+  ruleSummary, sourceDeleteBlocker, sourceUsable, syncErrorText, syncResultMessage, syncState,
 } from '../admin/src/sources';
 
 // Pure logic of the admin source catalogue screens (admin/src/sources.ts) and
@@ -19,7 +20,8 @@ const catalogue = (over: Partial<SourceCatalogue> = {}): SourceCatalogue => ({
 
 const source = (over: Partial<AdminSource> = {}): AdminSource => ({
   id: 1, name: 'Provider A', type: 'auto', description: '', enabled: true, last_sync_at: T0, last_sync_status: 'ok',
-  last_sync_error: '', catalogue: catalogue(), created_at: T0, updated_at: T0, ...over,
+  last_sync_error: '', catalogue: catalogue(), expires_at: null, expired: false,
+  dependents: { builders: [], subscriptions: 0 }, created_at: T0, updated_at: T0, ...over,
 });
 
 let nextEntry = 1;
@@ -157,6 +159,63 @@ describe('multiple sources in a builder', () => {
     expect(sum.disabled).toBe(1);
     expect(sum.rows.map(r => r.id)).toEqual([1, 2, 3]);
     expect(sum.rows[0].summary).toBe('5 серверов · 2 страны');
+  });
+});
+
+describe('source validity (expires_at)', () => {
+  const NOW = Date.parse(T0);
+  const at = (offsetMs: number) => new Date(NOW + offsetMs).toISOString();
+
+  it('has no state without a limit and follows the clock otherwise', () => {
+    expect(expiryState(source(), NOW)).toBe('none');
+    expect(expiryState(source({ expires_at: at(30 * 24 * 3600_000) }), NOW)).toBe('active');
+    expect(expiryState(source({ expires_at: at(EXPIRY_SOON_MS + 60_000) }), NOW)).toBe('active');
+    expect(expiryState(source({ expires_at: at(EXPIRY_SOON_MS) }), NOW)).toBe('soon');
+    expect(expiryState(source({ expires_at: at(60_000) }), NOW)).toBe('soon');
+    // The end itself is already past, like ProviderSource.Expired (!now.Before).
+    expect(expiryState(source({ expires_at: at(0) }), NOW)).toBe('expired');
+    expect(expiryState(source({ expires_at: at(-60_000) }), NOW)).toBe('expired');
+  });
+
+  it('trusts the server flag over the local clock', () => {
+    expect(expiryState(source({ expires_at: at(3600_000), expired: true }), NOW)).toBe('expired');
+  });
+
+  it('an expired source is unusable like a disabled one', () => {
+    expect(sourceUsable(source())).toBe(true);
+    expect(sourceUsable(source({ enabled: false }))).toBe(false);
+    expect(sourceUsable(source({ expires_at: at(-1), expired: true }))).toBe(false);
+  });
+
+  it('is left out of the builder totals and warned about in its rules', () => {
+    const expired = source({ id: 2, expires_at: at(-1), expired: true, catalogue: catalogue({ entries: 9 }) });
+    expect(builderSourcesSummary([source(), expired])).toMatchObject({ entries: 5, countries: 2, disabled: 1 });
+    const rule = { kind: 'country' as const, source_id: 2, country_code: 'DE', fingerprint: '', original_name: '', custom_name: null, enabled: true };
+    expect(ruleSummary(rule, [source(), expired], [1, 2]).warning).toBe('Срок действия источника истёк: правило пропускается.');
+    // Switched off wins: that is the reason the admin can act on first.
+    expect(ruleSummary(rule, [{ ...expired, enabled: false }], [2]).warning).toBe('Источник отключён: правило пропускается.');
+  });
+});
+
+describe('deletion blockers (database.SourceDependents / BuilderDependents)', () => {
+  const ref = (id: number, name: string) => ({ id, name });
+
+  it('a source nothing depends on is deletable', () => {
+    expect(sourceDeleteBlocker({ builders: [], subscriptions: 0 })).toBe('');
+  });
+
+  it('names the builders and counts the subscriptions of a source', () => {
+    expect(sourceDeleteBlocker({ builders: [ref(7, 'FINLAN')], subscriptions: 0 })).toBe('используется построителем «FINLAN»');
+    expect(sourceDeleteBlocker({ builders: [ref(7, 'A'), ref(8, 'B')], subscriptions: 3 }))
+      .toBe('используется построителями «A», «B»; на нём проданы 3 подписки');
+    expect(sourceDeleteBlocker({ builders: [], subscriptions: 1 })).toBe('на нём продана 1 подписка');
+    expect(sourceDeleteBlocker({ builders: [], subscriptions: 5 })).toBe('на нём продано 5 подписок');
+  });
+
+  it('names the plans and counts the overriding subscriptions of a builder', () => {
+    expect(builderDeleteBlocker({ plans: [], subscriptions: 0 })).toBe('');
+    expect(builderDeleteBlocker({ plans: [ref(1, 'Trial')], subscriptions: 2 })).toBe('назначен плану «Trial»; назначен лично 2 подпискам');
+    expect(builderDeleteBlocker({ plans: [ref(1, 'A'), ref(2, 'B')], subscriptions: 1 })).toBe('назначен планам «A», «B»; назначен лично 1 подписке');
   });
 });
 
@@ -319,7 +378,7 @@ describe('source API client', () => {
     transport.mockResolvedValueOnce(json({ source: source(), sync: syncResult() }, 201));
     const input = {
       name: 'Provider A', description: '', type: 'auto', subscription_url: 'https://provider.example/sub/token',
-      hwid: '', user_agent: '', headers: '', enabled: true,
+      hwid: '', user_agent: '', headers: '', enabled: true, expires_at: null,
     };
     const created = await api.createSource(input);
     expect(created.sync?.status).toBe('ok');
@@ -335,7 +394,80 @@ describe('source API client', () => {
     transport.mockResolvedValueOnce(json({ source: source({ last_sync_at: null, last_sync_status: '' }), sync: null }, 201));
     await expect(api.createSource({
       name: 'x', description: '', type: 'auto', subscription_url: 'https://provider.example/', hwid: '', user_agent: '', headers: '', enabled: true,
+      expires_at: null,
     })).resolves.toMatchObject({ sync: null });
+  });
+
+  it('sends the validity end on create; on update only when it was changed', async () => {
+    const { transport, api } = setup();
+    const until = '2026-12-01T10:00:00Z';
+    const body = (call: number) => JSON.parse(String(transport.mock.calls[call][1]?.body)) as Record<string, unknown>;
+    transport.mockResolvedValueOnce(json({ source: source({ expires_at: until }), sync: null }, 201));
+    const created = await api.createSource({
+      name: 'x', description: '', type: 'auto', subscription_url: 'https://provider.example/', hwid: '', user_agent: '', headers: '', enabled: true,
+      expires_at: until,
+    });
+    expect(created.source).toMatchObject({ expires_at: until, expired: false });
+    expect(body(0).expires_at).toBe(until);
+
+    // Untouched: the member is absent, so the server keeps the stored end.
+    transport.mockResolvedValueOnce(json(source({ expires_at: until })));
+    await api.updateSource(1, { name: 'x', description: '', type: 'auto' });
+    expect(transport.mock.calls[1][0]).toBe('/admin/api/sources/1');
+    expect(transport.mock.calls[1][1]?.method).toBe('PATCH');
+    expect(body(1)).toEqual({ name: 'x', description: '', type: 'auto' });
+
+    // Cleared: an explicit null removes the limit.
+    transport.mockResolvedValueOnce(json(source()));
+    await api.updateSource(1, { name: 'x', description: '', type: 'auto', expires_at: null });
+    expect(body(2)).toEqual({ name: 'x', description: '', type: 'auto', expires_at: null });
+
+    transport.mockResolvedValueOnce(json({ error: 'invalid_source', field: 'expires_at' }, 400));
+    await expect(api.updateSource(1, { name: 'x', description: '', type: 'auto', expires_at: '2020-01-01T00:00:00Z' }))
+      .rejects.toMatchObject({ code: 'invalid_source', field: 'expires_at', status: 400 });
+  });
+
+  it('rejects a created source without its validity or dependents', async () => {
+    const { transport, api } = setup();
+    const input = {
+      name: 'x', description: '', type: 'auto', subscription_url: 'https://provider.example/', hwid: '', user_agent: '', headers: '', enabled: true,
+      expires_at: null,
+    };
+    for (const broken of [{ dependents: null }, { dependents: { builders: [{ id: 1 }], subscriptions: 0 } }, { expires_at: 'soon' }, { expired: 'no' }]) {
+      transport.mockResolvedValueOnce(json({ source: { ...source(), ...broken }, sync: null }, 201));
+      await expect(api.createSource(input)).rejects.toMatchObject({ code: 'invalid_response' });
+    }
+  });
+
+  it('deletes a source with a request key and a builder with the loaded version', async () => {
+    const { transport, api } = setup();
+    const call = (index: number) => {
+      const [path, init] = transport.mock.calls[index];
+      return { path, method: init?.method, body: JSON.parse(String(init?.body)) as unknown };
+    };
+    transport.mockResolvedValueOnce(json({ deleted: 4, audit: {} }));
+    await expect(api.deleteSource(4, 'ui-k1')).resolves.toBeUndefined();
+    expect(call(0)).toEqual({ path: '/admin/api/sources/4', method: 'DELETE', body: { request_key: 'ui-k1' } });
+
+    transport.mockResolvedValueOnce(json({ deleted: 7, audit: {} }));
+    await expect(api.deleteBuilder(7, 3, 'ui-k2')).resolves.toBeUndefined();
+    expect(call(1)).toEqual({ path: '/admin/api/builders/7', method: 'DELETE', body: { request_key: 'ui-k2', version: 3 } });
+
+    transport.mockResolvedValueOnce(json({ error: 'source_in_use' }, 409));
+    await expect(api.deleteSource(4, 'ui-k3')).rejects.toMatchObject({ status: 409, code: 'source_in_use' });
+    transport.mockResolvedValueOnce(json({ error: 'builder_in_use' }, 409));
+    await expect(api.deleteBuilder(7, 3, 'ui-k4')).rejects.toMatchObject({ status: 409, code: 'builder_in_use' });
+    transport.mockResolvedValueOnce(json({ error: 'version_conflict' }, 409));
+    await expect(api.deleteBuilder(7, 2, 'ui-k5')).rejects.toMatchObject({ status: 409, code: 'version_conflict' });
+
+    // An answer about another row is not a confirmed deletion.
+    transport.mockResolvedValueOnce(json({ deleted: 5, audit: {} }));
+    await expect(api.deleteSource(4, 'ui-k6')).rejects.toMatchObject({ code: 'invalid_response' });
+    // Non-canonical ids never reach the server.
+    const sent = transport.mock.calls.length;
+    await expect(api.deleteSource(0, 'ui-k7')).rejects.toMatchObject({ status: 404 });
+    await expect(api.deleteBuilder(-1, 1, 'ui-k8')).rejects.toMatchObject({ status: 404 });
+    expect(transport.mock.calls).toHaveLength(sent);
   });
 
   it('refreshes server-side: sends no entries, a failure is a result', async () => {
@@ -375,6 +507,7 @@ describe('source API client', () => {
     transport.mockResolvedValueOnce(json({ error: 'invalid_source', field: 'subscription_url' }, 400));
     await expect(api.createSource({
       name: 'x', description: '', type: 'auto', subscription_url: 'ftp://x', hwid: '', user_agent: '', headers: '', enabled: true,
+      expires_at: null,
     })).rejects.toMatchObject({ code: 'invalid_source', field: 'subscription_url', status: 400 });
   });
 });

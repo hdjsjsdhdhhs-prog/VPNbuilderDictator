@@ -150,6 +150,9 @@ type WarmupCallbackAction struct {
 var warmupCallbackActions = []WarmupCallbackAction{
 	{Data: "menu_subscription", Label: "Моя подписка"},
 	{Data: "buy_premium_list", Label: "Тарифы (купить Premium)"},
+	// One click: activates the personal coupon of the message and opens the
+	// tariff list with the lowered prices (bot/promo.go handleApplyDiscount).
+	{Data: "apply_discount", Label: "Применить скидку и открыть тарифы"},
 	{Data: "create_subscription", Label: "Получить подписку"},
 	{Data: "back_to_start", Label: "Главное меню"},
 	{Data: "menu_help", Label: "Помощь"},

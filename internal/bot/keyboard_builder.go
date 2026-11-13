@@ -39,7 +39,12 @@ func (kb *KeyboardBuilder) MainMenu(hasSubscription bool, paymentEnabled bool) t
 
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("📖 Помощь", "menu_help"), tgbotapi.NewInlineKeyboardButtonData("📑 Документы", "menu_documents")))
 	if paymentEnabled && hasSubscription {
-		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("💎 Купить Premium", "buy_premium_list")))
+		// The promo code sits next to the purchase: an activated code lowers
+		// the prices of the tariff list.
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("💎 Купить Premium", "buy_premium_list"),
+			tgbotapi.NewInlineKeyboardButtonData("🎟 Промокод", "promo_enter"),
+		))
 	}
 
 	if hasSubscription {
@@ -63,6 +68,69 @@ func (kb *KeyboardBuilder) BuyProductList(products []database.Product) tgbotapi.
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "back_to_start")))
 
 	return tgbotapi.InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// TariffOffer is a tariff of the purchase menu with the amount this customer
+// pays for it (the catalogue price lowered by the customer's discount).
+type TariffOffer struct {
+	Product     database.Product
+	AmountCents int64
+}
+
+// tariffPriceLabel renders the amount to pay: "Бесплатно" for nothing to pay,
+// the old price struck out in words when a discount applies.
+func tariffPriceLabel(offer TariffOffer) string {
+	switch {
+	case offer.AmountCents <= 0:
+		return "Бесплатно"
+	case offer.AmountCents < offer.Product.PriceCents:
+		return fmt.Sprintf("%s вместо %s", utils.FormatPriceCents(offer.AmountCents), utils.FormatPriceCents(offer.Product.PriceCents))
+	default:
+		return utils.FormatPriceCents(offer.AmountCents)
+	}
+}
+
+// TariffList builds the tariff selection keyboard of the purchase menu: one
+// button per tariff with the price for this customer, the promo code entry
+// and the way back.
+func (kb *KeyboardBuilder) TariffList(offers []TariffOffer) tgbotapi.InlineKeyboardMarkup {
+	rows := make([][]tgbotapi.InlineKeyboardButton, 0, len(offers)+2)
+	for _, offer := range offers {
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(
+			fmt.Sprintf("%s — %s", offer.Product.Name, tariffPriceLabel(offer)), fmt.Sprintf("buy_product_%d", offer.Product.ID))))
+	}
+
+	rows = append(rows,
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("🎟 Ввести промокод", "promo_enter")),
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "back_to_start")),
+	)
+
+	return tgbotapi.InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// TariffPay builds the payment-link keyboard for the amount to pay.
+func (kb *KeyboardBuilder) TariffPay(amountCents int64, paymentURL string) tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonURL("💳 Оплатить "+utils.FormatPriceCents(amountCents), paymentURL)),
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "buy_premium_list")),
+	}}
+}
+
+// TariffGetFree builds the confirmation keyboard of a tariff that costs
+// nothing (a free tariff or a 100 % discount).
+func (kb *KeyboardBuilder) TariffGetFree(productID uint) tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("✅ Получить бесплатно", fmt.Sprintf("get_free_%d", productID))),
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "buy_premium_list")),
+	}}
+}
+
+// PromoPrompt is the keyboard of the "send me the code" screen.
+func (kb *KeyboardBuilder) PromoPrompt() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("💎 К тарифам", "buy_premium_list")),
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("🏠 В начало", "back_to_start")),
+	}}
 }
 
 // BuyProductConfirm builds the payment-link keyboard.

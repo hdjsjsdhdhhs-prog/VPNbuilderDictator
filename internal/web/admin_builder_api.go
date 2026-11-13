@@ -7,6 +7,7 @@ import (
 	"mime"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
 	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/service"
@@ -59,6 +60,41 @@ type updateSourceRequest struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	Type        string `json:"type"`
+	// ExpiresAt: omitted keeps the stored validity end, null clears it, an
+	// RFC 3339 instant sets it.
+	ExpiresAt json.RawMessage `json:"expires_at"`
+}
+
+// parseSourceExpiry decodes the expires_at member of a source request: set is
+// false when the member is absent, at is nil for JSON null. ok is false for
+// anything that is neither null nor an RFC 3339 string.
+func parseSourceExpiry(raw json.RawMessage) (at *time.Time, set, ok bool) {
+	if len(raw) == 0 {
+		return nil, false, true
+	}
+	if string(raw) == "null" {
+		return nil, true, true
+	}
+	var text string
+	err := json.Unmarshal(raw, &text)
+	if err != nil {
+		return nil, false, false
+	}
+	parsed, err := time.Parse(time.RFC3339, text)
+	if err != nil {
+		return nil, false, false
+	}
+	parsed = parsed.UTC()
+	return &parsed, true, true
+}
+
+// writeSourceExpiryInvalid answers a malformed expires_at like the service
+// answers an out-of-range one, so the editor highlights the same field.
+func writeSourceExpiryInvalid(w http.ResponseWriter) {
+	writeAdminJSON(w, http.StatusBadRequest, struct {
+		Error string `json:"error"`
+		Field string `json:"field"`
+	}{"invalid_source", "expires_at"})
 }
 
 func (a *adminAPI) builderUpdateSource(w http.ResponseWriter, r *http.Request, id uint) {
@@ -69,10 +105,17 @@ func (a *adminAPI) builderUpdateSource(w http.ResponseWriter, r *http.Request, i
 	if !decodeAdminJSON(w, r, &body) {
 		return
 	}
+	expiresAt, expirySet, ok := parseSourceExpiry(body.ExpiresAt)
+	if !ok {
+		writeSourceExpiryInvalid(w)
+		return
+	}
 	view, err := a.builderSvc.UpdateSource(r.Context(), id, service.UpdateSourceInput{
-		Name:        body.Name,
-		Description: body.Description,
-		Type:        body.Type,
+		Name:         body.Name,
+		Description:  body.Description,
+		Type:         body.Type,
+		ExpiresAtSet: expirySet,
+		ExpiresAt:    expiresAt,
 	})
 	if err != nil {
 		a.writeSourceError(w, "builder/source/update", err)
@@ -496,6 +539,9 @@ type createSourceRequest struct {
 	UserAgent       string `json:"user_agent"`
 	Headers         string `json:"headers"`
 	Enabled         bool   `json:"enabled"`
+	// ExpiresAt is the end of the provider subscription: omitted or null = no
+	// limit, otherwise an RFC 3339 instant in the future.
+	ExpiresAt json.RawMessage `json:"expires_at"`
 }
 
 func (a *adminAPI) builderCreateSource(w http.ResponseWriter, r *http.Request) {
@@ -506,7 +552,13 @@ func (a *adminAPI) builderCreateSource(w http.ResponseWriter, r *http.Request) {
 	if !decodeAdminJSON(w, r, &body) {
 		return
 	}
+	expiresAt, _, ok := parseSourceExpiry(body.ExpiresAt)
+	if !ok {
+		writeSourceExpiryInvalid(w)
+		return
+	}
 	view, sync, err := a.builderSvc.CreateSource(r.Context(), service.CreateSourceInput{
+		ExpiresAt:       expiresAt,
 		Name:            body.Name,
 		Description:     body.Description,
 		Type:            body.Type,
@@ -607,6 +659,12 @@ func (a *adminAPI) writeSourceError(w http.ResponseWriter, route string, err err
 		}{"invalid_source", fieldErr.Field})
 	case errors.Is(err, database.ErrProviderSourceNotFound):
 		writeAdminError(w, http.StatusNotFound, "not_found")
+	case errors.Is(err, database.ErrProviderSourceInUse):
+		writeAdminError(w, http.StatusConflict, "source_in_use")
+	case errors.Is(err, database.ErrAdminRequestKeyConflict):
+		writeAdminError(w, http.StatusConflict, "request_key_conflict")
+	case errors.Is(err, database.ErrAdminInvalidRequest):
+		writeAdminError(w, http.StatusBadRequest, "invalid_request")
 	case errors.Is(err, database.ErrProviderSourceSyncInProgress):
 		writeAdminError(w, http.StatusConflict, "sync_in_progress")
 	case errors.Is(err, service.ErrCatalogueFetcherUnavailable):
@@ -614,6 +672,81 @@ func (a *adminAPI) writeSourceError(w http.ResponseWriter, route string, err err
 	default:
 		a.internal(w, route, err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Deletion (only while nothing depends on the row)
+// ---------------------------------------------------------------------------
+
+type deleteSourceRequest struct {
+	RequestKey string `json:"request_key"`
+}
+
+// builderDeleteSource is DELETE /admin/api/sources/{id}. The source is deleted
+// with its catalogue only while no builder links it (or has a rule on it) and
+// no subscription was sold on it. Errors: 404 not_found, 409 source_in_use |
+// request_key_conflict, 400 invalid_request.
+func (a *adminAPI) builderDeleteSource(w http.ResponseWriter, r *http.Request, id uint) {
+	if !a.builderSvcOK(w) {
+		return
+	}
+	var body deleteSourceRequest
+	if !decodeAdminJSON(w, r, &body) {
+		return
+	}
+	audit, err := a.builderSvc.DeleteSource(r.Context(), a.actor, body.RequestKey, id)
+	if err != nil {
+		a.writeSourceError(w, "builder/source/delete", err)
+		return
+	}
+	writeAdminJSON(w, http.StatusOK, struct {
+		Deleted uint                    `json:"deleted"`
+		Audit   *database.AdminAuditLog `json:"audit"`
+	}{id, audit})
+}
+
+type deleteBuilderRequest struct {
+	RequestKey string `json:"request_key"`
+	// Version is the builder version the screen loaded: a builder changed in
+	// another tab is never deleted by a stale list.
+	Version int `json:"version"`
+}
+
+// builderDelete is DELETE /admin/api/builders/{id}. The builder is deleted
+// with its source links and rules only while no plan uses it as default and no
+// subscription overrides its plan with it. Errors: 404 not_found,
+// 409 builder_in_use | version_conflict | request_key_conflict,
+// 400 invalid_request.
+func (a *adminAPI) builderDelete(w http.ResponseWriter, r *http.Request, id uint) {
+	if !a.builderSvcOK(w) {
+		return
+	}
+	var body deleteBuilderRequest
+	if !decodeAdminJSON(w, r, &body) {
+		return
+	}
+	audit, err := a.builderSvc.DeleteBuilder(r.Context(), a.actor, body.RequestKey, id, body.Version)
+	if err != nil {
+		switch {
+		case errors.Is(err, database.ErrBuilderNotFound):
+			writeAdminError(w, http.StatusNotFound, "not_found")
+		case errors.Is(err, database.ErrBuilderInUse):
+			writeAdminError(w, http.StatusConflict, "builder_in_use")
+		case errors.Is(err, database.ErrBuilderVersionConflict):
+			writeAdminError(w, http.StatusConflict, "version_conflict")
+		case errors.Is(err, database.ErrAdminRequestKeyConflict):
+			writeAdminError(w, http.StatusConflict, "request_key_conflict")
+		case errors.Is(err, database.ErrAdminInvalidRequest):
+			writeAdminError(w, http.StatusBadRequest, "invalid_request")
+		default:
+			a.internal(w, "builder/delete", err)
+		}
+		return
+	}
+	writeAdminJSON(w, http.StatusOK, struct {
+		Deleted uint                    `json:"deleted"`
+		Audit   *database.AdminAuditLog `json:"audit"`
+	}{id, audit})
 }
 
 // ---------------------------------------------------------------------------

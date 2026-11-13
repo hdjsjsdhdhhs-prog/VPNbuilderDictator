@@ -508,11 +508,16 @@ Client app     Web server      Subserver              DB          Provider sourc
 A subscription row holds no VPN credentials of its own. On every `/sub` request the subserver (`internal/subserver`):
 
 1. **Resolves the Subscription Builder** (`database.ResolveSubscriptionBuilder`): the per-subscription override `subscriptions.subscription_builder_id`, otherwise the plan default `plans.subscription_builder_id`. A disabled or dangling builder at one level is skipped and the next level is consulted.
-2. **Fetches the linked, enabled ProviderSources** (`fetch.go`): read-only HTTP using server-side credentials; formats are JSON, Clash YAML, base64 and plain links. A failure of one source is best-effort (the source is skipped). If no source can be fetched the request fails with `ErrProviderSourceUnavailable` and never falls back to a legacy pipeline. Errors never contain upstream URLs or credentials.
+2. **Fetches the linked, enabled, non-expired ProviderSources** (`fetch.go`): read-only HTTP using server-side credentials; formats are JSON, Clash YAML, base64 and plain links. A failure of one source is best-effort (the source is skipped). If no source can be fetched the request fails with `ErrProviderSourceUnavailable` and never falls back to a legacy pipeline. Errors never contain upstream URLs or credentials.
 3. **Applies the builder rules** (country/node items, renames, ordering). Servers are identified by a credential-free fingerprint (`EntryFingerprint`), so the identity survives renames and credential rotation. The response is a JSON array when every fetched source is JSON, otherwise base64 share links; builder metadata overrides `profile-title`, `support-url` and `announce`.
-4. **Caches the merged body.** The cache key covers the builder version/metadata, the linked sources and every item rule, so configuration changes are served fresh.
+4. **Caches the merged body.** The cache key covers the builder version/metadata, the linked sources (including whether each one is expired at the moment of the request) and every item rule, so configuration changes and a source running out of its term are served fresh.
 
 The stored catalogue (`provider_sources`, `provider_source_entries`) only enriches entries (for example with a country); live upstream data is authoritative.
+
+#### Source validity end and deletion
+
+- **Validity end** (`provider_sources.expires_at`, migration `052_provider_source_expiry`): the admin records until which date and hour the provider's own subscription is paid; `NULL` means no limit. Past it the source is unusable **exactly like a disabled one** — `ProviderSource.RequestConfiguration` is the single check shared by `/sub`, the builder preview, the network monitor, the trial issuance check and the purchase policy. The `enabled` switch is not flipped, nothing is written at the moment of expiry, and extending the date brings the source back. A new end must be in the future; editing other fields of an already expired source keeps its stored end. The admin catalogue sync still works for a disabled or expired source (`FetchSourceCatalogue`).
+- **Deletion** (`DELETE /admin/api/sources/{id}`, `DELETE /admin/api/builders/{id}`; `database/config_deletion.go`): a row is physically deleted only while nothing depends on it. A source is blocked by any builder that links it or has a rule on it and by any subscription sold directly on it (`409 source_in_use`); a builder is blocked by any plan whose default it is and by any per-subscription override (`409 builder_in_use`) and needs the loaded version (`409 version_conflict`). The foreign keys would otherwise `SET NULL` those references and leave customers without content, so the check is explicit and switching off stays the way to retire something still referenced. Deletions are audited (`source_deleted`, `builder_deleted`, credential-free) and idempotent by `(actor, request_key)`; the admin views carry `dependents` so the panel can explain a refusal. Subscriptions are never deleted by this path.
 
 ### Subscription lifecycle
 
@@ -580,6 +585,8 @@ The bot exposes a `/metrics` endpoint (via `promhttp.Handler()`) on the HTTP ser
 | 2026-06 | Prometheus metrics | `/metrics` endpoint with HTTP, bot, DB, cache metrics |
 | 2026-07 | Security hardening (S2/S3/A1) | X-Forwarded-For rightmost IP, URL scheme allowlist, web→bot dependency break |
 | 2026-10 | Remove the legacy node subsystem (migration 051) | Subscriptions are assembled by Builders from ProviderSource catalogues; no panel provisioning, sync queue or panel traffic accounting |
+| 2026-11 | Source validity end (migration 052) and guarded deletion of sources/builders | A provider subscription is sold for a term: past `expires_at` the source is skipped like a disabled one without any worker; unused sources/builders can be deleted, referenced ones are refused instead of silently detaching plans and subscriptions |
+| 2026-11 | Promo codes, free tariffs and operational notifications (migration 053) | A discount lowers the amount of the pending order and is redeemed in the payment-confirmation transaction; nothing to pay is granted without a provider (`ActivateFree`). Infrastructure events and a daily report are a best-effort worker (`OpsWorker`) that only reads monitoring and source state. See `doc/promo-ops.md` |
 
 ---
 

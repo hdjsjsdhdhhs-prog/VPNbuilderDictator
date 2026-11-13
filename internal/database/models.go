@@ -168,6 +168,21 @@ type ProviderSource struct {
 	LastSyncAt     *time.Time `gorm:"column:last_sync_at"`
 	LastSyncStatus string     `gorm:"size:16;not null;default:'';column:last_sync_status"`
 	LastSyncError  string     `gorm:"size:64;not null;default:'';column:last_sync_error"`
+	// ExpiresAt is the admin-set end of the provider's own subscription
+	// (migration 052); nil = no limit. Past it the source is unusable exactly
+	// like a disabled one (see RequestConfiguration).
+	ExpiresAt *time.Time `gorm:"column:expires_at"`
+}
+
+// Expired reports whether the admin-set validity of the source ended at now.
+func (s ProviderSource) Expired(now time.Time) bool {
+	return s.ExpiresAt != nil && !now.Before(*s.ExpiresAt)
+}
+
+// BeforeSave stores the validity end in UTC, like every other timestamp.
+func (s *ProviderSource) BeforeSave(_ *gorm.DB) error {
+	s.ExpiresAt = utcTimePtr(s.ExpiresAt)
+	return nil
 }
 
 // ProviderSourceEntry is one entry (server/node) seen in a provider source on

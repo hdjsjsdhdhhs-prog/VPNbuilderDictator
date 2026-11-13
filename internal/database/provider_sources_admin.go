@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -31,6 +32,8 @@ type ProviderSourceUpdateInput struct {
 	HWID            string
 	UserAgent       string
 	Headers         string // JSON object
+	// ExpiresAt replaces the validity end; nil clears it (no limit).
+	ExpiresAt *time.Time
 }
 
 // UpdateProviderSource applies mutable fields to an existing source.
@@ -50,6 +53,7 @@ func (s *Service) UpdateProviderSource(ctx context.Context, id uint, in Provider
 		src.HWID = in.HWID
 		src.UserAgent = in.UserAgent
 		src.Headers = in.Headers
+		src.ExpiresAt = in.ExpiresAt
 		if err := tx.Save(&src).Error; err != nil {
 			return fmt.Errorf("update provider source: %w", err)
 		}

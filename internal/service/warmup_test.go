@@ -78,7 +78,8 @@ func TestWarmupSeed_AllScenariosValidAndRenderable(t *testing.T) {
 	f := newWarmupFixture(t)
 	views, err := f.svc.ListScenarios(f.ctx)
 	require.NoError(t, err)
-	require.Len(t, views, 14)
+	// 14 scenarios of migration 050 + the discount scenario of migration 053.
+	require.Len(t, views, 15)
 
 	expires := time.Date(2026, 12, 31, 20, 59, 0, 0, time.UTC)
 	enabled := 0
@@ -88,14 +89,30 @@ func TestWarmupSeed_AllScenariosValidAndRenderable(t *testing.T) {
 		require.NoError(t, err)
 		assert.Empty(t, problemCodes(e.problems, WarmupProblemInvalid), "%s must satisfy the registries", v.Key)
 
-		msg, err := f.svc.RenderScenario(f.ctx, &v.WarmupScenario, WarmupRecipient{
-			TelegramID: 42, Username: "user", PlanName: "Premium", ExpiresAt: &expires,
-		})
+		recipient := WarmupRecipient{TelegramID: 42, Username: "user", PlanName: "Premium", ExpiresAt: &expires}
+		if v.DiscountPercent > 0 {
+			// A discount scenario is only ever sent with the personal coupon
+			// issued for the delivery; without one it is refused.
+			_, err := f.svc.RenderScenario(f.ctx, &v.WarmupScenario, recipient)
+			_, reason := fieldReason(t, err)
+			assert.Equal(t, "coupon_required", reason, v.Key)
+			recipient.Coupon = &database.WarmupCoupon{Code: "TRIAL-7K3P9QXD", Percent: v.DiscountPercent}
+		}
+		msg, err := f.svc.RenderScenario(f.ctx, &v.WarmupScenario, recipient)
 		require.NoError(t, err, v.Key)
 		assert.NotContains(t, msg.HTML, "{{", v.Key)
 		require.NoError(t, validateTelegramHTML(msg.HTML), v.Key)
 		for _, b := range msg.Buttons {
 			assert.NotEmpty(t, b.Value, "%s: no button is sent without a target", v.Key)
+		}
+		if v.Key == "trial_ended_discount" {
+			// Migration 053: the discount after the trial is applied with one
+			// button; the code is shown for those who prefer to type it.
+			assert.False(t, v.Enabled, "the admin opts in")
+			assert.Contains(t, msg.HTML, "Скидка 20% на подписку")
+			assert.Contains(t, msg.HTML, "<code>TRIAL-7K3P9QXD</code>")
+			require.Len(t, msg.Buttons, 1)
+			assert.Equal(t, "apply_discount", msg.Buttons[0].Value)
 		}
 		if v.Enabled {
 			enabled++
@@ -255,7 +272,8 @@ func TestWarmupScenario_CreateAndSettings(t *testing.T) {
 	assert.NotZero(t, res.TargetID)
 	views, err := f.svc.ListScenarios(f.ctx)
 	require.NoError(t, err)
-	assert.Len(t, views, 15)
+	// 15 seeded scenarios (migrations 050 and 053) and the new one.
+	assert.Len(t, views, 16)
 
 	bad := []database.WarmupSettingsInput{
 		{Version: 1, MaxPerDay: 0, CooldownHours: 24, CatchupHours: 6},

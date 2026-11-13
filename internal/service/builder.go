@@ -56,6 +56,14 @@ type BuilderRepository interface {
 
 	// Preview
 	PreviewBuilder(ctx context.Context, builderID uint) (*database.PreviewBuilderResult, error)
+
+	// Deletion (only while nothing depends on the row) and its dependents
+	SourceDependentsAll(ctx context.Context) (map[uint]database.SourceDependents, error)
+	SourceDependentsFor(ctx context.Context, sourceID uint) (database.SourceDependents, error)
+	BuilderDependentsAll(ctx context.Context) (map[uint]database.BuilderDependents, error)
+	BuilderDependentsFor(ctx context.Context, builderID uint) (database.BuilderDependents, error)
+	DeleteProviderSource(ctx context.Context, meta database.AdminConfigMeta, id uint) (*database.AdminConfigResult, error)
+	DeleteBuilder(ctx context.Context, meta database.AdminConfigMeta, id uint, version int) (*database.AdminConfigResult, error)
 }
 
 var _ BuilderRepository = (*database.Service)(nil)
@@ -119,8 +127,16 @@ type SourceView struct {
 	LastSyncError  string     `json:"last_sync_error"`
 	// Catalogue summarizes the entries stored by the last successful sync.
 	Catalogue database.SourceCatalogueStats `json:"catalogue"`
-	CreatedAt time.Time                     `json:"created_at"`
-	UpdatedAt time.Time                     `json:"updated_at"`
+	// ExpiresAt is the admin-set end of the provider subscription (null = no
+	// limit). Expired is evaluated on the server clock: an expired source is
+	// skipped by /sub exactly like a disabled one.
+	ExpiresAt *time.Time `json:"expires_at"`
+	Expired   bool       `json:"expired"`
+	// Dependents is what still relies on the source; it can be deleted only
+	// while both lists are empty.
+	Dependents database.SourceDependents `json:"dependents"`
+	CreatedAt  time.Time                 `json:"created_at"`
+	UpdatedAt  time.Time                 `json:"updated_at"`
 }
 
 func sourceViewOf(s *database.ProviderSource) SourceView {
@@ -134,12 +150,16 @@ func sourceViewOf(s *database.ProviderSource) SourceView {
 		LastSyncStatus: s.LastSyncStatus,
 		LastSyncError:  s.LastSyncError,
 		Catalogue:      database.SourceCatalogueStats{ByCountry: []database.SourceCountryCount{}, Protocols: map[string]int{}},
+		ExpiresAt:      s.ExpiresAt,
+		Expired:        s.Expired(time.Now()),
+		Dependents:     database.SourceDependents{Builders: []database.DependentRef{}},
 		CreatedAt:      s.CreatedAt,
 		UpdatedAt:      s.UpdatedAt,
 	}
 }
 
-// sourceView returns the projection with the current catalogue statistics.
+// sourceView returns the projection with the current catalogue statistics
+// and dependents.
 func (s *BuilderService) sourceView(ctx context.Context, src *database.ProviderSource) (*SourceView, error) {
 	v := sourceViewOf(src)
 	stats, err := s.repo.SourceCatalogueStatsFor(ctx, src.ID)
@@ -147,6 +167,11 @@ func (s *BuilderService) sourceView(ctx context.Context, src *database.ProviderS
 		return nil, fmt.Errorf("source catalogue stats: %w", err)
 	}
 	v.Catalogue = stats
+	deps, err := s.repo.SourceDependentsFor(ctx, src.ID)
+	if err != nil {
+		return nil, fmt.Errorf("source dependents: %w", err)
+	}
+	v.Dependents = deps
 	return &v, nil
 }
 
@@ -163,10 +188,14 @@ type BuilderView struct {
 	// Sources and Items are always present ([] when empty): the admin list and
 	// the editor read the configuration from them, so a missing field must
 	// never be mistaken for "no sources / no rules".
-	Sources   []BuilderSourceView `json:"sources"`
-	Items     []BuilderItemView   `json:"items"`
-	CreatedAt time.Time           `json:"created_at"`
-	UpdatedAt time.Time           `json:"updated_at"`
+	Sources []BuilderSourceView `json:"sources"`
+	Items   []BuilderItemView   `json:"items"`
+	// Dependents is what still relies on the builder (plans whose default it
+	// is, subscriptions overriding their plan with it); it can be deleted only
+	// while both are empty.
+	Dependents database.BuilderDependents `json:"dependents"`
+	CreatedAt  time.Time                  `json:"created_at"`
+	UpdatedAt  time.Time                  `json:"updated_at"`
 }
 
 // BuilderSourceView is one source slot in a builder.
@@ -201,6 +230,7 @@ func builderViewOf(b *database.SubscriptionBuilder) BuilderView {
 		Version:      b.Version,
 		Sources:      make([]BuilderSourceView, 0, len(b.Sources)),
 		Items:        make([]BuilderItemView, 0, len(b.Items)),
+		Dependents:   database.BuilderDependents{Plans: []database.DependentRef{}},
 		CreatedAt:    b.CreatedAt,
 		UpdatedAt:    b.UpdatedAt,
 	}
@@ -239,15 +269,61 @@ func (s *BuilderService) ListSources(ctx context.Context) ([]SourceView, error) 
 	if err != nil {
 		return nil, fmt.Errorf("list sources: %w", err)
 	}
+	deps, err := s.repo.SourceDependentsAll(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list sources: %w", err)
+	}
 	views := make([]SourceView, 0, len(sources))
 	for i := range sources {
 		v := sourceViewOf(&sources[i])
 		if st, ok := stats[sources[i].ID]; ok {
 			v.Catalogue = st
 		}
+		if d, ok := deps[sources[i].ID]; ok {
+			v.Dependents = d
+		}
 		views = append(views, v)
 	}
 	return views, nil
+}
+
+// DeleteSource physically deletes a provider source that nothing depends on.
+// database.ErrProviderSourceInUse while a builder links it (or has a rule on
+// it) or a subscription was sold on it: switch it off instead.
+func (s *BuilderService) DeleteSource(ctx context.Context, actor, requestKey string, id uint) (*database.AdminAuditLog, error) {
+	result, err := s.repo.DeleteProviderSource(ctx, database.AdminConfigMeta{Actor: actor, RequestKey: requestKey}, id)
+	if err != nil {
+		return nil, err
+	}
+	return &result.Audit, nil
+}
+
+// DeleteBuilder physically deletes a subscription builder that nothing depends
+// on. database.ErrBuilderInUse while a plan uses it as default or a
+// subscription overrides its plan with it: switch it off or reassign first.
+func (s *BuilderService) DeleteBuilder(ctx context.Context, actor, requestKey string, id uint, version int) (*database.AdminAuditLog, error) {
+	result, err := s.repo.DeleteBuilder(ctx, database.AdminConfigMeta{Actor: actor, RequestKey: requestKey}, id, version)
+	if err != nil {
+		return nil, err
+	}
+	return &result.Audit, nil
+}
+
+// sourceExpiryMaxYear bounds the validity end so a typo cannot store a date
+// the admin UI and JSON cannot represent.
+const sourceExpiryMaxYear = 9999
+
+// validateSourceExpiry checks a newly set validity end: it must be in the
+// future (a past value would switch the source off the moment it is saved).
+func validateSourceExpiry(expiresAt *time.Time, now time.Time) (*time.Time, error) {
+	if expiresAt == nil {
+		return nil, nil
+	}
+	utc := expiresAt.UTC()
+	if !utc.After(now) || utc.Year() > sourceExpiryMaxYear {
+		return nil, &SourceFieldError{Field: "expires_at"}
+	}
+	return &utc, nil
 }
 
 // GetSource returns one provider source (credentials stripped).
@@ -264,10 +340,16 @@ type UpdateSourceInput struct {
 	Name        string
 	Description string
 	Type        string
+	// ExpiresAtSet tells whether the request carried the validity end. When
+	// false the stored value is kept; when true ExpiresAt replaces it (nil
+	// clears the limit).
+	ExpiresAtSet bool
+	ExpiresAt    *time.Time
 }
 
-// UpdateSource updates the non-credential metadata of a provider source.
-// Credentials are NOT updated here — they are managed out-of-band.
+// UpdateSource updates the non-credential metadata of a provider source and,
+// when requested, its validity end. Credentials are NOT updated here — they
+// are managed out-of-band.
 func (s *BuilderService) UpdateSource(ctx context.Context, id uint, in UpdateSourceInput) (*SourceView, error) {
 	name, format, err := validateSourceMeta(in.Name, in.Type)
 	if err != nil {
@@ -278,6 +360,18 @@ func (s *BuilderService) UpdateSource(ctx context.Context, id uint, in UpdateSou
 	if err != nil {
 		return nil, err
 	}
+	expiresAt := current.ExpiresAt
+	if in.ExpiresAtSet {
+		// Re-saving the stored value (e.g. renaming an already expired source)
+		// is not a new deadline and is accepted as is.
+		unchanged := in.ExpiresAt != nil && current.ExpiresAt != nil && in.ExpiresAt.Equal(*current.ExpiresAt)
+		if !unchanged {
+			expiresAt, err = validateSourceExpiry(in.ExpiresAt, time.Now().UTC())
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 	updated, err := s.repo.UpdateProviderSource(ctx, id, database.ProviderSourceUpdateInput{
 		Name:            name,
 		Description:     strings.TrimSpace(in.Description),
@@ -286,6 +380,7 @@ func (s *BuilderService) UpdateSource(ctx context.Context, id uint, in UpdateSou
 		HWID:            current.HWID,
 		UserAgent:       current.UserAgent,
 		Headers:         current.Headers,
+		ExpiresAt:       expiresAt,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("update source: %w", err)
@@ -327,11 +422,40 @@ func (s *BuilderService) ListBuilders(ctx context.Context) ([]BuilderView, error
 	if err != nil {
 		return nil, fmt.Errorf("list builders: %w", err)
 	}
+	deps, err := s.repo.BuilderDependentsAll(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list builders: %w", err)
+	}
 	views := make([]BuilderView, 0, len(builders))
 	for i := range builders {
-		views = append(views, builderViewOf(&builders[i]))
+		v := builderViewOf(&builders[i])
+		if d, ok := deps[builders[i].ID]; ok {
+			v.Dependents = d
+		}
+		views = append(views, v)
 	}
 	return views, nil
+}
+
+// builderView returns the projection with the current dependents.
+func (s *BuilderService) builderView(ctx context.Context, b *database.SubscriptionBuilder) (*BuilderView, error) {
+	v := builderViewOf(b)
+	deps, err := s.repo.BuilderDependentsFor(ctx, b.ID)
+	if err != nil {
+		return nil, fmt.Errorf("builder dependents: %w", err)
+	}
+	v.Dependents = deps
+	return &v, nil
+}
+
+// builderViewAudited is builderView for the audited mutations: the change is
+// committed, so a failed reload reports the audit row alongside the error.
+func (s *BuilderService) builderViewAudited(ctx context.Context, b *database.SubscriptionBuilder, audit *database.AdminAuditLog) (*BuilderView, *database.AdminAuditLog, error) {
+	v, err := s.builderView(ctx, b)
+	if err != nil {
+		return nil, audit, err
+	}
+	return v, audit, nil
 }
 
 // GetBuilder returns one builder with Sources and Items preloaded.
@@ -340,8 +464,7 @@ func (s *BuilderService) GetBuilder(ctx context.Context, id uint) (*BuilderView,
 	if err != nil {
 		return nil, err // ErrBuilderNotFound propagates as-is
 	}
-	v := builderViewOf(b)
-	return &v, nil
+	return s.builderView(ctx, b)
 }
 
 // CreateBuilderInput is the request body for creating a builder.
@@ -376,8 +499,7 @@ func (s *BuilderService) CreateBuilder(ctx context.Context, in CreateBuilderInpu
 	if err != nil {
 		return nil, &result.Audit, fmt.Errorf("reload builder after create: %w", err)
 	}
-	v := builderViewOf(b)
-	return &v, &result.Audit, nil
+	return s.builderViewAudited(ctx, b, &result.Audit)
 }
 
 // UpdateBuilderInput is the request body for updating a builder.
@@ -416,8 +538,7 @@ func (s *BuilderService) UpdateBuilder(ctx context.Context, in UpdateBuilderInpu
 	if err != nil {
 		return nil, &result.Audit, fmt.Errorf("reload builder after update: %w", err)
 	}
-	v := builderViewOf(b)
-	return &v, &result.Audit, nil
+	return s.builderViewAudited(ctx, b, &result.Audit)
 }
 
 // SetBuilderSources replaces the source list for a builder.
@@ -504,8 +625,7 @@ func (s *BuilderService) SaveBuilderConfiguration(ctx context.Context, in SaveBu
 	if err != nil {
 		return nil, &result.Audit, fmt.Errorf("reload builder after configuration save: %w", err)
 	}
-	v := builderViewOf(b)
-	return &v, &result.Audit, nil
+	return s.builderViewAudited(ctx, b, &result.Audit)
 }
 
 // ReorderBuilderItems updates item positions.
@@ -590,6 +710,9 @@ type CreateSourceInput struct {
 	UserAgent       string
 	Headers         string // JSON object, default "{}"
 	Enabled         bool
+	// ExpiresAt is the end of the provider subscription (date and hour); nil
+	// means it does not expire.
+	ExpiresAt *time.Time
 }
 
 // SourceFieldError names the invalid field of a source create/update. It wraps
@@ -661,7 +784,12 @@ func (s *BuilderService) CreateSource(ctx context.Context, in CreateSourceInput)
 	if headers == "" {
 		headers = "{}"
 	}
+	expiresAt, err := validateSourceExpiry(in.ExpiresAt, time.Now().UTC())
+	if err != nil {
+		return nil, nil, err
+	}
 	src := database.ProviderSource{
+		ExpiresAt:       expiresAt,
 		Name:            name,
 		Description:     strings.TrimSpace(in.Description),
 		Type:            format,
@@ -816,8 +944,7 @@ func (s *BuilderService) setBuilderEnabled(ctx context.Context, id uint, enabled
 	if err != nil {
 		return nil, fmt.Errorf("reload builder after toggle: %w", err)
 	}
-	v := builderViewOf(b)
-	return &v, nil
+	return s.builderView(ctx, b)
 }
 
 // ---------------------------------------------------------------------------

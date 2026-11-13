@@ -278,7 +278,7 @@ test('creates a disabled scenario, then edits, previews and saves it', async ({ 
   await page.locator('#wu-percent').fill('15');
   await page.getByRole('button', { name: 'Вставить {{discount_code}} в текст' }).click();
   await expect(page.locator('#wu-coupon-example')).toHaveText('Пример кода: VPN-XXXXXXXX');
-  await expect(page.getByText('Купон пока не применяется автоматически при оплате.')).toBeVisible();
+  await expect(page.getByText('Клиент применяет купон одной кнопкой с действием «Применить скидку и открыть тарифы»')).toBeVisible();
 
   await page.locator('#wu-preview').click();
   await expect(page.locator('.tg-text b')).toHaveText('Скидка');

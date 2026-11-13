@@ -195,6 +195,7 @@ Cache.Set(240s) → return body with Content-Type + Subscription-Userinfo
 - ☕ Donate, ❓ Help — auxiliary menus
 - 🔗 Referral system — share links with in-memory cache + periodic DB sync
 - 🎁 Trial subscriptions via `/i/{code}` landing page with Happ deep-links
+- 🎟 Promo codes (`/promo CODE` or the "🎟 Промокод" button) and one-click warm-up coupons lower the price in the purchase menu; free tariffs are granted without payment (`doc/promo-ops.md`)
 
 
 **Admin Features:**
@@ -326,9 +327,9 @@ All tests pass with `-race` detector. Fuzzing enabled for critical functions.
 ### Subscription Content (Builders)
 - **No panel integration:** the bot never registers clients on a VPN panel; a subscription is a local row. The legacy node subsystem (3x-ui/proxman, `nodes`, the sync state machine, panel traffic accounting) was removed in migration `051_remove_legacy_nodes`.
 - **Builder resolution:** `ResolveSubscriptionBuilder` picks `subscriptions.subscription_builder_id`, otherwise the plan default (`plans.subscription_builder_id`); a disabled or dangling builder is skipped.
-- **Sources:** `provider_sources` hold URL, format and headers (server-side only). The stored catalogue (`provider_source_entries`) only enriches entries; live upstream data is authoritative.
+- **Sources:** `provider_sources` hold URL, format and headers (server-side only). The stored catalogue (`provider_source_entries`) only enriches entries; live upstream data is authoritative. An optional validity end (`expires_at`, migration 052) takes a source out of `/sub`, preview and monitoring once it passes, exactly like disabling it.
 - **Resilience:** a failing source is skipped; if no source can be fetched the request fails with `ErrProviderSourceUnavailable`. Fetch errors never contain upstream URLs or credentials.
-- **Configuration:** ProviderSources, Builders and their rules are managed in the admin UI/API.
+- **Configuration:** ProviderSources, Builders and their rules are managed in the admin UI/API. A source or a builder can be deleted there only while nothing depends on it (builders/subscriptions for a source, plans/subscription overrides for a builder); otherwise it can only be switched off.
 
 ### Subscription Flow
 - **Trial:** `/i/{code}` → IP rate limit (3/hour) → DB trial record (negative telegram_id) → user clicks link in Telegram → `BindTrialSubscription` sets telegram_id (из отрицательного в реальный), sets referred_by if from invite
@@ -346,6 +347,12 @@ All tests pass with `-race` detector. Fuzzing enabled for critical functions.
 - **Chargeback:** `CHARGEBACKED` on a paid order auto-downgrades the subscription to the free plan unless another paid order exists (access preserved for manual review).
 - **Payment window:** link lifetime is determined by Platega `expiresIn` and stored as absolute UTC `payment_expires_at`; a still-valid saved link is reused. Only a new `RequestPayment` after that timestamp terminalizes the pending order as `expired`; a late `CONFIRMED` for an `expired`/`canceled` order never activates it and is sent for manual review.
 - **Metrics:** `payment_operations_total{operation,result}`, `payment_operation_duration_seconds`, `payment_amounts_cents_total{operation,currency}` (confirmed/chargeback), `payment_issues_total{event}`.
+
+### Promo Codes, Free Tariffs and Ops Notifications (migration 053)
+- **Discounts:** `RequestPayment` charges the catalogue price lowered by the customer's best unredeemed discount (`user_discounts`); the discount is recorded on the pending order (`order_discounts`) and redeemed inside `ConfirmOrderPaidCAS`. A pending order created for another amount is expired and replaced.
+- **Nothing to pay:** a free tariff (price 0) or a 100 % discount makes `RequestPayment` return `ErrNothingToPay`; the tariff is granted by `OrderService.ActivateFree` (order with amount 0, `payment_provider = 'free'`). A free tariff is refused while the same tariff is running or a paid term is active.
+- **Ops notifications:** `scheduler.OpsWorker` runs `OpsService.Tick` every minute — monitor outages, builder and source state changes and a daily report (Moscow time) become `ops_events`, delivered to Telegram in batches. Best-effort: it never affects subscriptions, payments or `/sub`.
+- **Admin:** promo codes under `/admin/api/promos`, settings/feed/report/test under `/admin/api/ops`. Details: `doc/promo-ops.md`.
 
 ### Subscription Deletion
 - **Order:** mark as revoked (journaled) → physical deletion of the DB row → cache invalidation (no external deprovisioning)

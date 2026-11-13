@@ -17,9 +17,9 @@ import (
 
 // Pin the complete Mini App/Purchase/Stars/Admin-audit/Subscription Builder/
 // Tariff catalogue/Journal/network monitor/trial settings/customer warm-up/
-// legacy-node removal schema; future-schema fixtures must remain strictly newer
-// than this version.
-const expectedLatestMigrationVersion = 51
+// legacy-node removal/provider-source expiry/promo codes and ops events
+// schema; future-schema fixtures must remain strictly newer than this version.
+const expectedLatestMigrationVersion = 53
 
 func TestLatestEmbeddedMigrationVersion(t *testing.T) {
 	t.Parallel()

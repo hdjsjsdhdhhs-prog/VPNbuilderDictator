@@ -1,7 +1,9 @@
 // Pure logic of the network monitor screens ("Мониторинг"): status and error
 // labels, time/duration formatting, filters and the latency chart geometry.
 // No DOM here; covered by tests/admin-monitoring.test.ts.
-import type { MonitorCountry, MonitorLatencyPoint, MonitorNode, MonitorStatus, MonitorTransition } from './api';
+import type {
+  MonitorBuilderSummary, MonitorCountry, MonitorLatencyPoint, MonitorNode, MonitorOverview, MonitorStatus, MonitorTransition,
+} from './api';
 import { pluralRu } from './tariffs';
 
 const countFormat = new Intl.NumberFormat('ru-RU');
@@ -14,13 +16,24 @@ export const STATUS_LABELS: Readonly<Record<MonitorStatus, string>> = {
   disabled: 'Отключён',
 };
 
-/** Badge modifier of a status (style.css .badge-*). */
+/** Badge modifier of a status (style.css .badge-*): green means "works". */
 export const STATUS_BADGES: Readonly<Record<MonitorStatus, string>> = {
-  up: 'badge badge-active',
+  up: 'badge badge-ok',
   degraded: 'badge badge-warn',
   down: 'badge badge-danger',
   unknown: 'badge',
   disabled: 'badge',
+};
+
+/**
+ * Colour of a state, the same everywhere on the monitor screens: ok is green,
+ * warn is yellow, down is red, unknown and off are neutral. Colour never
+ * stands alone: every marker has a text label or an accessible name.
+ */
+export type HealthTone = 'ok' | 'warn' | 'down' | 'unknown' | 'off';
+
+export const STATUS_TONES: Readonly<Record<MonitorStatus, HealthTone>> = {
+  up: 'ok', degraded: 'warn', down: 'down', unknown: 'unknown', disabled: 'off',
 };
 
 /** Statuses offered by the status filter (a builder may also be disabled). */
@@ -181,6 +194,173 @@ export function protocolsOf(countries: readonly MonitorCountry[]): string[] {
   const set = new Set<string>();
   for (const c of countries) for (const n of c.nodes) set.add(n.protocol);
   return [...set].sort((a, b) => protocolLabel(a).localeCompare(protocolLabel(b)));
+}
+
+// ---------------------------------------------------------------------------
+// Health at a glance: one verdict for the whole network, the share of servers
+// per state and the availability strip under the latency chart.
+
+/** Rounds missed before the monitor is reported as not checking (service.opsStalledRounds). */
+export const STALLED_ROUNDS = 10;
+
+type OverviewInput = Pick<MonitorOverview, 'enabled' | 'interval_seconds' | 'last_round_at' | 'builders'>;
+
+/** The checks are enabled but the last round is too old: every status is stale. */
+export function monitorStalled(o: Pick<MonitorOverview, 'enabled' | 'interval_seconds' | 'last_round_at'>, now: number): boolean {
+  if (!o.enabled || o.interval_seconds <= 0 || !o.last_round_at) return false;
+  return now - Date.parse(o.last_round_at) > o.interval_seconds * STALLED_ROUNDS * 1000;
+}
+
+export interface HealthSummary {
+  readonly tone: HealthTone;
+  readonly title: string;
+  readonly text: string;
+  /** Enabled builders only: a disabled builder serves nothing and is not checked. */
+  readonly builders: number;
+  readonly buildersOk: number;
+  readonly nodes: number;
+  readonly nodesUp: number;
+  readonly nodesDown: number;
+  readonly nodesUnknown: number;
+  readonly countries: number;
+  readonly countriesUp: number;
+}
+
+const serversWord = (n: number) => pluralRu(n, 'сервер', 'сервера', 'серверов');
+const buildersWord = (n: number) => pluralRu(n, 'построитель', 'построителя', 'построителей');
+
+/**
+ * The verdict of the overview. Green only when every enabled builder is up,
+ * every served server answers and the checks are actually running; a stopped
+ * monitor is never green.
+ */
+export function overviewHealth(o: OverviewInput, now: number): HealthSummary {
+  const active = o.builders.filter(b => b.enabled && b.status !== 'disabled');
+  const sum = (pick: (b: MonitorBuilderSummary) => number) => active.reduce((total, b) => total + pick(b), 0);
+  const counts = {
+    builders: active.length,
+    buildersOk: active.filter(b => b.status === 'up').length,
+    nodes: sum(b => b.nodes_total), nodesUp: sum(b => b.nodes_up), nodesDown: sum(b => b.nodes_down), nodesUnknown: sum(b => b.nodes_unknown),
+    countries: sum(b => b.countries_total), countriesUp: sum(b => b.countries_up),
+  };
+  const verdict = (tone: HealthTone, title: string, text: string): HealthSummary => ({ tone, title, text, ...counts });
+
+  if (active.length === 0) {
+    return verdict('off', 'Нет включённых построителей', 'Проверять нечего: серверы клиентам сейчас не выдаются.');
+  }
+  if (!o.enabled) {
+    return verdict('unknown', 'Проверки отключены', 'Фоновые проверки выключены в конфигурации: ниже последнее сохранённое состояние.');
+  }
+  if (monitorStalled(o, now)) {
+    return verdict('unknown', 'Проверки не идут',
+      `Последний раунд был ${formatAgo(o.last_round_at, now)}. Статусы ниже могут быть устаревшими.`);
+  }
+  const down = active.filter(b => b.status === 'down');
+  if (down.length > 0) {
+    return verdict('down', `Недоступно: ${countFormat.format(down.length)} ${buildersWord(down.length)}`,
+      'У этих построителей не отвечает ни один сервер: их клиенты остались без VPN.');
+  }
+  const sourceErrors = sum(b => b.source_errors);
+  if (counts.nodesDown > 0 || sourceErrors > 0 || active.some(b => b.status === 'degraded')) {
+    const parts: string[] = [];
+    if (counts.nodesDown > 0) parts.push(`не отвечает ${countFormat.format(counts.nodesDown)} из ${countFormat.format(counts.nodes)} ${serversWord(counts.nodes)}`);
+    if (sourceErrors > 0) parts.push(`источников с ошибкой загрузки: ${countFormat.format(sourceErrors)}`);
+    const text = parts.length ? `${parts.join(', ')}.` : 'Часть стран работает частично.';
+    return verdict('warn', 'Есть сбои', `${text.charAt(0).toUpperCase()}${text.slice(1)} Клиенты подключаются через остальные серверы.`);
+  }
+  if (counts.nodes === 0 || counts.nodesUp < counts.nodes) {
+    return verdict('unknown', 'Нет данных проверки',
+      counts.nodes === 0 ? 'Построители пока не выдают серверов с проверяемым адресом.' : 'Часть серверов ещё не проверена: дождитесь следующего раунда.');
+  }
+  return verdict('ok', 'Всё работает',
+    `Отвечают все ${countFormat.format(counts.nodes)} ${serversWord(counts.nodes)} в ${countFormat.format(counts.builders)} ${pluralRu(counts.builders, 'построителе', 'построителях', 'построителях')}.`);
+}
+
+export interface HealthSegment {
+  readonly tone: 'ok' | 'down' | 'unknown';
+  readonly count: number;
+  /** Percent of the bar, 0–100. */
+  readonly share: number;
+}
+
+/** Servers per state as shares of a bar; states without servers are omitted. */
+export function healthSegments(up: number, down: number, unknown: number): HealthSegment[] {
+  const total = up + down + unknown;
+  if (total <= 0) return [];
+  const raw: readonly (readonly [HealthSegment['tone'], number])[] = [['ok', up], ['down', down], ['unknown', unknown]];
+  return raw.filter(([, count]) => count > 0).map(([tone, count]) => ({ tone, count, share: Math.round((count / total) * 1000) / 10 }));
+}
+
+/** Accessible name of a health bar: "работают 5, недоступны 1, нет данных 2". */
+export function healthBarLabel(up: number, down: number, unknown: number): string {
+  const parts = [`работают ${countFormat.format(up)}`];
+  if (down > 0) parts.push(`недоступны ${countFormat.format(down)}`);
+  if (unknown > 0) parts.push(`нет данных ${countFormat.format(unknown)}`);
+  return parts.join(', ');
+}
+
+export interface UptimeCell {
+  readonly tone: 'ok' | 'warn' | 'down' | 'unknown';
+  /** Bounds of the cell in epoch milliseconds. */
+  readonly from: number;
+  readonly to: number;
+  readonly checks: number;
+  readonly failures: number;
+}
+
+/**
+ * The availability strip: the period cut into equal cells, each coloured by
+ * the checks that fell into it — green (all passed), yellow (some failed),
+ * red (all failed), neutral (no checks).
+ */
+export function uptimeCells(points: readonly MonitorLatencyPoint[], from: string, to: string, stepSeconds: number, maxCells = 96): UptimeCell[] {
+  const start = Date.parse(from);
+  const end = Date.parse(to);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || maxCells <= 0) return [];
+  const span = end - start;
+  const steps = stepSeconds > 0 ? Math.ceil(span / (stepSeconds * 1000)) : maxCells;
+  const count = Math.max(1, Math.min(maxCells, steps));
+  const width = span / count;
+  const cells = Array.from({ length: count }, (_, i) => ({ checks: 0, failures: 0, from: start + i * width, to: start + (i + 1) * width }));
+  for (const p of points) {
+    const at = Date.parse(p.at);
+    if (!Number.isFinite(at) || at < start || at > end) continue;
+    const cell = cells[Math.min(count - 1, Math.floor((at - start) / width))];
+    cell.checks += p.checks;
+    cell.failures += p.failures;
+  }
+  return cells.map(c => ({
+    ...c,
+    tone: c.checks <= 0 ? 'unknown' : c.failures <= 0 ? 'ok' : c.failures >= c.checks ? 'down' : 'warn',
+  }));
+}
+
+const UPTIME_TONE_TEXT: Readonly<Record<UptimeCell['tone'], string>> = {
+  ok: 'все проверки успешны', warn: 'часть проверок неудачна', down: 'все проверки неудачны', unknown: 'проверок не было',
+};
+
+/** Tooltip of a cell: what happened in it (the caller adds the time range). */
+export function uptimeCellText(cell: UptimeCell): string {
+  const base = UPTIME_TONE_TEXT[cell.tone];
+  if (cell.tone === 'unknown' || cell.tone === 'ok') return cell.checks > 0 ? `${base} (${countFormat.format(cell.checks)})` : base;
+  return `${base}: ${countFormat.format(cell.failures)} из ${countFormat.format(cell.checks)}`;
+}
+
+/** One line under the strip: "Все проверки успешны" or how many cells had failures. */
+export function uptimeSummary(cells: readonly UptimeCell[]): { tone: UptimeCell['tone']; text: string } {
+  const checked = cells.filter(c => c.tone !== 'unknown');
+  if (checked.length === 0) return { tone: 'unknown', text: 'За период проверок не было.' };
+  const bad = checked.filter(c => c.tone !== 'ok');
+  if (bad.length === 0) return { tone: 'ok', text: 'Все проверки за период успешны.' };
+  const tone = bad.some(c => c.tone === 'down') ? 'down' : 'warn';
+  return { tone, text: `Интервалов с неудачными проверками: ${countFormat.format(bad.length)} из ${countFormat.format(checked.length)}.` };
+}
+
+/** Tone of the availability figure: 100 % is green, under 99 % is red. */
+export function availabilityTone(percent: number | null): HealthTone {
+  if (percent === null) return 'unknown';
+  if (percent >= 100) return 'ok';
+  return percent >= 99 ? 'warn' : 'down';
 }
 
 // ---------------------------------------------------------------------------

@@ -54,7 +54,9 @@ func TestWarmupMigration050_Seed(t *testing.T) {
 
 	scenarios, err := svc.ListWarmupScenarios(ctx)
 	require.NoError(t, err)
-	require.Len(t, scenarios, 14, "exactly 14 standard scenarios")
+	// 14 scenarios of migration 050 and the "discount after the trial"
+	// scenario of migration 053.
+	require.Len(t, scenarios, 15, "exactly 15 standard scenarios")
 
 	enabled, disabled := []string{}, []string{}
 	for _, sc := range scenarios {
@@ -67,11 +69,21 @@ func TestWarmupMigration050_Seed(t *testing.T) {
 			assert.Nil(t, sc.EnabledAt, sc.Key)
 		}
 		assert.Equal(t, 1, sc.Version, sc.Key)
+		if sc.Key == "trial_ended_discount" {
+			// Migration 053: the only seeded scenario with a discount; its
+			// button applies the personal coupon with one click.
+			assert.Equal(t, 20, sc.DiscountPercent)
+			assert.Equal(t, "TRIAL", sc.CouponTemplate)
+			assert.Equal(t, 72, sc.CouponTTLHours)
+			assert.Contains(t, sc.Buttons, `"value":"apply_discount"`)
+			assert.Contains(t, sc.MessageHTML, "{{discount_code}}")
+			continue
+		}
 		assert.Zero(t, sc.DiscountPercent, sc.Key)
 	}
 	assert.Len(t, enabled, 11)
-	assert.ElementsMatch(t, []string{"sub_expiring_48h", "sub_expiring_24h", "sub_expired"}, disabled,
-		"only the subscription scenarios are off: they would duplicate the existing expiry reminders")
+	assert.ElementsMatch(t, []string{"sub_expiring_48h", "sub_expiring_24h", "sub_expired", "trial_ended_discount"}, disabled,
+		"the subscription scenarios are off (they would duplicate the existing expiry reminders), and so is the discount scenario: the admin opts in")
 
 	// Admin order: trial tab, subscription tab, winback tab, by position.
 	order := make([]string, 0, len(scenarios))
@@ -80,6 +92,7 @@ func TestWarmupMigration050_Seed(t *testing.T) {
 	}
 	assert.Equal(t, []string{
 		"trial_not_activated", "trial_not_connected_3h", "trial_not_connected_24h", "trial_ending", "trial_no_purchase", "trial_ended",
+		"trial_ended_discount",
 		"sub_expiring_48h", "sub_expiring_24h", "sub_expired",
 		"winback_3d", "trial_winback_3d", "winback_7d", "winback_14d", "winback_30d",
 	}, order)
@@ -302,7 +315,7 @@ func TestWarmupScenario_CreateIsDataDriven(t *testing.T) {
 	require.ErrorIs(t, err, ErrWarmupScenarioKeyTaken)
 	all, err := svc.ListWarmupScenarios(ctx)
 	require.NoError(t, err)
-	assert.Len(t, all, 15)
+	assert.Len(t, all, 16)
 }
 
 func TestWarmupSettings_Update(t *testing.T) {
@@ -378,7 +391,7 @@ func TestWarmupSettings_SwitchOnResetsEnabledAt(t *testing.T) {
 	onAt := res.Audit.CreatedAt
 	assert.WithinDuration(t, switchOn, onAt, time.Minute)
 	after := warmupScenarioStates(t, svc)
-	require.Len(t, after, 14)
+	require.Len(t, after, 15)
 	enabled := 0
 	for key, sc := range after {
 		old := before[key]

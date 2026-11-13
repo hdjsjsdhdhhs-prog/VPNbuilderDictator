@@ -26,8 +26,14 @@ export function pluralRu(n: number, one: string, few: string, many: string): str
 
 export const durationLabel = (days: number) => `${countFormat.format(days)} ${pluralRu(days, 'день', 'дня', 'дней')}`;
 
-/** Human price, e.g. "199 ₽", "199,90 ₽", "150 ★", "12,50 USD". */
+/** A tariff with price 0: granted in the bot without a payment, never sold. */
+export const isFreePrice = (amount: number | null) => amount === 0;
+
+export const FREE_PRICE_LABEL = 'Бесплатно';
+
+/** Human price, e.g. "199 ₽", "199,90 ₽", "150 ★", "12,50 USD"; "Бесплатно" for 0. */
 export function formatTariffPrice(amount: number, currency: string): string {
+  if (isFreePrice(amount)) return FREE_PRICE_LABEL;
   if (isWholeUnits(currency)) return `${countFormat.format(amount)} ★`;
   const major = amount / 100;
   const text = new Intl.NumberFormat('ru-RU', { minimumFractionDigits: amount % 100 === 0 ? 0 : 2, maximumFractionDigits: 2 }).format(major);
@@ -35,10 +41,12 @@ export function formatTariffPrice(amount: number, currency: string): string {
 }
 
 /**
- * The bot's product button (bot.KeyboardBuilder.BuyProductList +
- * utils.FormatPriceCents): "Месяц — 199₽" / "Месяц — 199.99₽".
+ * The bot's tariff button (bot.KeyboardBuilder.TariffList + tariffPriceLabel +
+ * utils.FormatPriceCents): "Месяц — 199₽" / "Месяц — 199.99₽" /
+ * "Старт — Бесплатно".
  */
 export function botButtonLabel(name: string, amount: number): string {
+  if (isFreePrice(amount)) return `${name} — ${FREE_PRICE_LABEL}`;
   const rub = Math.trunc(amount / 100);
   const kop = amount % 100;
   return `${name} — ${kop === 0 ? rub : `${rub}.${String(kop).padStart(2, '0')}`}₽`;
@@ -124,10 +132,11 @@ export function validateTariffForm(form: TariffForm): { input: TariffInput | nul
 
   if (!/^[A-Z]{3}$/.test(form.currency)) errors.currency = 'Выберите валюту.';
   const price = parsePriceInput(form.price, form.currency);
+  // 0 is a free tariff (database.TariffInput.Validate accepts it); an empty
+  // field is still an error, so a free tariff is never created by accident.
   if (price === null) {
-    errors.price = isWholeUnits(form.currency) ? 'Цена в звёздах — целое число.' : 'Введите цену, например 199 или 199,90.';
-  } else if (price <= 0) errors.price = 'Цена должна быть больше нуля.';
-  else if (price > TARIFF_LIMITS.maxPriceCents) errors.price = 'Слишком большая цена.';
+    errors.price = isWholeUnits(form.currency) ? 'Цена в звёздах — целое число.' : 'Введите цену, например 199 или 199,90. Для бесплатного тарифа — 0.';
+  } else if (price > TARIFF_LIMITS.maxPriceCents) errors.price = 'Слишком большая цена.';
 
   const description = form.description.replace(/\r\n/g, '\n').trim();
   if (chars(description) > TARIFF_LIMITS.description) errors.description = `Не длиннее ${TARIFF_LIMITS.description} символов.`;

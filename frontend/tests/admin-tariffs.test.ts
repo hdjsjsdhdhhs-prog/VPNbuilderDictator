@@ -75,7 +75,7 @@ describe('tariff form', () => {
 
   it('reports every field outside the server bounds', () => {
     const { input, errors } = validateTariffForm({
-      name: 'я'.repeat(65), planId: null, durationDays: '3651', price: '0', currency: 'RUB',
+      name: 'я'.repeat(65), planId: null, durationDays: '3651', price: '1000001', currency: 'RUB',
       description: 'x'.repeat(501), features: Array.from({ length: 9 }, (_, i) => `f${i}`).join('\n'), badge: 'b'.repeat(25),
       isActive: true, sortOrder: '100001',
     });
@@ -86,6 +86,15 @@ describe('tariff form', () => {
     expect(validateTariffForm({ ...valid(), currency: 'XTR', price: '1,5' }).errors.price).toBe('Цена в звёздах — целое число.');
     expect(validateTariffForm({ ...valid(), durationDays: '0' }).errors.durationDays).toBeDefined();
     expect(validateTariffForm({ ...valid(), sortOrder: '-1' }).errors.sortOrder).toBeDefined();
+  });
+
+  it('accepts a free tariff (price 0) but never an empty price', () => {
+    const free = validateTariffForm({ ...valid(), price: '0' });
+    expect(free.errors).toEqual({});
+    expect(free.input?.price_cents).toBe(0);
+    expect(validateTariffForm({ ...valid(), currency: 'XTR', price: '0' }).input?.price_cents).toBe(0);
+    expect(validateTariffForm({ ...valid(), price: '' }).errors.price).toContain('0');
+    expect(validateTariffForm({ ...valid(), price: '-1' }).errors.price).toBeDefined();
   });
 
   it('counts length in characters, not UTF-16 units', () => {

@@ -1,7 +1,10 @@
 // Pure logic of the source catalogue screens: format labels, sync state and
 // error texts, count labels, entry filters and the per-source summary shown
 // in the Builder. No DOM here; covered by tests/admin-sources.test.ts.
-import type { AdminBuilder, AdminSource, BuilderConfigItemInput, BuilderItem, BuilderPreview, FingerprintStatus, SourceCatalogue, SourceEntry, SourceSyncResult } from './api';
+import type {
+  AdminBuilder, AdminSource, BuilderConfigItemInput, BuilderDependents, BuilderItem, BuilderPreview, DependentRef, FingerprintStatus,
+  SourceCatalogue, SourceDependents, SourceEntry, SourceSyncResult,
+} from './api';
 import { pluralRu } from './tariffs';
 
 /** ProviderSource.type: the expected response format (database.SourceFormats). */
@@ -107,6 +110,64 @@ export function syncResultMessage(r: SourceSyncResult): SyncMessage {
   return { tone: r.status === 'partial' ? 'info' : 'success', text: parts.join(' ') };
 }
 
+// ---------------------------------------------------------------------------
+// Validity of a source (provider_sources.expires_at): the end of the provider's
+// own subscription. Past it the backend skips the source exactly like a
+// disabled one (database.ProviderSource.RequestConfiguration).
+
+/** A source the builders can use right now: switched on and not past its end. */
+export const sourceUsable = (s: Pick<AdminSource, 'enabled' | 'expired'>) => s.enabled && !s.expired;
+
+export type ExpiryState = 'none' | 'active' | 'soon' | 'expired';
+
+/** A source that ends within this window is flagged in the list. */
+export const EXPIRY_SOON_MS = 3 * 24 * 60 * 60 * 1000;
+
+/**
+ * The server flag is authoritative; the local clock only catches a source that
+ * ran out while the page was open.
+ */
+export function expiryState(src: Pick<AdminSource, 'expires_at' | 'expired'>, now: number): ExpiryState {
+  if (src.expired) return 'expired';
+  const at = src.expires_at ? Date.parse(src.expires_at) : NaN;
+  if (Number.isNaN(at)) return 'none';
+  if (at <= now) return 'expired';
+  return at - now <= EXPIRY_SOON_MS ? 'soon' : 'active';
+}
+
+export const EXPIRY_STATE_LABELS: Readonly<Record<Exclude<ExpiryState, 'none' | 'active'>, string>> = {
+  soon: 'Скоро истекает',
+  expired: 'Срок истёк',
+};
+
+// ---------------------------------------------------------------------------
+// Deletion: a source or a builder may be deleted only while nothing depends on
+// it (database.SourceDependents / BuilderDependents). The backend re-checks.
+
+const quoted = (refs: readonly DependentRef[]) => refs.map(r => `«${r.name}»`).join(', ');
+
+/** Why a source cannot be deleted ('' when nothing depends on it). */
+export function sourceDeleteBlocker(d: SourceDependents): string {
+  const parts: string[] = [];
+  if (d.builders.length > 0) {
+    parts.push(`${d.builders.length === 1 ? 'используется построителем' : 'используется построителями'} ${quoted(d.builders)}`);
+  }
+  if (d.subscriptions > 0) {
+    parts.push(`на нём ${pluralRu(d.subscriptions, 'продана', 'проданы', 'продано')} ${countFormat.format(d.subscriptions)} ${pluralRu(d.subscriptions, 'подписка', 'подписки', 'подписок')}`);
+  }
+  return parts.join('; ');
+}
+
+/** Why a builder cannot be deleted ('' when nothing depends on it). */
+export function builderDeleteBlocker(d: BuilderDependents): string {
+  const parts: string[] = [];
+  if (d.plans.length > 0) parts.push(`${d.plans.length === 1 ? 'назначен плану' : 'назначен планам'} ${quoted(d.plans)}`);
+  if (d.subscriptions > 0) {
+    parts.push(`назначен лично ${countFormat.format(d.subscriptions)} ${pluralRu(d.subscriptions, 'подписке', 'подпискам', 'подпискам')}`);
+  }
+  return parts.join('; ');
+}
+
 /** Regional-indicator flag for a two-letter code ('' otherwise). */
 export function flagEmoji(code: string): string {
   if (!/^[A-Z]{2}$/.test(code)) return '';
@@ -142,11 +203,11 @@ export interface BuilderSourceRow { id: number; name: string; summary: string; s
 
 export interface BuilderSourcesSummary {
   rows: BuilderSourceRow[];
-  /** Sum of the present entries of the selected ENABLED sources. */
+  /** Sum of the present entries of the selected USABLE (enabled, not expired) sources. */
   entries: number;
-  /** Distinct country codes across the selected enabled sources. */
+  /** Distinct country codes across the selected usable sources. */
   countries: number;
-  /** Selected sources that are disabled: /sub and Preview skip them. */
+  /** Selected sources that are disabled or expired: /sub and Preview skip them. */
   disabled: number;
 }
 
@@ -155,7 +216,7 @@ export function builderSourcesSummary(sources: readonly AdminSource[]): BuilderS
   let entries = 0;
   let disabled = 0;
   const rows = sources.map(s => {
-    if (s.enabled) {
+    if (sourceUsable(s)) {
       entries += s.catalogue.entries;
       for (const c of s.catalogue.by_country) codes.add(c.code);
     } else {
@@ -336,6 +397,7 @@ export function ruleSummary(item: RuleFields, sources: readonly AdminSource[], s
   let warning = '';
   if (!selectedIds.includes(item.source_id)) warning = 'Источник не подключён к построителю: правило не применяется.';
   else if (src && !src.enabled) warning = 'Источник отключён: правило пропускается.';
+  else if (src?.expired) warning = 'Срок действия источника истёк: правило пропускается.';
   if (item.kind === 'country') {
     const n = countryCount(src, item.country_code);
     if (!warning && src && n === 0) warning = 'В каталоге источника сейчас нет серверов этой страны.';

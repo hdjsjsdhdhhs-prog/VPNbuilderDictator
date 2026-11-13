@@ -14,21 +14,23 @@ import {
   type MonitorHistoryQuery, type MonitorNode, type MonitorOverview, type MonitorPeriod, type MonitorStatus,
 } from './api';
 import {
-  EMPTY_MONITOR_FILTER, FILTER_STATUSES, STATUS_BADGES, STATUS_LABELS, endReasonLabel, errorLabel, filterCountries,
-  formatAgo, formatAvailability, formatDuration, formatLatency, isFiltered, latencyChart, monitorCountryLabel,
-  outageKindLabel, probeLabel, protocolLabel, protocolsOf as monitorProtocolsOf, transitionText, transportLabel,
-  type MonitorFilter,
+  EMPTY_MONITOR_FILTER, FILTER_STATUSES, STATUS_BADGES, STATUS_LABELS, STATUS_TONES, availabilityTone, endReasonLabel, errorLabel,
+  filterCountries, formatAgo, formatAvailability, formatDuration, formatLatency, healthBarLabel, healthSegments, isFiltered,
+  latencyChart, monitorCountryLabel, outageKindLabel, overviewHealth, probeLabel, protocolLabel, protocolsOf as monitorProtocolsOf,
+  transitionText, transportLabel, uptimeCellText, uptimeCells, uptimeSummary,
+  type HealthSummary, type HealthTone, type MonitorFilter,
 } from './monitoring';
 import {
-  BADGE_PRESETS, DURATION_PRESETS, SERVER_FIELDS, TARIFF_CURRENCIES, botButtonLabel, catalogueOrder, durationLabel,
-  featuresFromText, formFromTariff, formatTariffPrice, isRetired, moveItem, parsePriceInput, pluralRu, reorderIds, sameForm,
+  BADGE_PRESETS, DURATION_PRESETS, FREE_PRICE_LABEL, SERVER_FIELDS, TARIFF_CURRENCIES, botButtonLabel, catalogueOrder, durationLabel,
+  featuresFromText, formFromTariff, formatTariffPrice, isFreePrice, isRetired, moveItem, parsePriceInput, pluralRu, reorderIds, sameForm,
   termsChanged, validateTariffForm, type FieldErrors, type TariffField, type TariffForm,
 } from './tariffs';
 import {
-  COUNTRY_CODE, EMPTY_FILTER, RESOLUTION_LABELS, SOURCE_FORMATS, SYNC_STATE_LABELS, builderCardSummary, builderConfigItems, builderSourcesSummary,
-  catalogueSummary, countriesLabel, countryCount, countryLabel, detectedFormatLabel, filterEntries, flagEmoji,
-  formatLabel, normalizeFormat, pickableEntries, previewSummary, protocolsOf, resolveNode, ruleSummary,
-  serversLabel, shortFingerprint, syncErrorText, syncResultMessage, syncState, type EntryFilter, type SyncState,
+  COUNTRY_CODE, EMPTY_FILTER, EXPIRY_STATE_LABELS, RESOLUTION_LABELS, SOURCE_FORMATS, SYNC_STATE_LABELS, builderCardSummary, builderConfigItems,
+  builderDeleteBlocker, builderSourcesSummary, catalogueSummary, countriesLabel, countryCount, countryLabel, detectedFormatLabel,
+  expiryState, filterEntries, flagEmoji, formatLabel, normalizeFormat, pickableEntries, previewSummary, protocolsOf, resolveNode,
+  ruleSummary, serversLabel, shortFingerprint, sourceDeleteBlocker, syncErrorText, syncResultMessage, syncState,
+  type EntryFilter, type SyncState,
 } from './sources';
 import {
   TRIAL_DURATION_PRESETS, TRIAL_LIMITS, TRIAL_SERVER_FIELDS, compositionFromBuilder, countryName, countrySelection,
@@ -38,12 +40,14 @@ import {
 } from './trial';
 import { WarmupApi, parseWarmupRoute, warmupHash, type WarmupRoute } from './warmup';
 import { WarmupScreen, resetWarmupMemory, type WarmupHost } from './warmup-ui';
+import { OpsApi, opsHash, parseOpsRoute, type OpsRoute } from './ops';
+import { OpsScreen, resetOpsMemory, type OpsHost } from './ops-ui';
 
 // ---------------------------------------------------------------------------
 // Icons. Geometry from Lucide (ISC License, https://lucide.dev), vendored so a
 // handful of glyphs does not add a runtime dependency. One family, one stroke.
 
-type IconName = 'overview' | 'users' | 'tariffs' | 'warmup' | 'up' | 'audit' | 'sources' | 'builders' | 'monitoring' | 'logout' | 'menu' | 'close' | 'alert' | 'info' | 'eye' | 'eyeOff' | 'refresh'
+type IconName = 'overview' | 'users' | 'tariffs' | 'promos' | 'warmup' | 'up' | 'audit' | 'sources' | 'builders' | 'monitoring' | 'events' | 'logout' | 'menu' | 'close' | 'alert' | 'info' | 'eye' | 'eyeOff' | 'refresh'
   | 'search' | 'back' | 'prev' | 'next' | 'chevron' | 'check' | 'plus' | 'trash' | 'drag' | 'edit';
 type Shape = readonly ['path' | 'circle' | 'rect', Readonly<Record<string, string>>];
 
@@ -106,6 +110,18 @@ const ICONS: Record<IconName, readonly Shape[]> = {
     ['path', { d: 'M15 3v18' }],
   ],
   monitoring: [['path', { d: 'M22 12h-4l-3 9L9 3l-3 9H2' }]],
+  // Lucide "ticket": promo codes.
+  promos: [
+    ['path', { d: 'M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z' }],
+    ['path', { d: 'M13 5v2' }],
+    ['path', { d: 'M13 17v2' }],
+    ['path', { d: 'M13 11v2' }],
+  ],
+  // Lucide "bell": events and Telegram notifications.
+  events: [
+    ['path', { d: 'M10.268 21a2 2 0 0 0 3.464 0' }],
+    ['path', { d: 'M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326' }],
+  ],
   plus: [['path', { d: 'M12 5v14' }], ['path', { d: 'M5 12h14' }]],
   trash: [
     ['path', { d: 'M3 6h18' }],
@@ -179,7 +195,7 @@ const clock = (date: Date) => date.toLocaleTimeString('ru-RU', { hour: '2-digit'
 // Sections. Overview reads /admin/api/dashboard, Users reads /admin/api/users,
 // the Journal (route #/audit) reads /admin/api/journal.
 
-type SectionId = 'overview' | 'users' | 'tariffs' | 'warmup' | 'audit' | 'sources' | 'builders' | 'monitoring';
+type SectionId = 'overview' | 'users' | 'tariffs' | 'promos' | 'warmup' | 'audit' | 'sources' | 'builders' | 'monitoring' | 'events';
 interface Section {
   id: SectionId;
   label: string;
@@ -201,6 +217,10 @@ const SECTIONS: readonly Section[] = [
     description: 'Предложения для покупки в Mini App и боте: цена, срок, карточка и порядок показа.',
   },
   {
+    id: 'promos', label: 'Промокоды',
+    description: 'Коды со скидкой на оплату подписки. Клиент вводит код в боте рядом с кнопкой покупки, и цены тарифов становятся ниже.',
+  },
+  {
     id: 'warmup', label: 'Прогрев клиентов',
     description: 'Автоматические сообщения в боте: пробный период, окончание подписки и возврат клиентов. Сценарии, тексты, кнопки, скидки и история отправок.',
   },
@@ -217,6 +237,10 @@ const SECTIONS: readonly Section[] = [
     description: 'Доступность серверов, которые построители сейчас выдают клиентам: построитель, страна, сервер. Проверки идут в фоне на уровне handshake протокола.',
   },
   {
+    id: 'events', label: 'События',
+    description: 'Сбои и восстановления серверов, стран, построителей и источников, итоги дня и уведомления в Telegram.',
+  },
+  {
     id: 'audit', label: 'Журнал',
     description: 'История действий пользователей, администраторов и системы: регистрации, подписки и платежи. Записи создаются автоматически и не редактируются.',
   },
@@ -230,9 +254,12 @@ const SECTIONS: readonly Section[] = [
 // Monitoring: #/monitoring, #/monitoring/{builder_id} (countries and servers).
 // Warm-up: #/warmup, #/warmup/create, #/warmup/scenario/{id}, #/warmup/settings,
 // #/warmup/deliveries, #/warmup/coupons (an unknown warm-up path opens #/warmup).
+// Promo codes: #/promos. Events: #/events (feed), #/events/report,
+// #/events/telegram (an unknown events path opens the feed).
 interface Route {
   section: Section; userId: number | null; tariffId: number | 'new' | 'trial' | null; sourceId: number | null; monitorId: number | null;
   warmup: WarmupRoute | null;
+  ops: OpsRoute | null;
 }
 const USER_ROUTE = /^users\/([1-9][0-9]{0,15})$/;
 const TARIFF_ROUTE = /^tariffs\/(new|trial|[1-9][0-9]{0,15})$/;
@@ -241,11 +268,14 @@ const MONITOR_ROUTE = /^monitoring\/([1-9][0-9]{0,15})$/;
 
 function currentRoute(): Route {
   const path = location.hash.replace(/^#\/?/, '');
-  const none = { userId: null, tariffId: null, sourceId: null, monitorId: null, warmup: null };
+  const none = { userId: null, tariffId: null, sourceId: null, monitorId: null, warmup: null, ops: null };
   const warmupSection = SECTIONS.find(section => section.id === 'warmup');
   if (warmupSection && (path === 'warmup' || path.startsWith('warmup/'))) {
     return { ...none, section: warmupSection, warmup: parseWarmupRoute(path) ?? { view: 'overview' } };
   }
+  const ops = parseOpsRoute(path);
+  const opsSection = ops && SECTIONS.find(section => section.id === ops.view);
+  if (ops && opsSection) return { ...none, section: opsSection, ops };
   const match = USER_ROUTE.exec(path);
   const users = SECTIONS.find(section => section.id === 'users');
   if (match && users) {
@@ -965,8 +995,110 @@ const MONITOR_OUTAGE_COLUMNS = [
 
 const MONITOR_PERIOD_LABELS: Readonly<Record<MonitorPeriod, string>> = { '24h': '24 часа', '7d': '7 дней', '30d': '30 дней' };
 
+/** A status badge with a coloured dot: green works, yellow partial, red down. */
 function monitorBadge(status: MonitorStatus): HTMLElement {
-  return el('span', STATUS_BADGES[status], STATUS_LABELS[status]);
+  const badge = el('span', `${STATUS_BADGES[status]} badge-dotted`);
+  badge.append(healthDot(STATUS_TONES[status]), el('span', '', STATUS_LABELS[status]));
+  return badge;
+}
+
+/** A decorative dot of a health tone; the text next to it carries the meaning. */
+function healthDot(tone: HealthTone): HTMLElement {
+  const dot = el('span', `health-dot is-${tone}`);
+  dot.setAttribute('aria-hidden', 'true');
+  return dot;
+}
+
+/** Servers per state as one stacked bar (green / red / neutral). */
+function healthBar(up: number, down: number, unknown: number): HTMLElement {
+  const bar = el('span', 'health-bar');
+  const segments = healthSegments(up, down, unknown);
+  bar.setAttribute('role', 'img');
+  bar.setAttribute('aria-label', segments.length ? `Серверы: ${healthBarLabel(up, down, unknown)}` : 'Серверов нет');
+  bar.title = segments.length ? healthBarLabel(up, down, unknown) : 'Серверов нет';
+  for (const s of segments) {
+    const part = el('span', `health-bar-part is-${s.tone}`);
+    part.style.flexGrow = String(s.count);
+    bar.append(part);
+  }
+  return bar;
+}
+
+/** "99,5 %" coloured by availabilityTone (100 % green, under 99 % red). */
+function availabilityNode(percent: number | null): HTMLElement {
+  const tone = availabilityTone(percent);
+  const node = el('span', `health-value is-${tone}`);
+  node.append(healthDot(tone), el('span', '', formatAvailability(percent)));
+  return node;
+}
+
+/** "3 из 5 работают" with the health bar under it. */
+function serversFact(b: MonitorBuilderSummary): HTMLElement {
+  const value = el('span', 'health-fact');
+  value.append(el('span', '', `${formatCount(b.nodes_up)} из ${formatCount(b.nodes_total)} работают`));
+  if (b.nodes_total > 0) value.append(healthBar(b.nodes_up, b.nodes_down, b.nodes_unknown));
+  return value;
+}
+
+/** The verdict at the top of the overview: one colour for the whole network. */
+function healthBanner(h: HealthSummary): HTMLElement {
+  const panel = el('section', `panel health-banner is-${h.tone}`);
+  panel.setAttribute('aria-labelledby', 'monitor-health-title');
+  const lead = el('div', 'health-lead');
+  const mark = el('span', `health-mark is-${h.tone}`);
+  mark.setAttribute('aria-hidden', 'true');
+  const words = el('div', 'health-words');
+  const title = el('h2', 'health-title', h.title);
+  title.id = 'monitor-health-title';
+  words.append(title, el('p', 'health-text', h.text));
+  lead.append(mark, words);
+
+  const stats = el('dl', 'health-stats');
+  const stat = (label: string, ok: number, total: number, extra?: HTMLElement) => {
+    const item = el('div', 'health-stat');
+    const value = el('dd', 'health-stat-value');
+    value.append(el('strong', '', formatCount(ok)), ` из ${formatCount(total)}`);
+    item.append(el('dt', 'health-stat-label', label), value);
+    if (extra) {
+      const more = el('dd', 'health-stat-extra');
+      more.append(extra);
+      item.append(more);
+    }
+    stats.append(item);
+  };
+  stat('Построители в норме', h.buildersOk, h.builders);
+  stat('Страны работают', h.countriesUp, h.countries);
+  stat('Серверы отвечают', h.nodesUp, h.nodes, healthBar(h.nodesUp, h.nodesDown, h.nodesUnknown));
+  panel.append(lead, stats);
+  return panel;
+}
+
+/** The availability strip of a period: one coloured cell per interval. */
+function uptimeStripNode(h: MonitorHistory): HTMLElement | null {
+  const cells = uptimeCells(h.latency, h.from, h.to, h.step_seconds);
+  if (cells.length === 0) return null;
+  const summary = uptimeSummary(cells);
+  const figure = el('figure', 'uptime');
+  const strip = el('div', 'uptime-strip');
+  strip.setAttribute('role', 'img');
+  strip.setAttribute('aria-label', `Доступность за ${MONITOR_PERIOD_LABELS[h.period]}: ${summary.text}`);
+  for (const c of cells) {
+    const part = el('span', `uptime-cell is-${c.tone}`);
+    part.title = `${formatDateTime(new Date(c.from).toISOString())} – ${formatDateTime(new Date(c.to).toISOString())}: ${uptimeCellText(c)}`;
+    strip.append(part);
+  }
+  const caption = el('figcaption', 'uptime-caption');
+  const verdict = el('span', 'uptime-verdict');
+  verdict.append(healthDot(summary.tone), el('span', '', summary.text));
+  const legend = el('span', 'uptime-legend');
+  for (const [tone, text] of [['ok', 'успешно'], ['warn', 'частично'], ['down', 'сбой'], ['unknown', 'нет проверок']] as const) {
+    const item = el('span', 'uptime-legend-item');
+    item.append(healthDot(tone), el('span', '', text));
+    legend.append(item);
+  }
+  caption.append(verdict, legend);
+  figure.append(strip, caption);
+  return figure;
 }
 
 /** "N s ago" that the page ticker keeps current; the title carries the exact time. */
@@ -1304,6 +1436,22 @@ function enabledBadge(enabled: boolean): HTMLElement {
   return el('span', enabled ? 'badge badge-active' : 'badge badge-disabled', enabled ? 'Включён' : 'Отключён');
 }
 
+/** "Срок истёк" / "Скоро истекает"; null while the source has no limit or it is far away. */
+function expiryBadge(src: AdminSource, now = Date.now()): HTMLElement | null {
+  const state = expiryState(src, now);
+  if (state !== 'expired' && state !== 'soon') return null;
+  const badge = el('span', state === 'expired' ? 'badge badge-danger' : 'badge badge-warn', EXPIRY_STATE_LABELS[state]);
+  if (src.expires_at) badge.title = formatDateTime(src.expires_at);
+  return badge;
+}
+
+/** "Действует до …" for the list and the builder editor ('' without a limit). */
+function expiryText(src: AdminSource, now = Date.now()): string {
+  if (!src.expires_at) return '';
+  const at = formatDateTime(src.expires_at);
+  return expiryState(src, now) === 'expired' ? `Срок истёк ${at}` : `Действует до ${at}`;
+}
+
 const SYNC_BADGE_CLASS: Readonly<Record<SyncState, string>> = {
   never: 'badge badge-disabled', ok: 'badge badge-active', partial: 'badge badge-warn', error: 'badge badge-danger',
 };
@@ -1408,9 +1556,13 @@ class AdminApp {
   // Customer warm-up (#/warmup…): one screen per route, disposed on leaving.
   private readonly warmupApi: WarmupApi;
   private warmupScreen: WarmupScreen | null = null;
+  // Promo codes (#/promos) and events (#/events…): one screen per route.
+  private readonly opsApi: OpsApi;
+  private opsScreen: OpsScreen | null = null;
 
   constructor(private readonly root: HTMLElement, private readonly api: AdminApi) {
     this.warmupApi = new WarmupApi(api);
+    this.opsApi = new OpsApi(api);
     this.toasts.setAttribute('aria-live', 'polite');
     window.addEventListener('beforeunload', event => {
       if (this.unsavedChanges?.()) event.preventDefault();
@@ -1447,6 +1599,7 @@ class AdminApp {
     this.tariffEditorView = null;
     this.trialEditorView = null;
     this.disposeWarmup();
+    this.disposeOps();
     this.overview = null;
     this.usersView = null;
     this.detailView = null;
@@ -1516,6 +1669,7 @@ class AdminApp {
     this.plansCache = null;
     this.orderKey = null;
     resetWarmupMemory();
+    resetOpsMemory();
 
     const card = el('section', 'auth-card');
     card.setAttribute('aria-labelledby', 'login-title');
@@ -1713,10 +1867,10 @@ class AdminApp {
 
   private renderSection(focus: boolean) {
     if (!this.shell) return;
-    const { section, userId, tariffId, sourceId, monitorId, warmup } = currentRoute();
+    const { section, userId, tariffId, sourceId, monitorId, warmup, ops } = currentRoute();
     const canonical = userId !== null ? `#/users/${userId}` : tariffId !== null ? `#/tariffs/${tariffId}`
       : sourceId !== null ? `#/sources/${sourceId}` : monitorId !== null ? `#/monitoring/${monitorId}`
-        : warmup !== null ? warmupHash(warmup) : `#/${section.id}`;
+        : warmup !== null ? warmupHash(warmup) : ops !== null ? opsHash(ops) : `#/${section.id}`;
     if (location.hash !== canonical) history.replaceState(null, '', canonical);
     for (const [id, link] of this.shell.links) {
       if (id === section.id) link.setAttribute('aria-current', 'page');
@@ -1741,6 +1895,7 @@ class AdminApp {
     this.tariffEditorView = null;
     this.trialEditorView = null;
     this.disposeWarmup();
+    this.disposeOps();
     this.unsavedChanges = null;
     this.pendingOrder = null;
     this.tariffsRequest++;
@@ -1780,6 +1935,11 @@ class AdminApp {
       }
       const screen = new WarmupScreen(this.warmupHost(), warmup, { header, title, desc });
       this.warmupScreen = screen;
+      page.append(header, screen.body);
+      load = () => screen.load();
+    } else if (ops !== null) {
+      const screen = new OpsScreen(this.opsHost(), ops, { header, title, desc });
+      this.opsScreen = screen;
       page.append(header, screen.body);
       load = () => screen.load();
     } else if (section.id === 'overview') {
@@ -3286,10 +3446,9 @@ class AdminApp {
     view.meta.textContent = data.builders.length === 0 ? ''
       : filter ? `Найдено: ${formatCount(list.length)} из ${formatCount(data.builders.length)}` : `Всего: ${formatCount(data.builders.length)}`;
 
-    const nodes: HTMLElement[] = [];
-    if (!data.enabled) {
-      nodes.push(notice({ tone: 'info', text: 'Фоновые проверки отключены в конфигурации. Показано последнее сохранённое состояние.' }));
-    }
+    // The verdict first: green means every enabled builder and served server
+    // answers and the checks are running; it also covers "checks disabled".
+    const nodes: HTMLElement[] = [healthBanner(overviewHealth(data, Date.now()))];
     if (data.builders.length === 0) {
       nodes.push(messagePanel('monitoring', 'Проверять пока нечего',
         'Мониторинг проверяет серверы, которые построители выдают клиентам. Создайте построитель — он появится здесь.', 'status'));
@@ -3342,12 +3501,15 @@ class AdminApp {
       note.append(agoNode(b.last_transition.at));
       transition.append(note);
     }
-    const row = el('tr', 'row-link');
+    const servers = countsCell('Серверы', b.nodes_up, b.nodes_total, [['недоступны', b.nodes_down], ['нет данных', b.nodes_unknown]]);
+    if (b.enabled && b.nodes_total > 0) servers.append(healthBar(b.nodes_up, b.nodes_down, b.nodes_unknown));
+    // The coloured edge of the row repeats the status for a quick scan.
+    const row = el('tr', `row-link health-row is-${b.enabled ? STATUS_TONES[b.status] : 'off'}`);
     row.append(
       name,
       cell('Статус', monitorBadge(b.status), 'col-status'),
       countsCell('Страны', b.countries_up, b.countries_total, [['частично', b.countries_degraded], ['недоступны', b.countries_down]]),
-      countsCell('Серверы', b.nodes_up, b.nodes_total, [['недоступны', b.nodes_down], ['нет данных', b.nodes_unknown]]),
+      servers,
       cell('Задержка', formatLatency(b.avg_latency_ms), 'col-md'),
       agoCell('Проверено', b.last_checked_at),
       transition,
@@ -3521,7 +3683,7 @@ class AdminApp {
     facts.append(
       fact('Статус', monitorBadge(b.status)),
       fact('Страны', `${formatCount(b.countries_up)} из ${formatCount(b.countries_total)} работают`, noteOf(countryNotes)),
-      fact('Серверы', `${formatCount(b.nodes_up)} из ${formatCount(b.nodes_total)} работают`, noteOf(nodeNotes)),
+      fact('Серверы', serversFact(b), noteOf(nodeNotes)),
       fact('Средняя задержка', formatLatency(b.avg_latency_ms)),
       fact('Проверено', agoNode(b.last_checked_at)),
       fact('Последний переход', transition),
@@ -3622,7 +3784,7 @@ class AdminApp {
     history.addEventListener('click', () =>
       this.selectMonitorHistory(view, { kind: 'country', country: c.country_code, targetId: null, label }));
 
-    const row = el('tr');
+    const row = el('tr', `health-row is-${STATUS_TONES[c.status]}`);
     row.append(
       cell('Страна', toggle),
       cell('Статус', monitorStatusNode(c.status, c.status_since), 'col-status'),
@@ -3745,10 +3907,13 @@ class AdminApp {
       fact('Сбоев за период', formatCount(s.outages)),
       fact('Недоступность', formatDuration(s.down_seconds)),
       fact('Частичные сбои', formatDuration(s.degraded_seconds)),
-      fact('Доступность', formatAvailability(s.availability), s.availability === null ? 'Считается для страны и сервера' : undefined),
+      fact('Доступность', availabilityNode(s.availability), s.availability === null ? 'Считается для страны и сервера' : undefined),
       fact('Проверок', formatCount(s.checks), s.failures > 0 ? `неудачных: ${formatCount(s.failures)}` : undefined),
     );
-    const out: HTMLElement[] = [facts, latencyChartNode(h)];
+    const out: HTMLElement[] = [facts];
+    const strip = uptimeStripNode(h);
+    if (strip) out.push(strip);
+    out.push(latencyChartNode(h));
     if (h.outages.length === 0) {
       out.push(el('p', 'panel-note', `За ${MONITOR_PERIOD_LABELS[h.period]} сбоев не было.`));
       return out;
@@ -4089,10 +4254,13 @@ class AdminApp {
     const name = el('a', 'source-name', src.name);
     name.href = `#/sources/${src.id}`;
     nameRow.append(name, enabledBadge(src.enabled), syncBadge(state));
+    const expiry = expiryBadge(src);
+    if (expiry) nameRow.append(expiry);
     const stats = el('p', 'source-stats', state === 'never' && src.catalogue.entries === 0
       ? 'Каталог ещё не загружен' : catalogueSummary(src.catalogue));
-    const meta = el('p', 'source-meta', `${formatLabel(src.type)} · ${lastSyncText(src)}`);
+    const meta = el('p', 'source-meta', [formatLabel(src.type), lastSyncText(src), expiryText(src)].filter(Boolean).join(' · '));
     info.append(nameRow, stats, meta);
+    if (src.expired) info.append(el('p', 'source-error', 'Срок действия истёк: построители пропускают источник, как отключённый.'));
     if ((state === 'error' || state === 'partial') && src.last_sync_error) {
       info.append(el('p', state === 'error' ? 'source-error' : 'source-warn', syncErrorText(src.last_sync_error)));
     }
@@ -4114,9 +4282,68 @@ class AdminApp {
     const toggleBtn = button(src.enabled ? 'Отключить' : 'Включить', 'btn btn-secondary btn-xs');
     toggleBtn.setAttribute('aria-label', `${src.enabled ? 'Отключить' : 'Включить'} «${src.name}»`);
     toggleBtn.addEventListener('click', () => void this.toggleSource(src, toggleBtn));
-    acts.append(open, sync, editBtn, toggleBtn);
+    const deleteBtn = button('Удалить', 'btn btn-danger btn-xs', 'trash');
+    deleteBtn.setAttribute('aria-label', `Удалить «${src.name}»`);
+    deleteBtn.addEventListener('click', () => void this.deleteSource(src, deleteBtn));
+    acts.append(open, sync, editBtn, toggleBtn, deleteBtn);
     item.append(info, acts);
     return item;
+  }
+
+  /**
+   * Deletes a source nothing depends on (with its catalogue). A source that is
+   * still referenced is only explained: it can be switched off instead. The
+   * backend re-checks, so a list that went stale ends in a refetch.
+   */
+  private async deleteSource(src: AdminSource, trigger: HTMLButtonElement) {
+    const shown = () => this.sourcesView !== null || this.sourceDetailView?.id === src.id;
+    const blocker = sourceDeleteBlocker(src.dependents);
+    if (blocker) {
+      this.toast(`Источник «${src.name}» нельзя удалить: ${blocker}. Его можно отключить.`);
+      return;
+    }
+    const confirmed = await this.confirmAction(`Удалить источник «${src.name}»?`,
+      'Источник и его каталог серверов будут удалены. Действие нельзя отменить.', 'Удалить');
+    if (!shown()) return;
+    if (!confirmed) { trigger.focus(); return; }
+    trigger.disabled = true;
+    trigger.setAttribute('aria-busy', 'true');
+    try {
+      await this.api.deleteSource(src.id, newRequestKey());
+      this.forgetSource(src.id);
+      this.toast(`Источник «${src.name}» удалён.`);
+      if (this.sourceDetailView?.id === src.id) location.hash = '#/sources';
+    } catch (error) {
+      if (await this.endIfSignedOut(error, shown)) return;
+      if (error instanceof ApiError && error.status === 404) {
+        // Already deleted (another tab): the outcome the admin asked for.
+        this.forgetSource(src.id);
+        this.toast(`Источника «${src.name}» уже нет.`);
+        if (this.sourceDetailView?.id === src.id) location.hash = '#/sources';
+        return;
+      }
+      trigger.disabled = false;
+      trigger.removeAttribute('aria-busy');
+      if (error instanceof ApiError && error.code === 'source_in_use') {
+        this.toast(`Источник «${src.name}» уже используется построителем или подпиской: удалить его нельзя, можно отключить.`);
+        // The dependents on screen are stale: reload them.
+        if (this.sourcesView) void this.loadSources();
+        if (this.sourceDetailView?.id === src.id) void this.loadSourceDetail();
+        return;
+      }
+      this.toast(`Не удалось удалить источник «${src.name}». ${errorText(error)}`);
+    }
+  }
+
+  /** Drops a deleted source from the list cache and repaints the list if it is open. */
+  private forgetSource(id: number) {
+    this.syncNotices.delete(id);
+    if (this.sourcesCache) this.sourcesCache = this.sourcesCache.filter(s => s.id !== id);
+    const view = this.sourcesView;
+    if (view && this.sourcesCache) {
+      const updatedEl = view.refresh.closest('.page-actions')?.querySelector<HTMLElement>('.updated') ?? el('p', 'updated');
+      this.paintSources(view.body, this.sourcesCache, updatedEl);
+    }
   }
 
   /** Keeps the list cache current and repaints the list if it is open. */
@@ -4246,6 +4473,53 @@ class AdminApp {
     const headersF = mkInput('src-headers', 'Дополнительные заголовки', '', 'text',
       'JSON-объект, например {"Authorization": "Bearer …"}. Значения только записываются и не показываются.');
 
+    // End of the provider's own subscription: date and hour, empty = no limit.
+    const expiryInput = el('input', 'input');
+    const initialExpiry = src?.expires_at ? localInputValue(new Date(src.expires_at)) : '';
+    // No `min`: an already expired source keeps its stored value until changed.
+    Object.assign(expiryInput, {
+      id: 'src-expires', name: 'expires_at', type: 'datetime-local', step: '60', value: initialExpiry, max: '9999-12-31T23:59',
+    });
+    const expiryF = field('Действует до', expiryInput);
+    const expiryChips = el('div', 'chips');
+    const setExpiry = (value: string) => {
+      expiryInput.value = value;
+      expiryF.setError('');
+      expiryInput.focus();
+    };
+    for (const days of [30, 90, 365]) {
+      const chip = button(`+${days} дн.`, 'chip');
+      chip.setAttribute('aria-label', `Срок действия: ${days} дней от текущего момента`);
+      chip.addEventListener('click', () => setExpiry(localInputValue(new Date(Date.now() + days * DAY_MS))));
+      expiryChips.append(chip);
+    }
+    const expiryClear = button('Бессрочно', 'chip');
+    expiryClear.setAttribute('aria-label', 'Убрать срок действия: источник бессрочный');
+    expiryClear.addEventListener('click', () => setExpiry(''));
+    expiryChips.append(expiryClear);
+    expiryF.root.append(expiryChips, el('p', 'field-hint',
+      `Дата и час, до которых оплачена подписка у провайдера, в часовом поясе браузера (${timeZoneLabel()}). ` +
+      'Пусто — бессрочно. После этого срока построители пропускают источник, как отключённый.'));
+    expiryInput.addEventListener('input', () => expiryF.setError(''));
+
+    /**
+     * The expires_at to send: no `value` = untouched (the stored end is kept,
+     * so renaming an expired source does not reject its past date), null = no
+     * limit, otherwise RFC 3339; `error` when the value is invalid.
+     */
+    const readExpiry = (): { value?: string | null; error?: string } => {
+      const raw = expiryInput.value;
+      // An incomplete date/time reads as '' too: tell it from a cleared field.
+      if (raw === '' && expiryInput.validity.badInput) return { error: 'Укажите дату и время полностью или очистите поле.' };
+      if (raw === initialExpiry) return isNew ? { value: null } : {};
+      if (raw === '') return { value: null };
+      const date = parseLocalInput(raw);
+      if (!date) return { error: 'Укажите корректные дату и время.' };
+      if (date.getFullYear() > 9999) return { error: 'Год не может быть больше 9999.' };
+      if (date.getTime() <= Date.now()) return { error: 'Срок должен быть в будущем. Чтобы выключить источник сейчас, отключите его.' };
+      return { value: toRFC3339(date) };
+    };
+
     const enabledChk = el('input', 'checkbox');
     enabledChk.type = 'checkbox';
     enabledChk.id = 'src-enabled';
@@ -4273,10 +4547,11 @@ class AdminApp {
     } else {
       body.append(el('p', 'field-hint', 'URL и учётные данные изменить здесь нельзя: они только записываются при создании.'));
     }
-    body.append(enabledRow, statusEl, acts);
+    body.append(expiryF.root, enabledRow, statusEl, acts);
     dialog.append(body);
 
     const fields: Readonly<Record<string, { setError: (t: string) => void; focus: () => void }>> = {
+      expires_at: { setError: expiryF.setError, focus: () => expiryInput.focus() },
       name: { setError: nameF.setError, focus: () => nameF.inp.focus() },
       type: { setError: typeF.setError, focus: () => typeSel.focus() },
       subscription_url: { setError: urlF.setError, focus: () => urlF.inp.focus() },
@@ -4285,6 +4560,7 @@ class AdminApp {
       user_agent: { setError: uaF.setError, focus: () => uaF.inp.focus() },
     };
     const FIELD_ERRORS: Readonly<Record<string, string>> = {
+      expires_at: 'Срок должен быть корректной датой и временем в будущем.',
       name: 'Введите название (до 255 символов).',
       type: 'Выберите формат из списка.',
       subscription_url: 'Нужен полный адрес http:// или https:// без #фрагмента.',
@@ -4323,6 +4599,8 @@ class AdminApp {
         try { const parsed: unknown = JSON.parse(headers); ok = typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed); } catch { ok = false; }
         if (!ok) { headersF.setError(FIELD_ERRORS.headers); headersF.inp.focus(); return; }
       }
+      const expiry = readExpiry();
+      if (expiry.error) { expiryF.setError(expiry.error); expiryInput.focus(); return; }
       submitting = true;
       save.disabled = true; save.setAttribute('aria-busy', 'true');
       setLabel(save, isNew ? 'Создаём и синхронизируем…' : 'Сохраняем…');
@@ -4334,6 +4612,7 @@ class AdminApp {
             subscription_url: url, hwid: hwidF.inp.value.trim(),
             user_agent: uaF.inp.value.trim(), headers,
             enabled: enabledChk.checked,
+            expires_at: expiry.value ?? null,
           };
           const created = await this.api.createSource(input);
           if (!isOpen()) return;
@@ -4343,7 +4622,10 @@ class AdminApp {
           this.toast('Источник создан.');
           location.hash = `#/sources/${created.source.id}`;
         } else {
-          const input: UpdateSourceInput = { name, description: descF.inp.value.trim(), type: typeSel.value };
+          const input: UpdateSourceInput = {
+            name, description: descF.inp.value.trim(), type: typeSel.value,
+            ...(expiry.value !== undefined ? { expires_at: expiry.value } : {}),
+          };
           const updated = await this.api.updateSource(src!.id, input);
           if (!isOpen()) return;
           this.replaceSource(updated);
@@ -4478,7 +4760,7 @@ class AdminApp {
     const entries = view.entries ?? [];
     setLoading(view.body, null);
     view.title.textContent = src.name;
-    view.desc.textContent = `${formatLabel(src.type)} · ${src.enabled ? 'включён' : 'отключён'}${src.description ? ` · ${src.description}` : ''}`;
+    view.desc.textContent = `${formatLabel(src.type)} · ${src.enabled ? 'включён' : 'отключён'}${src.expired ? ' · срок истёк' : ''}${src.description ? ` · ${src.description}` : ''}`;
     document.title = `${src.name} · Источники · DictatorVPN Admin`;
     const last = this.syncNotices.get(src.id);
     view.status.replaceChildren(...(last && !view.syncing ? [notice(last)] : []));
@@ -4501,14 +4783,22 @@ class AdminApp {
         state === 'error' ? 'is-danger' : ''),
       fact('Когда', src.last_sync_at ? formatDateTime(src.last_sync_at) : 'Ещё не было',
         state === 'error' ? 'Показан каталог последней успешной синхронизации' : undefined),
+      fact('Действует до', src.expires_at ? formatDateTime(src.expires_at) : 'Бессрочно',
+        expiryState(src, Date.now()) === 'expired' ? 'Срок истёк: построители пропускают источник, как отключённый'
+          : src.expires_at ? relativeTime(src.expires_at, Date.now()) : undefined,
+        expiryState(src, Date.now()) === 'expired' ? 'is-danger' : ''),
     );
     const manage = el('div', 'source-detail-actions');
     const editBtn = button('Изменить', 'btn btn-secondary btn-sm', 'edit');
     editBtn.addEventListener('click', () => this.openSourceEditor(src));
     const toggleBtn = button(src.enabled ? 'Отключить' : 'Включить', 'btn btn-secondary btn-sm');
     toggleBtn.addEventListener('click', () => void this.toggleSource(src, toggleBtn));
-    manage.append(editBtn, toggleBtn);
+    const deleteBtn = button('Удалить', 'btn btn-danger btn-sm', 'trash');
+    deleteBtn.addEventListener('click', () => void this.deleteSource(src, deleteBtn));
+    manage.append(editBtn, toggleBtn, deleteBtn);
     summary.append(panelHead('src-summary-title', 'Сводка', catalogueSummary(c)), facts, manage);
+    const deleteBlocker = sourceDeleteBlocker(src.dependents);
+    if (deleteBlocker) summary.append(el('p', 'panel-note', `Удалить нельзя: ${deleteBlocker}. Источник можно отключить.`));
 
     // Countries ------------------------------------------------------------
     const countries = el('section', 'panel');
@@ -4687,9 +4977,64 @@ class AdminApp {
     editBtn.addEventListener('click', () => void this.openSavedBuilder(b.id, editBtn));
     const toggleBtn = button(b.enabled ? 'Отключить' : 'Включить', 'btn btn-secondary btn-xs');
     toggleBtn.addEventListener('click', () => void this.toggleBuilder(b, toggleBtn));
-    acts.append(editBtn, toggleBtn);
+    const deleteBtn = button('Удалить', 'btn btn-danger btn-xs', 'trash');
+    deleteBtn.setAttribute('aria-label', `Удалить «${b.name}»`);
+    deleteBtn.addEventListener('click', () => void this.deleteBuilder(b, deleteBtn));
+    acts.append(editBtn, toggleBtn, deleteBtn);
     item.append(info, acts);
     return item;
+  }
+
+  /**
+   * Deletes a builder nothing depends on (with its source links and rules). A
+   * builder a plan or a subscription still uses is only explained: it can be
+   * switched off instead. The backend re-checks the dependents and the loaded
+   * version, so a stale list ends in a refetch.
+   */
+  private async deleteBuilder(b: AdminBuilder, trigger: HTMLButtonElement) {
+    const shown = () => this.buildersView !== null;
+    const blocker = builderDeleteBlocker(b.dependents);
+    if (blocker) {
+      this.toast(`Построитель «${b.name}» нельзя удалить: ${blocker}. Его можно отключить.`);
+      return;
+    }
+    const confirmed = await this.confirmAction(`Удалить построитель «${b.name}»?`,
+      'Построитель, его список источников и правила будут удалены. Действие нельзя отменить.', 'Удалить');
+    if (!shown()) return;
+    if (!confirmed) { trigger.focus(); return; }
+    trigger.disabled = true;
+    trigger.setAttribute('aria-busy', 'true');
+    try {
+      await this.api.deleteBuilder(b.id, b.version, newRequestKey());
+      this.forgetBuilder(b.id);
+      this.toast(`Построитель «${b.name}» удалён.`);
+    } catch (error) {
+      if (await this.endIfSignedOut(error, shown)) return;
+      if (error instanceof ApiError && error.status === 404) {
+        // Already deleted (another tab): the outcome the admin asked for.
+        this.forgetBuilder(b.id);
+        this.toast(`Построителя «${b.name}» уже нет.`);
+        return;
+      }
+      trigger.disabled = false;
+      trigger.removeAttribute('aria-busy');
+      if (error instanceof ApiError && (error.code === 'builder_in_use' || error.code === 'version_conflict')) {
+        this.toast(error.code === 'builder_in_use'
+          ? `Построитель «${b.name}» уже назначен плану или подписке: удалить его нельзя, можно отключить.`
+          : `Построитель «${b.name}» изменили в другом окне. Список обновлён, повторите удаление.`);
+        // The list on screen is stale: reload it.
+        void this.loadBuilders();
+        return;
+      }
+      this.toast(`Не удалось удалить построитель «${b.name}». ${errorText(error)}`);
+    }
+  }
+
+  /** Drops a deleted builder from the list cache and repaints the list if it is open. */
+  private forgetBuilder(id: number) {
+    if (this.buildersCache) this.buildersCache = this.buildersCache.filter(x => x.id !== id);
+    const view = this.buildersView;
+    if (view && this.buildersCache) this.paintBuilders(view.body, this.buildersCache, el('p', 'updated'));
   }
 
   private async toggleBuilder(b: AdminBuilder, btn: HTMLButtonElement) {
@@ -4861,6 +5206,8 @@ class AdminApp {
       meta.append(el('span', 'source-pick-stats', state === 'never' && src.catalogue.entries === 0
         ? 'каталог не загружен' : catalogueSummary(src.catalogue)), syncBadge(state));
       if (!src.enabled) meta.append(enabledBadge(false));
+      const expiry = expiryBadge(src);
+      if (expiry) meta.append(expiry);
       return meta;
     };
     const renderSourcesPicker = () => {
@@ -4907,7 +5254,7 @@ class AdminApp {
       // Sources are merged only here: the total is the sum of the selected
       // catalogues, countries are counted once across them.
       const total = builderSourcesSummary(selected);
-      const skipped = total.disabled > 0 ? ` Отключённые (${formatCount(total.disabled)}) не учитываются: сборка их пропускает.` : '';
+      const skipped = total.disabled > 0 ? ` Отключённые и с истёкшим сроком (${formatCount(total.disabled)}) не учитываются: сборка их пропускает.` : '';
       sourcesTotal.textContent = selected.length === 0 ? 'Источники не выбраны.'
         : `Итого: ${serversLabel(total.entries)} · ${countriesLabel(total.countries)} (уникальных) из ${formatCount(selected.length)} ${pluralRu(selected.length, 'источника', 'источников', 'источников')}.${skipped}`;
       setupDragReorder(sourcesListEl, 'source-pick-selected', (newOrder) => {
@@ -5385,8 +5732,9 @@ class AdminApp {
       sourceHint.textContent = !src ? ''
         : !selectedIds.includes(src.id) ? 'Источник не подключён к построителю: такое правило не применяется. Выберите подключённый источник.'
           : !src.enabled ? 'Источник отключён: сборка его пропускает.'
-            : syncState(src) === 'never' ? 'Источник ещё не синхронизирован: каталог пуст.'
-              : `Каталог: ${catalogueSummary(src.catalogue)} · ${lastSyncText(src)}`;
+            : src.expired ? 'Срок действия источника истёк: сборка его пропускает.'
+              : syncState(src) === 'never' ? 'Источник ещё не синхронизирован: каталог пуст.'
+                : `Каталог: ${catalogueSummary(src.catalogue)} · ${lastSyncText(src)}`;
       fillCountries();
     };
     const updateKind = () => {
@@ -6042,6 +6390,10 @@ class AdminApp {
     const price = textInput('tf-price', 'decimal');
     const priceField = field('Цена', price);
     register('price', price, priceField.setError);
+    // A price of 0 is a free tariff: one chip instead of typing it.
+    const priceChips = chipGroup('Быстрый выбор цены', [{ value: '0', text: FREE_PRICE_LABEL }],
+      value => { price.value = value; priceField.setError(''); sync(); });
+    priceField.root.append(priceChips.group);
     const priceHint = hint(priceField.root, '');
 
     const currency = el('select', 'input');
@@ -6093,7 +6445,7 @@ class AdminApp {
 
     const textControls = [name, duration, price, description, features, badge, sort];
     const choiceControls = [plan, currency, active];
-    const chips = [...durationChips.chips, ...badgeChips.chips];
+    const chips = [...durationChips.chips, ...priceChips.chips, ...badgeChips.chips];
 
     const read = (): TariffForm => ({
       // Same key order as formFromTariff: sameForm compares serialized forms.
@@ -6230,10 +6582,20 @@ class AdminApp {
       bot.setAttribute('role', 'group');
       bot.setAttribute('aria-label', 'Кнопка в боте');
       bot.append(el('p', 'preview-caption', 'Кнопка в боте'));
-      if (code === 'XTR') bot.append(el('p', 'field-hint', 'Не показывается: оплата Telegram Stars доступна только в Mini App.'));
-      else bot.append(el('span', 'bot-button', botButtonLabel(title, amount ?? 0)));
+      const free = isFreePrice(amount);
+      if (free) {
+        bot.append(el('span', 'bot-button', botButtonLabel(title, 0)),
+          el('p', 'field-hint', 'После нажатия бот предложит «Получить бесплатно»: оплата не нужна.'));
+      } else if (code === 'XTR') {
+        bot.append(el('p', 'field-hint', 'Не показывается: оплата Telegram Stars доступна только в Mini App.'));
+      } else {
+        bot.append(el('span', 'bot-button', amount === null ? `${title} — …` : botButtonLabel(title, amount)));
+      }
 
-      const nodes: HTMLElement[] = [el('p', 'preview-caption', 'Карточка в Mini App'), card, bot];
+      // A free tariff has no Mini App card: the Mini App only sells.
+      const nodes: HTMLElement[] = free
+        ? [bot, el('p', 'field-hint', 'В Mini App бесплатный тариф не показывается: там только покупка.')]
+        : [el('p', 'preview-caption', 'Карточка в Mini App'), card, bot];
       if (!form.isActive) nodes.push(el('p', 'field-hint', 'Тариф скрыт: покупатели не увидят его, пока он не включён.'));
       previewBody.replaceChildren(...nodes);
     };
@@ -6339,9 +6701,13 @@ class AdminApp {
       for (const paint of counters) paint();
       for (const chip of durationChips.chips) chip.setAttribute('aria-pressed', String(chip.dataset.value === form.durationDays.trim()));
       for (const chip of badgeChips.chips) chip.setAttribute('aria-pressed', String(chip.dataset.value === form.badge.trim()));
-      priceHint.textContent = form.currency === 'XTR'
-        ? 'Целое число звёзд Telegram Stars. Такой тариф продаётся только в Mini App.'
-        : 'Например 199 или 199,90. Тариф в рублях продаётся через бота.';
+      const free = isFreePrice(parsePriceInput(form.price, form.currency));
+      for (const chip of priceChips.chips) chip.setAttribute('aria-pressed', String(free));
+      priceHint.textContent = free
+        ? 'Бесплатный тариф: клиент получает его в боте без оплаты, кнопкой «Получить бесплатно». Взять его снова можно после окончания срока; при действующей платной подписке он недоступен. В Mini App не показывается.'
+        : form.currency === 'XTR'
+          ? 'Целое число звёзд Telegram Stars. Такой тариф продаётся только в Mini App. Для бесплатного тарифа укажите 0.'
+          : 'Например 199 или 199,90. Тариф в рублях продаётся через бота. Для бесплатного тарифа укажите 0.';
       const count = featuresFromText(form.features).length;
       featuresHint.textContent = `По одному в строке, не больше ${TARIFF_LIMITS.features} пунктов по ${TARIFF_LIMITS.feature} символов. Сейчас: ${count}.`;
       paintTerms();
@@ -7035,7 +7401,7 @@ class AdminApp {
             form.rules = rulesForSources(form.rules, form.sourceIds);
             onCompositionChange();
           });
-          row.append(box, el('span', '', src.name), el('span', 'slot-status', `${catalogueSummary(src.catalogue)}${src.enabled ? '' : ' · отключён'}`));
+          row.append(box, el('span', '', src.name), el('span', 'slot-status', `${catalogueSummary(src.catalogue)}${src.enabled ? '' : ' · отключён'}${src.expired ? ' · срок истёк' : ''}`));
           list.append(row);
         }
         nodes.push(list);
@@ -7499,6 +7865,26 @@ class AdminApp {
         this.unsavedChanges = null;
         location.hash = hash;
       },
+      sessionUsed: () => { this.lastSessionCheck = Date.now(); },
+    };
+  }
+
+  // Promo codes and events -----------------------------------------------------
+
+  private disposeOps() {
+    this.opsScreen?.dispose();
+    this.opsScreen = null;
+  }
+
+  /** What a promo/events screen may use of the shell: session, dialogs, guard. */
+  private opsHost(): OpsHost {
+    return {
+      api: this.opsApi,
+      icon: name => icon(name),
+      toast: text => this.toast(text),
+      confirm: (titleText, text, confirmLabel) => this.confirmAction(titleText, text, confirmLabel),
+      setUnsaved: check => { this.unsavedChanges = check; },
+      signedOut: (error, current) => this.endIfSignedOut(error, current),
       sessionUsed: () => { this.lastSessionCheck = Date.now(); },
     };
   }

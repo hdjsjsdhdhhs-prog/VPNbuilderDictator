@@ -173,7 +173,7 @@ func TestAdminWarmupAPI_OverviewSettingsAndReplay(t *testing.T) {
 	f.login()
 
 	overview := f.okDo(http.MethodGet, "/admin/api/warmup")
-	assert.Len(t, overview["scenarios"], 14)
+	assert.Len(t, overview["scenarios"], 15)
 	assert.Len(t, overview["categories"], 3)
 	assert.Contains(t, overview, "summary")
 	assert.Contains(t, overview["registry"], "callbacks")
@@ -214,9 +214,10 @@ func TestAdminWarmupAPI_ListAndGetScenarios(t *testing.T) {
 	count := func(query string) int {
 		return len(f.okDo(http.MethodGet, "/admin/api/warmup/scenarios"+query)["scenarios"].([]any))
 	}
-	assert.Equal(t, 14, count(""))
+	// 053_promo_ops adds trial_ended_discount (category trial, created disabled).
+	assert.Equal(t, 15, count(""))
 	assert.Equal(t, 3, count("?category=subscription"))
-	assert.Equal(t, 3, count("?enabled=false"))
+	assert.Equal(t, 4, count("?enabled=false"))
 	assert.Equal(t, 11, count("?enabled=true"))
 	assert.Equal(t, 5, count("?trigger=paid_expired"))
 	names := f.okDo(http.MethodGet, "/admin/api/warmup/scenarios?order=name")["scenarios"].([]any)

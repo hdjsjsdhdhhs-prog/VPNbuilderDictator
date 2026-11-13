@@ -125,10 +125,17 @@ func TestHandleBuyPremiumList_SuccessShowsProducts(t *testing.T) {
 	require.NotNil(t, edit.ReplyMarkup, "product list must carry the BuyProductList keyboard")
 	require.NotEmpty(t, edit.ReplyMarkup.InlineKeyboard)
 
-	for _, row := range edit.ReplyMarkup.InlineKeyboard[:len(edit.ReplyMarkup.InlineKeyboard)-1] {
+	// Product rows, then the promo code entry, then the way back.
+	rows := edit.ReplyMarkup.InlineKeyboard
+	require.Len(t, rows, 4)
+	for _, row := range rows[:len(rows)-2] {
 		require.NotNil(t, row[0].CallbackData)
 		assert.Contains(t, *row[0].CallbackData, "buy_product_", "product rows use buy_product_{id} callbacks")
 	}
+	require.NotNil(t, rows[2][0].CallbackData)
+	assert.Equal(t, "promo_enter", *rows[2][0].CallbackData, "the promo code is entered next to the prices")
+	require.NotNil(t, rows[3][0].CallbackData)
+	assert.Equal(t, "back_to_start", *rows[3][0].CallbackData)
 }
 
 // The bot shows products in the catalogue order returned by
@@ -153,7 +160,8 @@ func TestHandleBuyPremiumList_KeepsCatalogueSortOrder(t *testing.T) {
 	require.True(t, ok)
 	require.NotNil(t, edit.ReplyMarkup)
 	rows := edit.ReplyMarkup.InlineKeyboard
-	require.Len(t, rows, 4)
+	// Three tariffs, the promo code entry and the way back.
+	require.Len(t, rows, 5)
 	var callbacks []string
 	for _, row := range rows[:3] {
 		require.NotNil(t, row[0].CallbackData)
@@ -204,7 +212,8 @@ func TestHandleBuyProduct_TariffUnavailable(t *testing.T) {
 	}{
 		{name: "nil product", product: nil},
 		{name: "inactive product", product: &database.Product{ID: 1, Name: "Месяц", PriceCents: 19900, IsActive: false}},
-		{name: "free product", product: &database.Product{ID: 1, Name: "Free", PriceCents: 0, IsActive: true}},
+		{name: "inactive free product", product: &database.Product{ID: 1, Name: "Free", PriceCents: 0, IsActive: false}},
+		{name: "negative price", product: &database.Product{ID: 1, Name: "Broken", PriceCents: -1, IsActive: true}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -224,6 +233,62 @@ func TestHandleBuyProduct_TariffUnavailable(t *testing.T) {
 			assert.Contains(t, messages[0].Text, "Тариф недоступен")
 		})
 	}
+}
+
+// A free tariff (price 0) is not "unavailable": it is offered for a free
+// activation and never sent to the payment provider.
+func TestHandleBuyProduct_FreeTariffOffersFreeActivation(t *testing.T) {
+	t.Parallel()
+
+	mockDB := testutil.NewDatabaseService()
+	mockDB.GetProductByIDFunc = func(context.Context, uint) (*database.Product, error) {
+		return &database.Product{ID: 7, Name: "Free", PriceCents: 0, DurationDays: 30, IsActive: true}, nil
+	}
+	h, bot := newPaymentTestHandler(t, mockDB, fakePaymentProvider{})
+
+	require.NoError(t, h.handleBuyProduct(context.Background(), 42, "user", 99, 7))
+
+	edit, ok := bot.LastChattableSafe().(tgbotapi.EditMessageTextConfig)
+	require.True(t, ok)
+	assert.Contains(t, edit.Text, "Этот тариф бесплатный")
+	assert.Contains(t, edit.Text, "30 дн.")
+	require.NotNil(t, edit.ReplyMarkup)
+	rows := edit.ReplyMarkup.InlineKeyboard
+	require.Len(t, rows, 2)
+	require.NotNil(t, rows[0][0].CallbackData)
+	assert.Equal(t, "get_free_7", *rows[0][0].CallbackData)
+	assert.Nil(t, rows[0][0].URL, "a free tariff has no payment link")
+}
+
+// The promo code entry: the prompt opens, the next text is consumed as the
+// code exactly once, and an expired or closed prompt is not a code.
+func TestPromoPrompts(t *testing.T) {
+	t.Parallel()
+
+	var prompts promoPrompts
+	now := time.Now()
+	assert.False(t, prompts.take(1, now), "nothing was asked")
+
+	prompts.open(1, now)
+	assert.True(t, prompts.take(1, now.Add(time.Minute)))
+	assert.False(t, prompts.take(1, now.Add(time.Minute)), "a prompt is consumed once")
+
+	prompts.open(2, now)
+	assert.False(t, prompts.take(2, now.Add(promoPromptTTL+time.Second)), "an expired prompt is not a code")
+
+	prompts.open(3, now)
+	prompts.close(3)
+	assert.False(t, prompts.take(3, now))
+}
+
+func TestTariffPriceLabel(t *testing.T) {
+	t.Parallel()
+
+	product := database.Product{Name: "Месяц", PriceCents: 20000}
+	assert.Equal(t, "200₽", tariffPriceLabel(TariffOffer{Product: product, AmountCents: 20000}))
+	assert.Equal(t, "150₽ вместо 200₽", tariffPriceLabel(TariffOffer{Product: product, AmountCents: 15000}))
+	assert.Equal(t, "Бесплатно", tariffPriceLabel(TariffOffer{Product: product, AmountCents: 0}))
+	assert.Equal(t, "Бесплатно", tariffPriceLabel(TariffOffer{Product: database.Product{PriceCents: 0}, AmountCents: 0}))
 }
 
 func TestHandleBuyProduct_PaymentDisabled(t *testing.T) {

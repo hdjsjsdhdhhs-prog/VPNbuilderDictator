@@ -11,7 +11,13 @@ import type { Page, Route } from '@playwright/test';
 //             sync keeps the previous catalogue
 //   preview   database.PreviewBuilder (country rules expand to every present
 //             entry of the country, node rules resolve by fingerprint then by a
-//             unique name, unlinked/disabled sources are skipped)
+//             unique name, unlinked/disabled/expired sources are skipped)
+//   validity  provider_sources.expires_at: null = no limit, a new end must be
+//             in the future, an omitted member keeps the stored one; `expired`
+//             is evaluated on the server clock
+//   deletion  database.DeleteProviderSource / DeleteBuilder: only while
+//             nothing depends on the row (409 source_in_use | builder_in_use),
+//             a builder also needs the loaded version (409 version_conflict)
 // URLs are placeholders: no real provider address or credential is used.
 
 const CSRF = 'c'.repeat(43);
@@ -28,7 +34,9 @@ type EntryInput = Pick<Entry, 'fingerprint' | 'original_name' | 'protocol' | 'co
 interface Source {
   id: number; name: string; type: string; description: string; enabled: boolean;
   last_sync_at: string | null; last_sync_status: string; last_sync_error: string;
+  expires_at: string | null;
 }
+interface DependentRef { id: number; name: string }
 
 /** The next upstream answer of a source: a parsed catalogue or a failure code. */
 type Outcome = { entries: EntryInput[]; skipped?: number; format?: string } | { error: string };
@@ -40,6 +48,7 @@ interface Item {
 interface Builder {
   id: number; name: string; description: string; enabled: boolean; profile_title: string; support_url: string; announce: string;
   version: number; sources: { source_id: number; position: number }[]; items: Item[];
+  dependents?: { plans: DependentRef[]; subscriptions: number };
 }
 interface Call { method: string; path: string; body: Record<string, unknown> }
 
@@ -52,13 +61,27 @@ const CATALOGUE_A = [
 ];
 const CATALOGUE_B = [e('b1', '🇺🇸 New York', 'US'), e('b2', '🇺🇸 Dallas', 'US'), e('b3', '🇩🇪 Munich', 'DE')];
 
-const CREATE_FIELDS = ['name', 'description', 'type', 'subscription_url', 'hwid', 'user_agent', 'headers', 'enabled'];
+const CREATE_FIELDS = ['name', 'description', 'type', 'subscription_url', 'hwid', 'user_agent', 'headers', 'enabled', 'expires_at'];
+const UPDATE_FIELDS = ['name', 'description', 'type', 'expires_at'];
+/** The form the panel sends expires_at in: RFC 3339, UTC, whole seconds. */
+const RFC3339_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 const ITEM_FIELDS = ['id', 'kind', 'source_id', 'country_code', 'fingerprint', 'original_name', 'custom_name', 'description', 'position', 'enabled'];
 const BUILDER_FIELDS = ['request_key', 'version', 'name', 'description', 'enabled', 'profile_title', 'support_url', 'announce'];
 const CONFIG_FIELDS = [...BUILDER_FIELDS, 'source_ids', 'items'];
 const CONFIG_ITEM_FIELDS = ['id', 'kind', 'source_id', 'country_code', 'fingerprint', 'original_name', 'custom_name', 'description', 'enabled'];
 
-async function backend(page: Page, options: { outcomes?: Record<number, Outcome[]>; builderSources?: number[] } = {}) {
+interface BackendOptions {
+  outcomes?: Record<number, Outcome[]>;
+  builderSources?: number[];
+  /** Stored validity end per source id. */
+  expiresAt?: Record<number, string>;
+  /** Subscriptions sold directly on a source, per source id. */
+  sold?: Record<number, number>;
+  /** Plans whose default builder is the fixture builder. */
+  plans?: DependentRef[];
+}
+
+async function backend(page: Page, options: BackendOptions = {}) {
   let clock = Date.parse(T0);
   const now = () => new Date(clock += 60_000).toISOString();
   let nextEntryId = 1;
@@ -96,7 +119,7 @@ async function backend(page: Page, options: { outcomes?: Record<number, Outcome[
 
   const addSource = (over: Partial<Source> & { id: number; name: string }, catalogue: EntryInput[] | null) => {
     const src: Source = {
-      type: 'auto', description: '', enabled: true, last_sync_at: null, last_sync_status: '', last_sync_error: '', ...over,
+      type: 'auto', description: '', enabled: true, last_sync_at: null, last_sync_status: '', last_sync_error: '', expires_at: null, ...over,
     };
     sources.push(src);
     if (catalogue) applySync(src, { entries: catalogue });
@@ -108,6 +131,12 @@ async function backend(page: Page, options: { outcomes?: Record<number, Outcome[
   addSource({ id: 2, name: 'Provider B', type: 'json' }, CATALOGUE_B);
   const broken = addSource({ id: 3, name: 'Broken', type: 'base64' }, null);
   applySync(broken, { error: 'timeout' });
+  for (const [id, at] of Object.entries(options.expiresAt ?? {})) sources.find(s => s.id === Number(id))!.expires_at = at;
+  const sold = new Map<number, number>(Object.entries(options.sold ?? {}).map(([k, v]) => [Number(k), v]));
+  const builderDeps = { plans: [...(options.plans ?? [])], subscriptions: 0 };
+  let sourceListReads = 0;
+  /** database.ProviderSource.Expired on the server clock. */
+  const expired = (src: Source) => src.expires_at !== null && Date.parse(src.expires_at) <= Date.now();
 
   const builders: Builder[] = [{
     id: 7, name: 'Основной', description: '', enabled: true, profile_title: '', support_url: '', announce: '', version: 1,
@@ -120,6 +149,7 @@ async function backend(page: Page, options: { outcomes?: Record<number, Outcome[
     ...b,
     sources: [...b.sources].sort((x, y) => x.position - y.position),
     items: [...b.items].sort((x, y) => x.position - y.position),
+    dependents: builderDeps,
   });
 
   /** service.SourceView: metadata and catalogue statistics, never the URL or credentials. */
@@ -140,6 +170,13 @@ async function backend(page: Page, options: { outcomes?: Record<number, Outcome[
         entries: live.length, countries: counts.size, no_country: live.filter(x => !x.country_code).length,
         absent: mine.length - live.length, by_country, protocols,
       },
+      expired: expired(src),
+      // database.SourceDependents: builders that link the source or have a rule on it.
+      dependents: {
+        builders: builders.filter(b => b.sources.some(s => s.source_id === src.id) || b.items.some(i => i.source_id === src.id))
+          .map(b => ({ id: b.id, name: b.name })),
+        subscriptions: sold.get(src.id) ?? 0,
+      },
     };
   };
   const presentOf = (id: number) => entries.filter(x => x.source_id === id && x.present).sort((a, b) => a.upstream_position - b.upstream_position);
@@ -147,7 +184,10 @@ async function backend(page: Page, options: { outcomes?: Record<number, Outcome[
   /** database.PreviewBuilder. */
   const preview = (b: Builder) => {
     const linked = new Set(b.sources.map(s => s.source_id));
-    const usable = (id: number) => sources.find(s => s.id === id)?.enabled ?? false;
+    const usable = (id: number) => {
+      const src = sources.find(s => s.id === id);
+      return src !== undefined && src.enabled && !expired(src);
+    };
     const items: unknown[] = [];
     const warnings: string[] = [];
     const seen = new Set<string>();
@@ -205,7 +245,10 @@ async function backend(page: Page, options: { outcomes?: Record<number, Outcome[
       return json(route, 200, { authenticated: true, csrf_token: CSRF });
     }
     if (method === 'GET') {
-      if (pathname === '/admin/api/sources') return json(route, 200, { sources: sources.map(view) });
+      if (pathname === '/admin/api/sources') {
+        sourceListReads++;
+        return json(route, 200, { sources: sources.map(view) });
+      }
       const one = /^\/admin\/api\/sources\/(\d+)$/.exec(pathname);
       if (one) {
         const src = sources.find(s => s.id === Number(one[1]));
@@ -252,8 +295,15 @@ async function backend(page: Page, options: { outcomes?: Record<number, Outcome[
       if (unknown(CREATE_FIELDS).length) { problems.push(`unknown fields ${unknown(CREATE_FIELDS)}`); return json(route, 400, { error: 'invalid_request' }); }
       const url = String(body.subscription_url);
       if (!/^https?:\/\/[^\s/#]+/.test(url) || url.includes('rejected')) return json(route, 400, { error: 'invalid_source', field: 'subscription_url' });
+      const until = body.expires_at ?? null;
+      if (until !== null && (typeof until !== 'string' || !RFC3339_UTC.test(until) || Date.parse(until) <= Date.now())) {
+        return json(route, 400, { error: 'invalid_source', field: 'expires_at' });
+      }
       const id = Math.max(...sources.map(s => s.id)) + 1;
-      const src = addSource({ id, name: String(body.name), type: String(body.type), description: String(body.description), enabled: Boolean(body.enabled) }, null);
+      const src = addSource({
+        id, name: String(body.name), type: String(body.type), description: String(body.description), enabled: Boolean(body.enabled),
+        expires_at: until,
+      }, null);
       const sync = { ...applySync(src, outcomes.get(id)?.shift() ?? { entries: [] }) };
       return json(route, 201, { source: view(src), sync: { ...sync, source: view(src) } });
     }
@@ -274,9 +324,51 @@ async function backend(page: Page, options: { outcomes?: Record<number, Outcome[
       return json(route, 200, view(src));
     }
 
+    const oneSource = /^\/admin\/api\/sources\/(\d+)$/.exec(pathname);
+    if (oneSource && (method === 'PATCH' || method === 'DELETE')) {
+      const src = sources.find(s => s.id === Number(oneSource[1]));
+      if (!src) return json(route, 404, { error: 'not_found' });
+      // service.UpdateSource: an omitted expires_at keeps the stored end, the
+      // stored value re-sent is accepted, any other end must be in the future.
+      if (method === 'PATCH') {
+        if (unknown(UPDATE_FIELDS).length) { problems.push(`unknown fields ${unknown(UPDATE_FIELDS)}`); return json(route, 400, { error: 'invalid_request' }); }
+        if ('expires_at' in body) {
+          const until = body.expires_at;
+          const unchanged = typeof until === 'string' && src.expires_at !== null && Date.parse(until) === Date.parse(src.expires_at);
+          if (until !== null && !unchanged && (typeof until !== 'string' || !RFC3339_UTC.test(until) || Date.parse(until) <= Date.now())) {
+            return json(route, 400, { error: 'invalid_source', field: 'expires_at' });
+          }
+          if (!unchanged) src.expires_at = until as string | null;
+        }
+        Object.assign(src, { name: String(body.name), description: String(body.description), type: String(body.type) });
+        return json(route, 200, view(src));
+      }
+      // database.DeleteProviderSource: only while nothing depends on the source.
+      if (unknown(['request_key']).length || !KEY_PATTERN.test(String(body.request_key))) {
+        problems.push(`source delete body ${JSON.stringify(body)}`);
+        return json(route, 400, { error: 'invalid_request' });
+      }
+      const deps = view(src).dependents;
+      if (deps.builders.length > 0 || deps.subscriptions > 0) return json(route, 409, { error: 'source_in_use' });
+      sources.splice(sources.indexOf(src), 1);
+      for (let i = entries.length - 1; i >= 0; i--) if (entries[i].source_id === src.id) entries.splice(i, 1);
+      return json(route, 200, { deleted: src.id, audit: {} });
+    }
+
     const bm = /^\/admin\/api\/builders\/(\d+)(?:\/(sources|items|reorder|preview|enable|disable|configuration))?(?:\/(\d+))?$/.exec(pathname);
     const b = bm ? builders.find(x => x.id === Number(bm[1])) : undefined;
     if (bm && !b) return json(route, 404, { error: 'not_found' });
+    // database.DeleteBuilder: the loaded version, and nothing may depend on it.
+    if (b && method === 'DELETE' && !bm![2]) {
+      if (unknown(['request_key', 'version']).length || !KEY_PATTERN.test(String(body.request_key))) {
+        problems.push(`builder delete body ${JSON.stringify(body)}`);
+        return json(route, 400, { error: 'invalid_request' });
+      }
+      if (body.version !== b.version) return json(route, 409, { error: 'version_conflict' });
+      if (builderDeps.plans.length > 0 || builderDeps.subscriptions > 0) return json(route, 409, { error: 'builder_in_use' });
+      builders.splice(builders.indexOf(b), 1);
+      return json(route, 200, { deleted: b.id, audit: {} });
+    }
     // database.SaveBuilderConfiguration: one transaction, expected version,
     // rule ids must be rules of this builder, position = index.
     if (b && method === 'PUT' && bm![2] === 'configuration') {
@@ -309,11 +401,11 @@ async function backend(page: Page, options: { outcomes?: Record<number, Outcome[
       if (body.version !== b.version) return json(route, 409, { error: 'version_conflict' });
       Object.assign(b, { name: body.name, description: body.description, enabled: body.enabled, profile_title: body.profile_title,
         support_url: body.support_url, announce: body.announce, version: b.version + 1 });
-      return json(route, 200, { builder: b, audit: {} });
+      return json(route, 200, { builder: stored(b), audit: {} });
     }
     if (b && method === 'PUT' && bm![2] === 'sources') {
       b.sources = (body.source_ids as number[]).map((source_id, position) => ({ source_id, position }));
-      return json(route, 200, b);
+      return json(route, 200, stored(b));
     }
     if (b && method === 'POST' && bm![2] === 'items') {
       if (unknown(ITEM_FIELDS).length) { problems.push(`item fields ${unknown(ITEM_FIELDS)}`); return json(route, 400, { error: 'invalid_request' }); }
@@ -360,6 +452,13 @@ async function backend(page: Page, options: { outcomes?: Record<number, Outcome[
     queue: (id: number, ...next: Outcome[]) => outcomes.set(id, [...(outcomes.get(id) ?? []), ...next]),
     /** The upstream changed and a background sync ran (another admin, scheduler). */
     resync: (id: number, catalogue: EntryInput[]) => applySync(sources.find(s => s.id === id)!, { entries: catalogue }),
+    /** Ids of the stored sources / builders. */
+    sourceIds: () => sources.map(s => s.id),
+    builderIds: () => builders.map(x => x.id),
+    /** GET requests of the source list. */
+    sourceListReads: () => sourceListReads,
+    /** A subscription was sold directly on the source meanwhile. */
+    sell: (id: number, count: number) => sold.set(id, count),
   };
 }
 
@@ -445,7 +544,7 @@ test.describe('sources', () => {
     const [create] = api.calls('/admin/api/sources', 'POST');
     expect(create.body).toEqual({
       name: 'Nordic', description: '', type: 'auto', subscription_url: SECRET_URL, hwid: '', user_agent: '',
-      headers: '{"X-Client": "panel"}', enabled: true,
+      headers: '{"X-Client": "panel"}', enabled: true, expires_at: null,
     });
     // The initial sync ran on the server as part of the create request.
     expect(api.calls(/\/refresh$/)).toHaveLength(0);
@@ -914,6 +1013,291 @@ test.describe('builder uses the source catalogue', () => {
     await dialog.getByRole('button', { name: 'Запустить предпросмотр' }).click();
     await expect(dialog.locator('.preview-body .preview-stats')).toHaveText('В подписке: 0 серверов · 0 стран');
     await expect(dialog.locator('.preview-warn')).toContainText('is not linked to the builder');
+    expect(api.problems()).toEqual([]);
+  });
+});
+
+// The browser runs in UTC (playwright.admin.config.ts), so a datetime-local
+// value is the UTC wall clock; dates are relative to the real clock because
+// the panel validates against Date.now().
+const inDays = (days: number) => new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 16);
+/** A datetime-local value as the panel prints it (ru-RU, dd.mm.yyyy, hh:mm). */
+const printed = (local: string) => `${local.slice(8, 10)}.${local.slice(5, 7)}.${local.slice(0, 4)}, ${local.slice(11, 16)}`;
+const toasts = (page: Page) => page.locator('.toast-region');
+const sourceDeletes = (api: Awaited<ReturnType<typeof backend>>) => api.calls(/^\/admin\/api\/sources\/\d+$/, 'DELETE');
+const builderDeletes = (api: Awaited<ReturnType<typeof backend>>) => api.calls(/^\/admin\/api\/builders\/\d+$/, 'DELETE');
+
+test.describe('source validity end', () => {
+  test('create: the end is validated, sent in UTC and shown in the list and details', async ({ page }) => {
+    const api = await backend(page, { outcomes: { 4: [{ entries: [e('n1', '🇫🇮 Helsinki', 'FI')] }] } });
+    await page.goto('/#/sources');
+    await page.getByRole('button', { name: 'Добавить источник' }).first().click();
+    const dialog = page.getByRole('dialog', { name: 'Новый источник' });
+    await dialog.getByLabel('Название').fill('Termed');
+    await dialog.getByLabel('URL подписки').fill(SECRET_URL);
+    const until = dialog.getByLabel('Действует до');
+    await expect(until).toHaveValue('');
+    const submit = dialog.getByRole('button', { name: 'Создать и синхронизировать' });
+
+    // A past end would switch the source off the moment it is saved.
+    await until.fill('2020-01-01T10:00');
+    await submit.click();
+    await expect(dialog.getByText('Срок должен быть в будущем. Чтобы выключить источник сейчас, отключите его.')).toBeVisible();
+    await expect(until).toHaveAttribute('aria-invalid', 'true');
+    expect(api.calls('/admin/api/sources', 'POST')).toHaveLength(0);
+
+    // Presets fill a future end and clear the error; "Бессрочно" empties the field.
+    await dialog.getByRole('button', { name: 'Срок действия: 30 дней от текущего момента' }).click();
+    await expect(until).toHaveValue(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/);
+    await expect(until).not.toHaveAttribute('aria-invalid', 'true');
+    await dialog.getByRole('button', { name: 'Убрать срок действия: источник бессрочный' }).click();
+    await expect(until).toHaveValue('');
+
+    const local = inDays(40);
+    await until.fill(local);
+    await submit.click();
+    await expect(heading(page, 'Termed')).toBeVisible();
+    const [create] = api.calls('/admin/api/sources', 'POST');
+    expect(create.body.expires_at).toBe(`${local}:00Z`);
+    await expect(region(page, 'Сводка')).toContainText('Действует до');
+    await expect(region(page, 'Сводка')).toContainText(printed(local));
+
+    await page.goto('/#/sources');
+    const row = region(page, 'Источники').getByRole('listitem', { name: 'Termed' });
+    await expect(row.locator('.source-meta')).toContainText(`Действует до ${printed(local)}`);
+    await expect(row).not.toContainText('Срок истёк');
+    await expect(row).not.toContainText('Скоро истекает');
+    // A source without a limit says nothing about it.
+    await expect(region(page, 'Источники').getByRole('listitem', { name: 'Provider A' })).not.toContainText('Действует до');
+    expect(api.problems()).toEqual([]);
+  });
+
+  test('edit: an untouched end is not sent, a new one replaces it, "Бессрочно" clears it', async ({ page }) => {
+    const stored = inDays(10);
+    const api = await backend(page, { expiresAt: { 1: `${stored}:00Z` } });
+    await page.goto('/#/sources');
+    const list = region(page, 'Источники');
+    const patches = () => api.calls('/admin/api/sources/1', 'PATCH');
+    const save = async (dialogName: string, edit: (dialog: ReturnType<Page['getByRole']>) => Promise<void>) => {
+      const dialog = page.getByRole('dialog', { name: dialogName });
+      await expect(dialog).toBeVisible();
+      await edit(dialog);
+      await dialog.getByRole('button', { name: 'Сохранить' }).click();
+      await expect(page.getByRole('dialog')).toHaveCount(0);
+    };
+
+    await list.getByRole('button', { name: 'Изменить «Provider A»' }).click();
+    await save('Источник: Provider A', async dialog => {
+      await expect(dialog.getByLabel('Действует до')).toHaveValue(stored);
+      await dialog.getByLabel('Название').fill('Provider A2');
+    });
+    // The member is absent: the server keeps the stored end.
+    expect(patches()[0].body).toEqual({ name: 'Provider A2', description: '', type: 'auto' });
+    const row = list.getByRole('listitem', { name: 'Provider A2' });
+    await expect(row.locator('.source-meta')).toContainText(`Действует до ${printed(stored)}`);
+
+    const later = inDays(90);
+    await list.getByRole('button', { name: 'Изменить «Provider A2»' }).click();
+    await save('Источник: Provider A2', dialog => dialog.getByLabel('Действует до').fill(later));
+    expect(patches()[1].body).toEqual({ name: 'Provider A2', description: '', type: 'auto', expires_at: `${later}:00Z` });
+    await expect(row.locator('.source-meta')).toContainText(`Действует до ${printed(later)}`);
+
+    await list.getByRole('button', { name: 'Изменить «Provider A2»' }).click();
+    await save('Источник: Provider A2', dialog => dialog.getByRole('button', { name: 'Убрать срок действия: источник бессрочный' }).click());
+    expect(patches()[2].body).toEqual({ name: 'Provider A2', description: '', type: 'auto', expires_at: null });
+    await expect(row).not.toContainText('Действует до');
+    expect(api.problems()).toEqual([]);
+  });
+
+  test('an expired source is flagged, left out of the builder totals and comes back when extended', async ({ page }) => {
+    const api = await backend(page, { builderSources: [1, 2], expiresAt: { 1: `${inDays(2)}:00Z`, 2: '2020-01-01T00:00:00Z' } });
+    await page.goto('/#/sources');
+    const list = region(page, 'Источники');
+    const b = list.getByRole('listitem', { name: 'Provider B' });
+    // Expiry does not flip the admin switch: both badges are shown.
+    await expect(b).toContainText('Включён');
+    await expect(b).toContainText('Срок истёк');
+    await expect(b.locator('.source-error')).toHaveText('Срок действия истёк: построители пропускают источник, как отключённый.');
+    await expect(b.locator('.source-meta')).toContainText('Срок истёк 01.01.2020, 00:00');
+    // Less than three days left.
+    await expect(list.getByRole('listitem', { name: 'Provider A' })).toContainText('Скоро истекает');
+    await expect(list.getByRole('listitem', { name: 'Broken' })).not.toContainText('истек');
+
+    await openDetail(page, 2, 'Provider B');
+    await expect(region(page, 'Сводка')).toContainText('Срок истёк: построители пропускают источник, как отключённый');
+    await expect(page.locator('body')).toContainText('включён · срок истёк');
+
+    // The builder editor counts only what /sub would serve.
+    const dialog = await openBuilder(page);
+    await expect(dialog.locator('.source-pick-item', { hasText: 'Provider B' })).toContainText('Срок истёк');
+    await expect(dialog.locator('.sources-total')).toHaveText(
+      'Итого: 5 серверов · 2 страны (уникальных) из 2 источников. Отключённые и с истёкшим сроком (1) не учитываются: сборка их пропускает.');
+    await dialog.getByRole('button', { name: 'Запустить предпросмотр' }).click();
+    await expect(dialog.locator('.preview-body .preview-stats')).toHaveText('В подписке: 5 серверов · 2 страны');
+    await dialog.getByRole('button', { name: 'Закрыть' }).click();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+
+    // Renaming an expired source does not reject its past end...
+    await page.goto('/#/sources');
+    await list.getByRole('button', { name: 'Изменить «Provider B»' }).click();
+    let editor = page.getByRole('dialog', { name: 'Источник: Provider B' });
+    await expect(editor.getByLabel('Действует до')).toHaveValue('2020-01-01T00:00');
+    await editor.getByLabel('Описание').fill('renewal pending');
+    await editor.getByRole('button', { name: 'Сохранить' }).click();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    expect(api.calls('/admin/api/sources/2', 'PATCH')[0].body).toEqual({ name: 'Provider B', description: 'renewal pending', type: 'json' });
+    await expect(b).toContainText('Срок истёк');
+
+    // ...and extending it brings the source back.
+    await list.getByRole('button', { name: 'Изменить «Provider B»' }).click();
+    editor = page.getByRole('dialog', { name: 'Источник: Provider B' });
+    await editor.getByRole('button', { name: 'Срок действия: 90 дней от текущего момента' }).click();
+    await editor.getByRole('button', { name: 'Сохранить' }).click();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(b).not.toContainText('Срок истёк');
+    await expect(b.locator('.source-error')).toHaveCount(0);
+    expect(api.problems()).toEqual([]);
+  });
+
+  test('a server rejection of the end is shown on the field', async ({ page }) => {
+    const api = await backend(page);
+    // The server clock is ahead of the browser: the end the panel accepted is already past there.
+    await page.route('**/admin/api/sources/3', async route => {
+      if (route.request().method() !== 'PATCH') return route.fallback();
+      await route.fulfill({ status: 400, contentType: 'application/json', body: JSON.stringify({ error: 'invalid_source', field: 'expires_at' }) });
+    });
+    await page.goto('/#/sources');
+    await region(page, 'Источники').getByRole('button', { name: 'Изменить «Broken»' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Источник: Broken' });
+    await dialog.getByLabel('Действует до').fill(inDays(1));
+    await dialog.getByRole('button', { name: 'Сохранить' }).click();
+    await expect(dialog.getByText('Срок должен быть корректной датой и временем в будущем.')).toBeVisible();
+    await expect(dialog.getByLabel('Действует до')).toHaveAttribute('aria-invalid', 'true');
+    await expect(dialog.getByLabel('Действует до')).toBeFocused();
+    expect(api.problems()).toEqual([]);
+  });
+});
+
+test.describe('deleting sources and builders', () => {
+  test('source: explained while used, confirmed and removed when free', async ({ page }) => {
+    const api = await backend(page);
+    await page.goto('/#/sources');
+    const list = region(page, 'Источники');
+    await expect(list.locator('.panel-meta')).toHaveText('3 · 8 серверов всего');
+
+    // Linked to the builder: nothing is asked and nothing is sent.
+    await list.getByRole('button', { name: 'Удалить «Provider A»' }).click();
+    await expect(toasts(page)).toContainText('Источник «Provider A» нельзя удалить: используется построителем «Основной». Его можно отключить.');
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    expect(sourceDeletes(api)).toHaveLength(0);
+
+    // Cancelling keeps the source.
+    await list.getByRole('button', { name: 'Удалить «Broken»' }).click();
+    const confirm = page.getByRole('dialog', { name: 'Удалить источник «Broken»?' });
+    await expect(confirm).toContainText('Источник и его каталог серверов будут удалены. Действие нельзя отменить.');
+    await confirm.getByRole('button', { name: 'Отмена' }).click();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(list.getByRole('listitem', { name: 'Broken' })).toBeVisible();
+    expect(sourceDeletes(api)).toHaveLength(0);
+
+    await list.getByRole('button', { name: 'Удалить «Broken»' }).click();
+    await page.getByRole('dialog', { name: 'Удалить источник «Broken»?' }).getByRole('button', { name: 'Удалить' }).click();
+    await expect(list.getByRole('listitem', { name: 'Broken' })).toHaveCount(0);
+    await expect(toasts(page)).toContainText('Источник «Broken» удалён.');
+    await expect(list.locator('.panel-meta')).toHaveText('2 · 8 серверов всего');
+    const [del] = sourceDeletes(api);
+    expect(del.path).toBe('/admin/api/sources/3');
+    expect(Object.keys(del.body)).toEqual(['request_key']);
+    expect(String(del.body.request_key)).toMatch(KEY_PATTERN);
+    expect(api.sourceIds()).toEqual([1, 2]);
+    expect(api.problems()).toEqual([]);
+  });
+
+  test('source: a list that went stale is corrected by the server and reloaded', async ({ page }) => {
+    const api = await backend(page);
+    await page.goto('/#/sources');
+    const list = region(page, 'Источники');
+    await expect(list.getByRole('listitem', { name: 'Provider B' })).toBeVisible();
+    // Subscriptions were sold on the source after the list was loaded.
+    api.sell(2, 3);
+    const reads = api.sourceListReads();
+    await list.getByRole('button', { name: 'Удалить «Provider B»' }).click();
+    await page.getByRole('dialog', { name: 'Удалить источник «Provider B»?' }).getByRole('button', { name: 'Удалить' }).click();
+    await expect(toasts(page)).toContainText('Источник «Provider B» уже используется построителем или подпиской: удалить его нельзя, можно отключить.');
+    await expect(list.getByRole('listitem', { name: 'Provider B' })).toBeVisible();
+    await expect.poll(() => api.sourceListReads()).toBeGreaterThan(reads);
+    expect(api.sourceIds()).toEqual([1, 2, 3]);
+
+    // The details page explains why and offers switching off instead.
+    await openDetail(page, 2, 'Provider B');
+    await expect(region(page, 'Сводка')).toContainText('Удалить нельзя: на нём проданы 3 подписки. Источник можно отключить.');
+    await region(page, 'Сводка').getByRole('button', { name: 'Удалить' }).click();
+    await expect(toasts(page)).toContainText('Источник «Provider B» нельзя удалить: на нём проданы 3 подписки. Его можно отключить.');
+    expect(sourceDeletes(api)).toHaveLength(1);
+    expect(api.problems()).toEqual([]);
+  });
+
+  test('source: deleting from the details page returns to the list', async ({ page }) => {
+    const api = await backend(page);
+    await openDetail(page, 3, 'Broken');
+    await expect(region(page, 'Сводка')).not.toContainText('Удалить нельзя');
+    await region(page, 'Сводка').getByRole('button', { name: 'Удалить' }).click();
+    await page.getByRole('dialog', { name: 'Удалить источник «Broken»?' }).getByRole('button', { name: 'Удалить' }).click();
+    await expect(page).toHaveURL(/#\/sources$/);
+    await expect(heading(page, 'Источники')).toBeVisible();
+    await expect(region(page, 'Источники').getByRole('listitem', { name: 'Broken' })).toHaveCount(0);
+    await expect(region(page, 'Источники').getByRole('listitem', { name: 'Provider A' })).toBeVisible();
+    expect(sourceDeletes(api)).toHaveLength(1);
+    expect(api.problems()).toEqual([]);
+  });
+
+  test('builder: a plan that uses it blocks the deletion', async ({ page }) => {
+    const api = await backend(page, { plans: [{ id: 2, name: 'Trial' }] });
+    await page.goto('/#/builders');
+    await page.getByRole('button', { name: 'Удалить «Основной»' }).click();
+    await expect(toasts(page)).toContainText('Построитель «Основной» нельзя удалить: назначен плану «Trial». Его можно отключить.');
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    expect(builderDeletes(api)).toHaveLength(0);
+    expect(api.problems()).toEqual([]);
+  });
+
+  test('builder: the loaded version is checked, then it is removed and frees its sources', async ({ page }) => {
+    const api = await backend(page);
+    await page.goto('/#/builders');
+    const remove = page.getByRole('button', { name: 'Удалить «Основной»' });
+    await expect(remove).toBeVisible();
+    await expect(page.locator('.builder-meta')).toHaveText('v1 · 1 источник · 0 правил');
+
+    // Another tab saved the builder: the stale card must not delete it.
+    api.changeBuilder(b => { b.version = 5; });
+    await remove.click();
+    const confirm = page.getByRole('dialog', { name: 'Удалить построитель «Основной»?' });
+    await expect(confirm).toContainText('Построитель, его список источников и правила будут удалены. Действие нельзя отменить.');
+    await confirm.getByRole('button', { name: 'Удалить' }).click();
+    await expect(toasts(page)).toContainText('Построитель «Основной» изменили в другом окне. Список обновлён, повторите удаление.');
+    await expect(page.locator('.builder-meta')).toHaveText('v5 · 1 источник · 0 правил');
+    expect(api.builderIds()).toEqual([7]);
+
+    await page.getByRole('button', { name: 'Удалить «Основной»' }).click();
+    await page.getByRole('dialog', { name: 'Удалить построитель «Основной»?' }).getByRole('button', { name: 'Удалить' }).click();
+    await expect(page.getByText('Построителей пока нет')).toBeVisible();
+    await expect(toasts(page)).toContainText('Построитель «Основной» удалён.');
+    const deletes = builderDeletes(api);
+    expect(deletes.map(c => c.body.version)).toEqual([1, 5]);
+    for (const c of deletes) {
+      expect(Object.keys(c.body).sort()).toEqual(['request_key', 'version']);
+      expect(String(c.body.request_key)).toMatch(KEY_PATTERN);
+    }
+    // A retry is a new request, not a replay of the rejected one.
+    expect(deletes[0].body.request_key).not.toBe(deletes[1].body.request_key);
+    expect(api.builderIds()).toEqual([]);
+
+    // Its source is no longer referenced and can be deleted now.
+    await page.goto('/#/sources');
+    await region(page, 'Источники').getByRole('button', { name: 'Удалить «Provider A»' }).click();
+    await page.getByRole('dialog', { name: 'Удалить источник «Provider A»?' }).getByRole('button', { name: 'Удалить' }).click();
+    await expect(region(page, 'Источники').getByRole('listitem', { name: 'Provider A' })).toHaveCount(0);
+    expect(api.sourceIds()).toEqual([2, 3]);
     expect(api.problems()).toEqual([]);
   });
 });

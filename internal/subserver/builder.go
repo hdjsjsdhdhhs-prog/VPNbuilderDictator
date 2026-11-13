@@ -72,9 +72,12 @@ type builderAggregate struct {
 
 // builderCacheKey derives the response cache key for a builder-served
 // subscription. It covers the builder version/metadata, the linked sources
-// (updated_at, enabled, last catalogue sync) and every item rule, so any
-// configuration change is served fresh instead of from a stale cache entry.
+// (updated_at, enabled, expired, last catalogue sync) and every item rule, so
+// any configuration change is served fresh instead of from a stale cache
+// entry. A source running out of its validity is not a database change, so
+// its expired state at the moment of the request is part of the key too.
 func builderCacheKey(subID string, b *database.SubscriptionBuilder) string {
+	now := time.Now()
 	h := sha256.New()
 	fmt.Fprintf(h, "b|%d|%d|%d|%t|%q|%q|%q\n",
 		b.ID, b.Version, b.UpdatedAt.UnixNano(), b.Enabled, b.ProfileTitle, b.SupportURL, b.Announce)
@@ -86,7 +89,7 @@ func builderCacheKey(subID string, b *database.SubscriptionBuilder) string {
 			if s.Source.LastSyncAt != nil {
 				lastSync = s.Source.LastSyncAt.UnixNano()
 			}
-			fmt.Fprintf(h, "|%d|%t|%d", s.Source.UpdatedAt.UnixNano(), s.Source.Enabled, lastSync)
+			_, _ = fmt.Fprintf(h, "|%d|%t|%d|%t", s.Source.UpdatedAt.UnixNano(), s.Source.Enabled, lastSync, s.Source.Expired(now))
 		}
 		fmt.Fprint(h, "\n")
 	}

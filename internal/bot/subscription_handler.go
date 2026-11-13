@@ -358,46 +358,22 @@ func (sh *SubscriptionHandler) handleBuyPremiumList(ctx context.Context, chatID 
 		zap.Int64("chat_id", chatID),
 		zap.String("username", username))
 
-	if sh.h.orderService == nil || !sh.h.paymentEnabled {
+	if sh.h.orderService == nil {
 		return sh.showBuyError(chatID, messageID, "❌ Платежи временно недоступны")
 	}
 
-	products, err := sh.h.db.ListActiveProducts(ctx)
-	if err != nil {
-		logger.Warn("list active products failed", zap.Error(err))
-		return sh.showBuyError(chatID, messageID, msg(MsgSubTempError))
-	}
+	// Paid tariffs need the payment provider; free tariffs are offered even
+	// without it. Prices are shown for this customer (active discount applied).
+	sh.h.promoPrompts.close(chatID)
 
-	// This is the legacy payment menu. XTR checkout belongs to the authenticated
-	// Purchase Foundation flow, never to external-provider callbacks.
-	legacyProducts := make([]database.Product, 0, len(products))
-	for _, product := range products {
-		if product.Currency != "XTR" {
-			legacyProducts = append(legacyProducts, product)
-		}
-	}
-	products = legacyProducts
-	if len(products) == 0 {
-		editMsg := tgbotapi.NewEditMessageText(chatID, messageID, "❌ Нет доступных тарифов")
-		kb := sh.h.keyboards.Back()
-		editMsg.ReplyMarkup = &kb
-		sh.h.safeSend(editMsg)
-
-		return nil
-	}
-
-	editMsg := tgbotapi.NewEditMessageText(chatID, messageID, msg(MsgPremiumBenefits))
-	editMsg.ParseMode = tgbotapi.ModeMarkdown
-	keyboard := sh.h.keyboards.BuyProductList(products)
-	editMsg.ReplyMarkup = &keyboard
-	sh.h.safeSend(editMsg)
-
-	return nil
+	return sh.showTariffList(ctx, chatID, messageID, "")
 }
 
-// handleBuyProduct creates a Platega payment link for a specific product.
+// handleBuyProduct opens one tariff: a tariff that costs nothing (a free
+// tariff or a 100 % discount) is offered for a free activation, anything else
+// gets a Platega payment link for the amount this customer pays.
 func (sh *SubscriptionHandler) handleBuyProduct(ctx context.Context, chatID int64, username string, messageID int, productID uint) error {
-	if sh.h.orderService == nil || !sh.h.paymentEnabled {
+	if sh.h.orderService == nil {
 		return sh.showBuyError(chatID, messageID, "❌ Платежи временно недоступны")
 	}
 
@@ -407,8 +383,18 @@ func (sh *SubscriptionHandler) handleBuyProduct(ctx context.Context, chatID int6
 		return sh.showBuyError(chatID, messageID, msg(MsgSubTempError))
 	}
 
-	if product == nil || !product.IsActive || product.PriceCents <= 0 {
+	if product == nil || !product.IsActive || product.PriceCents < 0 {
 		return sh.showBuyError(chatID, messageID, "❌ Тариф недоступен")
+	}
+
+	quote := sh.h.orderService.Quote(ctx, chatID, product)
+	if quote.Free() {
+		sh.showFreeConfirm(chatID, messageID, product, quote.Discount)
+		return nil
+	}
+
+	if !sh.h.paymentEnabled {
+		return sh.showBuyError(chatID, messageID, "❌ Платежи временно недоступны")
 	}
 
 	logger.Info("Payment purchase requested",
@@ -419,9 +405,13 @@ func (sh *SubscriptionHandler) handleBuyProduct(ctx context.Context, chatID int6
 		zap.Int64("amount_cents", product.PriceCents),
 		zap.String("currency", product.Currency))
 
-	info, _, err := sh.h.orderService.RequestPayment(ctx, chatID, username, product)
+	info, order, err := sh.h.orderService.RequestPayment(ctx, chatID, username, product)
 	if err != nil {
 		switch {
+		case errors.Is(err, service.ErrNothingToPay):
+			// The discount was activated between the quote and the request.
+			sh.showFreeConfirm(chatID, messageID, product, quote.Discount)
+			return nil
 		case errors.Is(err, service.ErrPaymentDisabled):
 			return sh.showBuyError(chatID, messageID, "❌ Платежи временно недоступны")
 		case errors.Is(err, service.ErrPaymentAlreadyInProgress):
@@ -438,11 +428,28 @@ func (sh *SubscriptionHandler) handleBuyProduct(ctx context.Context, chatID int6
 		return sh.showBuyError(chatID, messageID, msg(MsgSubTempError))
 	}
 
-	text := fmt.Sprintf("Тариф: 💎 *%s*\n\nСтоимость: *%s*\n\nПосле оплаты тариф активируется автоматически.\nЕсли тариф уже активен, новые дни прибавятся к текущему сроку.\n\n_Платёжная система может дополнительно взимать комиссию._",
-		utils.EscapeMarkdown(product.Name), utils.FormatPriceCents(product.PriceCents))
+	// The amount to pay is the one of the payment intent: the catalogue price
+	// lowered by the customer's discount.
+	amount := product.PriceCents
+	if order != nil && order.AmountCents > 0 {
+		amount = order.AmountCents
+	}
+
+	price := "*" + utils.FormatPriceCents(amount) + "*"
+	if amount < product.PriceCents {
+		price += " вместо " + utils.FormatPriceCents(product.PriceCents)
+		// A lowered intent always carries the customer's current discount: an
+		// intent priced with another one is released by RequestPayment.
+		if quote.Discount != nil {
+			price += fmt.Sprintf(" (скидка %d%%)", quote.Discount.Percent)
+		}
+	}
+
+	text := fmt.Sprintf("Тариф: 💎 *%s*\n\nСтоимость: %s\n\nПосле оплаты тариф активируется автоматически.\nЕсли тариф уже активен, новые дни прибавятся к текущему сроку.\n\n_Платёжная система может дополнительно взимать комиссию._",
+		utils.EscapeMarkdown(product.Name), price)
 	editMsg := tgbotapi.NewEditMessageText(chatID, messageID, text)
 	editMsg.ParseMode = "Markdown"
-	keyboard := sh.h.keyboards.BuyProductConfirm(product, info.URL)
+	keyboard := sh.h.keyboards.TariffPay(amount, info.URL)
 	editMsg.ReplyMarkup = &keyboard
 	sh.h.safeSend(editMsg)
 

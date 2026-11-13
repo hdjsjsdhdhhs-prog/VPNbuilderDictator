@@ -37,7 +37,7 @@ const (
 // label values. Known commands are returned as-is; anything else becomes "unknown".
 func normalizeCommand(cmd string) string {
 	switch cmd {
-	case "start", "help", "invite", "mysub", "del", "setplan", "broadcast", "broadcasts", "send", "refstats", "v", "lastreg":
+	case "start", "help", "invite", "mysub", "promo", "del", "setplan", "broadcast", "broadcasts", "send", "refstats", "v", "lastreg":
 		return cmd
 	default:
 		return "unknown"
@@ -76,6 +76,8 @@ type Handler struct {
 	version             string
 	referral            *ReferralHandler
 	warmupContacts      WarmupContactRecorder
+	// promoPrompts: chats the bot asked for a promo code (see promo.go).
+	promoPrompts promoPrompts
 
 	// Admin rate limiting (separate from user rate limit)
 	adminRateLimiters map[int64]*ratelimiter.TokenBucket
@@ -428,7 +430,9 @@ func (h *Handler) getMainMenuContent(ctx context.Context, username string, hasSu
 		} else if h.paymentEnabled && h.isFreePlanSubscription(ctx, sub) {
 			text += "\n\n" + msg(MsgPremiumMenuTeaser)
 		}
-		keyboard = h.getMainMenuKeyboard(true)
+		// The purchase row is shown when the payment provider is on or there
+		// is a free tariff to get.
+		keyboard = h.keyboards.MainMenu(true, h.purchaseMenuAvailable(ctx))
 	} else {
 		text = msg(MsgStartGreetingNoSub, username)
 		keyboard = tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("📥 Получить подписку", "create_subscription")))
@@ -724,6 +728,8 @@ func (h *Handler) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 				err = h.HandleInvite(ctx, update)
 			case "mysub":
 				err = h.HandleMySub(ctx, update)
+			case "promo":
+				err = h.HandlePromo(ctx, update)
 			case "del":
 				err = h.HandleDel(ctx, update)
 			case "setplan":
@@ -749,6 +755,9 @@ func (h *Handler) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 			// treat it as the broadcast message; otherwise send help hint.
 			if h.isAdmin(chatID) && h.broadcastSessionActive(chatID) {
 				err = h.HandleBroadcastDraft(ctx, update)
+			} else if handled, promoErr := h.handlePromoText(ctx, update); handled {
+				// The bot asked for a promo code: this text is the code.
+				err = promoErr
 			} else {
 				err = h.HandleHelp(ctx, update)
 			}

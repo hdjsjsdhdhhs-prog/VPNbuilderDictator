@@ -83,6 +83,9 @@ type appServices struct {
 	adminService   *service.AdminService
 	builderService *service.BuilderService
 	netMonitor     *netmon.Service
+	// Operational notifications (Telegram alerts, event feed, daily report).
+	opsService *service.OpsService
+	opsSender  *service.OpsTelegramSender
 }
 
 // newNetworkMonitor wires the network monitor with the /sub builder pipeline
@@ -140,9 +143,17 @@ func initServices(cfg *config.Config, dbService *database.Service, botAPI *tgbot
 		return &service.FetchedCatalogue{Format: c.Format, Entries: c.Entries, Skipped: c.Skipped, Duplicates: c.Duplicates}, nil
 	})
 
+	netMonitor := newNetworkMonitor(cfg, dbService)
+	// Events and the daily report go to TELEGRAM_ADMIN_ID through the main
+	// bot unless the admin configures another chat or bot in the panel.
+	opsSender := service.NewOpsTelegramSender(botAPI)
+	opsService := service.NewOpsService(dbService, netMonitor, cfg.TelegramAdminID)
+	opsService.SetSender(opsSender)
+
 	return &appServices{
 		subService: subService, subServer: subServer, handler: handler, orderService: orderService,
-		adminService: adminService, builderService: builderService, netMonitor: newNetworkMonitor(cfg, dbService),
+		adminService: adminService, builderService: builderService, netMonitor: netMonitor,
+		opsService: opsService, opsSender: opsSender,
 	}
 }
 
