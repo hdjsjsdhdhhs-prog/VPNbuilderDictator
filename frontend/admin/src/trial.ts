@@ -134,7 +134,7 @@ export function validateTrialForm(form: TrialForm, stored: CompositionState | nu
   if (chars(badge) > TRIAL_LIMITS.badge) errors.badge = `Не длиннее ${TRIAL_LIMITS.badge} символов.`;
 
   const changed = form.builderId !== null && compositionChanged(form, stored);
-  if (changed && !editable) errors.composition = 'Состав этого построителя меняется только в разделе «Построители» или в его копии.';
+  if (changed && !editable) errors.composition = 'Состав этой сборки меняется только в разделе «Сборки» или в её копии.';
   if (changed && editable) {
     if (form.sourceIds.length === 0) errors.composition = 'Выберите хотя бы один источник.';
     else if (form.mode === 'selected' && form.rules.length === 0) errors.composition = 'Выберите хотя бы одну страну или сервер.';
@@ -173,7 +173,13 @@ export const entryCountry = (e: Pick<SourceEntry, 'country_code' | 'original_nam
 
 export interface CountryGroup { code: string; entries: SourceEntry[] }
 
-/** Present entries grouped by country, sorted by code; "no country" last. */
+const countryCollator = new Intl.Collator('ru');
+
+/**
+ * Present entries grouped by country, sorted by the name the owner reads
+ * ("Бельгия", "Германия", …, not by ISO code: a provider subscription has
+ * dozens of countries); "no country" last.
+ */
 export function groupByCountry(entries: readonly SourceEntry[]): CountryGroup[] {
   const groups = new Map<string, SourceEntry[]>();
   for (const e of entries) {
@@ -184,7 +190,7 @@ export function groupByCountry(entries: readonly SourceEntry[]): CountryGroup[] 
     groups.set(code, list);
   }
   return [...groups.entries()]
-    .sort(([a], [b]) => (a === '' ? 1 : b === '' ? -1 : a.localeCompare(b)))
+    .sort(([a], [b]) => (a === '' ? 1 : b === '' ? -1 : countryCollator.compare(countryName(a), countryName(b))))
     .map(([code, list]) => ({ code, entries: list }));
 }
 
@@ -262,11 +268,11 @@ const PROBLEM_TEXT: Readonly<Record<string, string>> = {
   out_of_range: 'Значение вне допустимого диапазона.',
   too_long: 'Слишком длинный текст.',
   too_many: 'Слишком много элементов.',
-  builder_not_found: 'Построитель не найден: возможно, его удалили.',
-  builder_disabled: 'Построитель отключён: новые пробные подписки не выдаются.',
-  builder_shared: 'Построитель используется другими тарифами или подписками: его состав здесь не меняется. Создайте копию.',
-  builder_required: 'Состав задаётся только вместе с построителем.',
-  builder_version_conflict: 'Построитель изменили в другом окне.',
+  builder_not_found: 'Сборка не найдена: возможно, её удалили.',
+  builder_disabled: 'Сборка отключена: новые пробные подписки не выдаются.',
+  builder_shared: 'Сборка используется другими тарифами или подписками: её состав здесь не меняется. Создайте копию.',
+  builder_required: 'Состав задаётся только вместе со сборкой.',
+  builder_version_conflict: 'Сборку изменили в другом окне.',
   mode: 'Неизвестный режим состава.',
   required: 'Выберите источники и хотя бы одну страну или сервер.',
   duplicate: 'Источник выбран дважды.',
@@ -279,14 +285,14 @@ const PROBLEM_TEXT: Readonly<Record<string, string>> = {
   kind: 'Неизвестный тип правила.',
   duplicate_rule: 'Правило повторяется.',
   node_covered_by_country: 'Сервер уже входит в выбранную целиком страну.',
-  no_sources: 'У построителя нет источников.',
+  no_sources: 'У сборки нет источников.',
   empty_result: 'Состав пуст: ни одного доступного сервера.',
 };
 
 /** Codes whose meaning depends on the field. */
 const FIELD_PROBLEM_TEXT: Readonly<Record<string, string>> = {
   // The trial is served only by the trial plan builder (/sub has no other route).
-  'builder_id|builder_required': 'Выберите построитель: без него пробная подписка не выдаётся.',
+  'builder_id|builder_required': 'Выберите сборку: без неё пробная подписка не выдаётся.',
 };
 
 export const problemText = (p: Pick<TrialProblem, 'code'> & { field?: string }) =>

@@ -183,7 +183,7 @@ const uncertainText = (error: unknown) => (isUncertain(error) ? ' Повтори
 const EXAMPLE_PRICE_CENTS = 19_900;
 
 const EVENT_SUBJECT_LABELS: Readonly<Record<ReturnType<typeof kindSubject>, string>> = {
-  server: 'Сервер', country: 'Страна', builder: 'Построитель', source: 'Источник', monitor: 'Мониторинг', report: 'Отчёт',
+  server: 'Сервер', country: 'Страна', builder: 'Сборка', source: 'Источник', monitor: 'Мониторинг', report: 'Отчёт',
 };
 
 // =============================================================================
@@ -914,7 +914,7 @@ export class OpsScreen {
       results.append(filtered
         ? this.#emptyPanel('Нет событий по этим условиям', 'Измените или сбросьте фильтры.')
         : this.#emptyPanel('Событий пока нет',
-          'Здесь появятся сбои и восстановления серверов, стран, построителей и источников, а также ежедневные итоги. Пока записей нет — сбоев не было.'));
+          'Здесь появятся сбои и восстановления серверов, стран, сборок и источников, а также ежедневные итоги. Пока записей нет — сбоев не было.'));
     } else {
       const panel = el('section', 'panel ops-feed-panel');
       panel.setAttribute('aria-label', 'Лента событий');
@@ -1147,7 +1147,7 @@ export class OpsScreen {
     const what = this.#panel('ops-set-what', 'Что присылать');
     const kinds: readonly (readonly [keyof Pick<OpsForm, 'notifyServers' | 'notifyCountries' | 'notifySources'>, string, string, string])[] = [
       ['notifyServers', 'ops-set-servers', 'Серверы', 'Сервер перестал отвечать, восстановился или снят с выдачи; проверки мониторинга остановились.'],
-      ['notifyCountries', 'ops-set-countries', 'Страны и построители', 'Страна недоступна или работает частично; у построителя не отвечает ни один сервер; построитель отключён.'],
+      ['notifyCountries', 'ops-set-countries', 'Страны и сборки', 'Страна недоступна или работает частично; у сборки не отвечает ни один сервер; сборка отключена.'],
       ['notifySources', 'ops-set-sources', 'Источники', 'Источник не загружается, скоро закончится, его срок истёк или он отключён.'],
     ];
     for (const [key, id, label, hint] of kinds) {

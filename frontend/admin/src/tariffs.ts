@@ -78,7 +78,8 @@ export const featuresFromText = (text: string) => text.split(/\r?\n/).map(line =
 /** Raw editor state, as typed. */
 export interface TariffForm {
   name: string;
-  planId: number | null;
+  /** The сборка (builder) the tariff sells. */
+  builderId: number | null;
   durationDays: string;
   price: string;
   currency: string;
@@ -90,24 +91,24 @@ export interface TariffForm {
   sortOrder: string;
 }
 
-export type TariffField = 'name' | 'planId' | 'durationDays' | 'price' | 'currency' | 'description' | 'features' | 'badge' | 'sortOrder';
+export type TariffField = 'name' | 'builderId' | 'durationDays' | 'price' | 'currency' | 'description' | 'features' | 'badge' | 'sortOrder';
 export type FieldErrors = Partial<Record<TariffField, string>>;
 
 /** Server field names (database.TariffFieldError.Field) → editor fields. */
 export const SERVER_FIELDS: Readonly<Record<string, TariffField>> = {
-  name: 'name', plan_id: 'planId', duration_days: 'durationDays', price_cents: 'price', currency: 'currency',
+  name: 'name', plan_id: 'builderId', builder_id: 'builderId', duration_days: 'durationDays', price_cents: 'price', currency: 'currency',
   description: 'description', features: 'features', badge: 'badge', sort_order: 'sortOrder',
 };
 
-export function formFromTariff(tariff: AdminTariff | null, defaultPlanId: number | null): TariffForm {
+export function formFromTariff(tariff: AdminTariff | null, defaultBuilderId: number | null): TariffForm {
   if (!tariff) {
     return {
-      name: '', planId: defaultPlanId, durationDays: '30', price: '', currency: 'RUB', description: '', features: '', badge: '',
+      name: '', builderId: defaultBuilderId, durationDays: '30', price: '', currency: 'RUB', description: '', features: '', badge: '',
       isActive: true, sortOrder: '',
     };
   }
   return {
-    name: tariff.name, planId: tariff.plan_id, durationDays: String(tariff.duration_days),
+    name: tariff.name, builderId: tariff.builder_id, durationDays: String(tariff.duration_days),
     price: priceInputValue(tariff.price_cents, tariff.currency), currency: tariff.currency,
     description: tariff.description, features: tariff.features.join('\n'), badge: tariff.badge, isActive: tariff.is_active,
     sortOrder: String(tariff.sort_order),
@@ -123,7 +124,7 @@ export function validateTariffForm(form: TariffForm): { input: TariffInput | nul
   if (!name) errors.name = 'Введите название.';
   else if (chars(name) > TARIFF_LIMITS.name) errors.name = `Не длиннее ${TARIFF_LIMITS.name} символов.`;
 
-  if (form.planId === null) errors.planId = 'Выберите план.';
+  if (form.builderId === null) errors.builderId = 'Выберите сборку: что получит покупатель.';
 
   const duration = /^\d{1,5}$/.test(form.durationDays.trim()) ? Number(form.durationDays.trim()) : NaN;
   if (!Number.isInteger(duration) || duration < 1 || duration > TARIFF_LIMITS.maxDurationDays) {
@@ -154,10 +155,10 @@ export function validateTariffForm(form: TariffForm): { input: TariffInput | nul
     errors.sortOrder = `Позиция — целое число от 0 до ${countFormat.format(TARIFF_LIMITS.maxSortOrder)} или пусто.`;
   }
 
-  if (Object.keys(errors).length > 0 || form.planId === null || price === null) return { input: null, errors };
+  if (Object.keys(errors).length > 0 || form.builderId === null || price === null) return { input: null, errors };
   return {
     input: {
-      name, plan_id: form.planId, duration_days: duration, price_cents: price, currency: form.currency,
+      name, builder_id: form.builderId, duration_days: duration, price_cents: price, currency: form.currency,
       description, features, badge, is_active: form.isActive, sort_order: sortOrder,
     },
     errors,
@@ -166,10 +167,13 @@ export function validateTariffForm(form: TariffForm): { input: TariffInput | nul
 
 /**
  * Whether the immutable purchase terms differ (database.TariffInput.sameTerms).
- * For a used tariff this means the save creates a new version.
+ * For a used tariff this means the save creates a new version. A tariff whose
+ * legacy plan had no сборка yet gets one in place (the plan adopts it): that
+ * is not a change of terms.
  */
 export function termsChanged(tariff: AdminTariff, input: TariffInput): boolean {
-  return tariff.name !== input.name || tariff.plan_id !== input.plan_id || tariff.duration_days !== input.duration_days ||
+  const moved = tariff.builder_id !== null && tariff.builder_id !== input.builder_id;
+  return tariff.name !== input.name || moved || tariff.duration_days !== input.duration_days ||
     tariff.price_cents !== input.price_cents || tariff.currency !== input.currency;
 }
 

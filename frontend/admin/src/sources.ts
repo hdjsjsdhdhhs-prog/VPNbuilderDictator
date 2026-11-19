@@ -1,9 +1,9 @@
 // Pure logic of the source catalogue screens: format labels, sync state and
-// error texts, count labels, entry filters and the per-source summary shown
-// in the Builder. No DOM here; covered by tests/admin-sources.test.ts.
+// error texts, count labels, entry filters, and what the «Сборки» constructor
+// shares with them (node resolution, the summary of the server check).
+// No DOM here; covered by tests/admin-sources.test.ts.
 import type {
-  AdminBuilder, AdminSource, BuilderConfigItemInput, BuilderDependents, BuilderItem, BuilderPreview, DependentRef, FingerprintStatus,
-  SourceCatalogue, SourceDependents, SourceEntry, SourceSyncResult,
+  AdminSource, BuilderPreview, DependentRef, FingerprintStatus, SourceCatalogue, SourceDependents, SourceEntry, SourceSyncResult,
 } from './api';
 import { pluralRu } from './tariffs';
 
@@ -141,8 +141,9 @@ export const EXPIRY_STATE_LABELS: Readonly<Record<Exclude<ExpiryState, 'none' | 
 };
 
 // ---------------------------------------------------------------------------
-// Deletion: a source or a builder may be deleted only while nothing depends on
-// it (database.SourceDependents / BuilderDependents). The backend re-checks.
+// Deletion: a source may be deleted only while nothing depends on it
+// (database.SourceDependents). The backend re-checks. The blocker of a сборка
+// is builds.buildDeleteBlocker.
 
 const quoted = (refs: readonly DependentRef[]) => refs.map(r => `«${r.name}»`).join(', ');
 
@@ -150,20 +151,10 @@ const quoted = (refs: readonly DependentRef[]) => refs.map(r => `«${r.name}»`)
 export function sourceDeleteBlocker(d: SourceDependents): string {
   const parts: string[] = [];
   if (d.builders.length > 0) {
-    parts.push(`${d.builders.length === 1 ? 'используется построителем' : 'используется построителями'} ${quoted(d.builders)}`);
+    parts.push(`${d.builders.length === 1 ? 'используется сборкой' : 'используется сборками'} ${quoted(d.builders)}`);
   }
   if (d.subscriptions > 0) {
     parts.push(`на нём ${pluralRu(d.subscriptions, 'продана', 'проданы', 'продано')} ${countFormat.format(d.subscriptions)} ${pluralRu(d.subscriptions, 'подписка', 'подписки', 'подписок')}`);
-  }
-  return parts.join('; ');
-}
-
-/** Why a builder cannot be deleted ('' when nothing depends on it). */
-export function builderDeleteBlocker(d: BuilderDependents): string {
-  const parts: string[] = [];
-  if (d.plans.length > 0) parts.push(`${d.plans.length === 1 ? 'назначен плану' : 'назначен планам'} ${quoted(d.plans)}`);
-  if (d.subscriptions > 0) {
-    parts.push(`назначен лично ${countFormat.format(d.subscriptions)} ${pluralRu(d.subscriptions, 'подписке', 'подпискам', 'подпискам')}`);
   }
   return parts.join('; ');
 }
@@ -197,145 +188,9 @@ export const protocolsOf = (entries: readonly SourceEntry[]) =>
   [...new Set(entries.map(e => e.protocol).filter(Boolean))].sort();
 
 // ---------------------------------------------------------------------------
-// Builder: sources are merged only there; each keeps its own statistics.
-
-export interface BuilderSourceRow { id: number; name: string; summary: string; state: SyncState; enabled: boolean }
-
-export interface BuilderSourcesSummary {
-  rows: BuilderSourceRow[];
-  /** Sum of the present entries of the selected USABLE (enabled, not expired) sources. */
-  entries: number;
-  /** Distinct country codes across the selected usable sources. */
-  countries: number;
-  /** Selected sources that are disabled or expired: /sub and Preview skip them. */
-  disabled: number;
-}
-
-export function builderSourcesSummary(sources: readonly AdminSource[]): BuilderSourcesSummary {
-  const codes = new Set<string>();
-  let entries = 0;
-  let disabled = 0;
-  const rows = sources.map(s => {
-    if (sourceUsable(s)) {
-      entries += s.catalogue.entries;
-      for (const c of s.catalogue.by_country) codes.add(c.code);
-    } else {
-      disabled++;
-    }
-    return { id: s.id, name: s.name, summary: catalogueSummary(s.catalogue), state: syncState(s), enabled: s.enabled };
-  });
-  return { rows, entries, countries: codes.size, disabled };
-}
-
-// ---------------------------------------------------------------------------
-// Builder list card. Counts come from the saved configuration the backend
-// returns (service.BuilderView.sources / items) and follow the /sub resolver
-// (subserver.builderSourcesToFetch + selectBuilderEntries):
-//   source  = a linked provider source (subscription_builder_sources row);
-//   rule    = a subscription_builder_items row: a country rule (every server
-//             of one country, resolved on each build) or a node rule (one
-//             concrete server of the catalogue);
-//   no rules         → every server of every linked source is served;
-//   no linked source → nothing is served;
-//   rules present but none enabled on a linked source → nothing is served.
-
-export interface BuilderCardSummary {
-  sources: number;
-  rules: number;
-  /** Rules switched off: /sub skips them. */
-  disabledRules: number;
-  /** Enabled rules whose source is not linked: /sub ignores them. */
-  unlinkedRules: number;
-  /** Country codes of the applied country rules, rule order, unique ('' = without a country). */
-  countries: string[];
-  /** Applied node rules (one concrete server each). */
-  nodes: number;
-  /** "v3 · 2 источника · 4 правила (1 выкл.)" */
-  meta: string;
-  /** What /sub serves with this configuration. */
-  composition: string;
-  /** The configuration serves nothing. */
-  empty: boolean;
-}
-
-type CardBuilder = Pick<AdminBuilder, 'version' | 'sources' | 'items'>;
-
-/**
- * Rules of the editor as the configuration save expects them: in display
- * order (the index is the position), local placeholders (id <= 0) as new rules
- * (id 0), only the fields of the rule kind.
- */
-export function builderConfigItems(items: readonly BuilderItem[]): BuilderConfigItemInput[] {
-  return items.map(it => ({
-    id: it.id > 0 ? it.id : 0,
-    kind: it.kind,
-    source_id: it.source_id,
-    country_code: it.kind === 'country' ? (it.country_code ?? '') : '',
-    fingerprint: it.kind === 'node' ? (it.fingerprint ?? '') : '',
-    original_name: it.kind === 'node' ? (it.original_name ?? '') : '',
-    custom_name: it.custom_name ?? null,
-    description: it.description ?? '',
-    enabled: it.enabled,
-  }));
-}
-
-export function builderCardSummary(b: CardBuilder): BuilderCardSummary {
-  const sources = b.sources ?? [];
-  const items = b.items ?? [];
-  const linked = new Set(sources.map(s => s.source_id));
-  const countries: string[] = [];
-  let disabledRules = 0, unlinkedRules = 0, nodes = 0;
-  for (const it of [...items].sort((x, y) => x.position - y.position || x.id - y.id)) {
-    if (!it.enabled) { disabledRules++; continue; }
-    if (!linked.has(it.source_id)) { unlinkedRules++; continue; }
-    if (it.kind === 'node') { nodes++; continue; }
-    const code = (it.country_code ?? '').toUpperCase();
-    if (!countries.includes(code)) countries.push(code);
-  }
-  const off = [
-    disabledRules ? `${countFormat.format(disabledRules)} выкл.` : '',
-    unlinkedRules ? `${countFormat.format(unlinkedRules)} без источника` : '',
-  ].filter(Boolean).join(', ');
-  const meta = [
-    `v${b.version}`,
-    `${countFormat.format(sources.length)} ${pluralRu(sources.length, 'источник', 'источника', 'источников')}`,
-    `${countFormat.format(items.length)} ${pluralRu(items.length, 'правило', 'правила', 'правил')}${off ? ` (${off})` : ''}`,
-  ].join(' · ');
-
-  let composition: string;
-  let empty = false;
-  if (sources.length === 0) {
-    composition = 'Источники не подключены: подписка не соберётся.';
-    empty = true;
-  } else if (items.length === 0) {
-    composition = 'Без правил: все серверы подключённых источников.';
-  } else if (countries.length === 0 && nodes === 0) {
-    composition = 'Ни одно правило не применяется: подписка не соберётся.';
-    empty = true;
-  } else {
-    const parts: string[] = [];
-    if (countries.length) parts.push(`Страны: ${countries.map(c => c ? countryLabel(c) : 'без страны').join(', ')}`);
-    if (nodes) parts.push(`отдельных серверов: ${countFormat.format(nodes)}`);
-    composition = parts.join(' · ');
-  }
-  return { sources: sources.length, rules: items.length, disabledRules, unlinkedRules, countries, nodes, meta, composition, empty };
-}
-
-// ---------------------------------------------------------------------------
-// Builder rules against the real catalogue. The backend (Preview and /sub)
-// stays authoritative; these helpers only explain a rule before it is saved
-// and mirror database.CountryMatches / MatchOriginalName.
-
-export const COUNTRY_CODE = /^[A-Z]{2}$/;
-
-/** Present servers of one country in a source's catalogue (0 when absent). */
-export function countryCount(src: Pick<AdminSource, 'catalogue'> | undefined, code: string): number {
-  const want = code.trim().toUpperCase();
-  return src?.catalogue.by_country.find(c => c.code.toUpperCase() === want)?.count ?? 0;
-}
-
-/** "🇩🇪 DE" (or just the code when it is not a flaggable pair). */
-export const countryLabel = (code: string) => `${flagEmoji(code)} ${code}`.trim();
+// Node rules against the real catalogue. The backend (the server check and
+// /sub) stays authoritative; these helpers mirror database.MatchOriginalName
+// and database.ResolveNodeItem for the live preview of a сборка.
 
 // database.originalNameTiers: exact, then %XX decoding, then "+" as space.
 const safeDecode = (s: string, plusAsSpace: boolean) => {
@@ -372,52 +227,6 @@ export function resolveNode(fingerprint: string, originalName: string, entries: 
   const matches = matchOriginalName(originalName, present.map(e => e.original_name));
   if (matches.length === 1) return { status: 'fallback', entry: present[matches[0]] };
   return { status: matches.length === 0 ? 'missing' : 'conflict', entry: null };
-}
-
-export const RESOLUTION_LABELS: Readonly<Record<FingerprintStatus, string>> = {
-  matched: 'Найден', fallback: 'Найден по имени', missing: 'Не найден', conflict: 'Неоднозначно',
-};
-
-type RuleFields = Pick<BuilderItem, 'kind' | 'source_id' | 'country_code' | 'fingerprint' | 'original_name' | 'custom_name' | 'enabled'>;
-
-export interface RuleSummary {
-  title: string;
-  detail: string;
-  /** Why the rule serves nothing right now ('' when it works). */
-  warning: string;
-}
-
-/**
- * How a rule reads in the Builder editor: which source it takes servers
- * from and what it yields by the source's current catalogue.
- */
-export function ruleSummary(item: RuleFields, sources: readonly AdminSource[], selectedIds: readonly number[]): RuleSummary {
-  const src = sources.find(s => s.id === item.source_id);
-  const srcName = src ? `«${src.name}»` : `источника #${item.source_id}`;
-  let warning = '';
-  if (!selectedIds.includes(item.source_id)) warning = 'Источник не подключён к построителю: правило не применяется.';
-  else if (src && !src.enabled) warning = 'Источник отключён: правило пропускается.';
-  else if (src?.expired) warning = 'Срок действия источника истёк: правило пропускается.';
-  if (item.kind === 'country') {
-    const n = countryCount(src, item.country_code);
-    if (!warning && src && n === 0) warning = 'В каталоге источника сейчас нет серверов этой страны.';
-    return {
-      title: item.custom_name || countryLabel(item.country_code),
-      detail: `Все серверы страны ${countryLabel(item.country_code)} из ${srcName} · сейчас ${serversLabel(n)}`,
-      warning,
-    };
-  }
-  return {
-    title: item.custom_name || item.original_name || shortFingerprint(item.fingerprint) || '—',
-    detail: `Сервер из ${srcName}${item.custom_name && item.original_name ? ` · в источнике: ${item.original_name}` : ''}`,
-    warning,
-  };
-}
-
-/** Entries of the node picker: present, filtered, capped for rendering. */
-export function pickableEntries(entries: readonly SourceEntry[], query: string, country: string, limit = 200) {
-  const all = filterEntries(entries, { country, protocol: '', query, showAbsent: false });
-  return { shown: all.slice(0, limit), total: all.length };
 }
 
 export interface PreviewSummary {

@@ -43,7 +43,7 @@ const REPORT_HTML = '📊 <b>Итоги дня — 12.11.2026</b>\n\n👥 Пол
 
 const event = (over: Json): Json => ({
   id: 1, created_at: '2026-11-12T12:00:00Z', kind: 'server_down', severity: 'critical', title: 'Сервер недоступен',
-  message: 'NL-1 (vless 203.0.113.7:443) · построитель «Основной» · NL · причина: нет ответа (таймаут)', builder_id: 1, source_id: null,
+  message: 'NL-1 (vless 203.0.113.7:443) · сборка «Основной» · NL · причина: нет ответа (таймаут)', builder_id: 1, source_id: null,
   target_id: 7, country_code: 'NL', notify_status: 'sent', notified_at: '2026-11-12T12:01:00Z', notify_error: '', details: {}, ...over,
 });
 

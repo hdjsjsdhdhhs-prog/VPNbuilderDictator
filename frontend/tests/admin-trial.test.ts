@@ -94,7 +94,7 @@ describe('trial form validation', () => {
   it('refuses composition edits of a shared builder and empty selections', () => {
     const v = view();
     const edited: TrialForm = { ...formFromView(v), rules: [] };
-    expect(validateTrialForm(edited, stored(v), false).errors.composition).toMatch(/Построители/);
+    expect(validateTrialForm(edited, stored(v), false).errors.composition).toBe('Состав этой сборки меняется только в разделе «Сборки» или в её копии.');
     expect(validateTrialForm(edited, stored(v), true).errors.composition).toMatch(/хотя бы одну/);
     expect(validateTrialForm({ ...edited, mode: 'all', sourceIds: [] }, stored(v), true).errors.composition).toMatch(/источник/);
     // "All countries" sends no rules.
@@ -130,8 +130,8 @@ describe('trial served only by the plan builder (no legacy issuance nodes)', () 
   });
 
   it('explains a missing builder by field (database.TrialDraft preview)', () => {
-    expect(problemText({ code: 'builder_required', field: 'builder_id' })).toBe('Выберите построитель: без него пробная подписка не выдаётся.');
-    expect(problemText({ code: 'builder_required', field: 'composition' })).toBe('Состав задаётся только вместе с построителем.');
+    expect(problemText({ code: 'builder_required', field: 'builder_id' })).toBe('Выберите сборку: без неё пробная подписка не выдаётся.');
+    expect(problemText({ code: 'builder_required', field: 'composition' })).toBe('Состав задаётся только вместе со сборкой.');
     expect(problemText({ code: 'duplicate' })).toBe('Источник выбран дважды.');
     // Codes of the removed node subsystem are no longer known texts.
     for (const code of ['no_trial_node', 'legacy_node_not_found', 'legacy_node_inactive']) {
@@ -155,6 +155,16 @@ describe('catalogue by country', () => {
     ]);
     expect(countryName('')).toBe('Без страны');
     expect(countryName('DE')).toMatch(/DE$/);
+  });
+
+  it('orders countries by the name the owner reads, not by ISO code', () => {
+    const groups = groupByCountry([
+      entry(1, 'ch', 'Zurich', 'CH'), entry(2, 'be', 'Brussels', 'BE'), entry(3, 'x', 'Unknown'),
+      entry(4, 'de', 'Berlin', 'DE'), entry(5, 'ca', 'Toronto', 'CA'), entry(6, 'gb', 'London', 'GB'),
+    ]);
+    // Бельгия, Великобритания, Германия, Канада, Швейцария; by code it would
+    // be BE, CA, CH, DE, GB.
+    expect(groups.map(g => g.code)).toEqual(['BE', 'GB', 'DE', 'CA', 'CH', '']);
   });
 });
 
@@ -269,7 +279,7 @@ describe('trial API client', () => {
     expect(error).toMatchObject({ code: 'invalid_trial', field: 'builder_id', reason: 'builder_required' });
     const { field, reason } = error as ApiError;
     expect(TRIAL_SERVER_FIELDS[field]).toBe('builderId');
-    expect(problemText({ code: reason, field })).toMatch(/Выберите построитель/);
+    expect(problemText({ code: reason, field })).toMatch(/Выберите сборку/);
   });
 
   it('reports field and reason of a rejection', async () => {

@@ -1,10 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AdminApi, type AdminSource, type BuilderItem, type BuilderPreview, type SourceCatalogue, type SourceEntry, type SourceSyncResult } from '../admin/src/api';
+import { AdminApi, type AdminSource, type BuilderPreview, type SourceCatalogue, type SourceEntry, type SourceSyncResult } from '../admin/src/api';
 import {
-  EMPTY_FILTER, EXPIRY_SOON_MS, builderCardSummary, builderConfigItems, builderDeleteBlocker, builderSourcesSummary, catalogueSummary,
-  countryCount, countryLabel, expiryState, filterEntries, flagEmoji,
-  formatLabel, matchOriginalName, normalizeFormat, pickableEntries, previewSummary, protocolsOf, resolveNode,
-  ruleSummary, sourceDeleteBlocker, sourceUsable, syncErrorText, syncResultMessage, syncState,
+  EMPTY_FILTER, EXPIRY_SOON_MS, catalogueSummary, expiryState, filterEntries, flagEmoji,
+  formatLabel, matchOriginalName, normalizeFormat, previewSummary, protocolsOf, resolveNode,
+  sourceDeleteBlocker, sourceUsable, syncErrorText, syncResultMessage, syncState,
 } from '../admin/src/sources';
 
 // Pure logic of the admin source catalogue screens (admin/src/sources.ts) and
@@ -101,15 +100,6 @@ describe('catalogue statistics', () => {
     expect(flagEmoji('DE')).toBe('🇩🇪');
     expect(flagEmoji('de')).toBe('');
     expect(flagEmoji('')).toBe('');
-    expect(countryLabel('NL')).toBe('🇳🇱 NL');
-  });
-
-  it('counts the servers of one country', () => {
-    const src = source();
-    expect(countryCount(src, 'DE')).toBe(3);
-    expect(countryCount(src, 'de')).toBe(3);
-    expect(countryCount(src, 'US')).toBe(0);
-    expect(countryCount(undefined, 'DE')).toBe(0);
   });
 });
 
@@ -138,28 +128,6 @@ describe('entry filters (source details)', () => {
   it('lists protocols once, sorted', () => {
     expect(protocolsOf(list)).toEqual(['ss', 'trojan', 'vless']);
   });
-
-  it('caps the node picker and keeps the full count', () => {
-    const many = Array.from({ length: 250 }, (_, i) => entry({ original_name: `n${i}` }));
-    const { shown, total } = pickableEntries(many, '', '');
-    expect(shown).toHaveLength(200);
-    expect(total).toBe(250);
-    expect(pickableEntries(many, 'n24', '').total).toBe(11);
-  });
-});
-
-describe('multiple sources in a builder', () => {
-  it('sums servers and counts distinct countries of the enabled sources', () => {
-    const a = source({ id: 1, catalogue: catalogue({ entries: 5, by_country: [{ code: 'DE', count: 3 }, { code: 'NL', count: 1 }] }) });
-    const b = source({ id: 2, name: 'Provider B', catalogue: catalogue({ entries: 4, by_country: [{ code: 'DE', count: 2 }, { code: 'US', count: 2 }] }) });
-    const off = source({ id: 3, name: 'Off', enabled: false, catalogue: catalogue({ entries: 7, by_country: [{ code: 'JP', count: 7 }] }) });
-    const sum = builderSourcesSummary([a, b, off]);
-    expect(sum.entries).toBe(9);
-    expect(sum.countries).toBe(3);
-    expect(sum.disabled).toBe(1);
-    expect(sum.rows.map(r => r.id)).toEqual([1, 2, 3]);
-    expect(sum.rows[0].summary).toBe('5 серверов · 2 страны');
-  });
 });
 
 describe('source validity (expires_at)', () => {
@@ -186,18 +154,9 @@ describe('source validity (expires_at)', () => {
     expect(sourceUsable(source({ enabled: false }))).toBe(false);
     expect(sourceUsable(source({ expires_at: at(-1), expired: true }))).toBe(false);
   });
-
-  it('is left out of the builder totals and warned about in its rules', () => {
-    const expired = source({ id: 2, expires_at: at(-1), expired: true, catalogue: catalogue({ entries: 9 }) });
-    expect(builderSourcesSummary([source(), expired])).toMatchObject({ entries: 5, countries: 2, disabled: 1 });
-    const rule = { kind: 'country' as const, source_id: 2, country_code: 'DE', fingerprint: '', original_name: '', custom_name: null, enabled: true };
-    expect(ruleSummary(rule, [source(), expired], [1, 2]).warning).toBe('Срок действия источника истёк: правило пропускается.');
-    // Switched off wins: that is the reason the admin can act on first.
-    expect(ruleSummary(rule, [{ ...expired, enabled: false }], [2]).warning).toBe('Источник отключён: правило пропускается.');
-  });
 });
 
-describe('deletion blockers (database.SourceDependents / BuilderDependents)', () => {
+describe('deletion blockers (database.SourceDependents)', () => {
   const ref = (id: number, name: string) => ({ id, name });
 
   it('a source nothing depends on is deletable', () => {
@@ -205,47 +164,15 @@ describe('deletion blockers (database.SourceDependents / BuilderDependents)', ()
   });
 
   it('names the builders and counts the subscriptions of a source', () => {
-    expect(sourceDeleteBlocker({ builders: [ref(7, 'FINLAN')], subscriptions: 0 })).toBe('используется построителем «FINLAN»');
+    expect(sourceDeleteBlocker({ builders: [ref(7, 'FINLAN')], subscriptions: 0 })).toBe('используется сборкой «FINLAN»');
     expect(sourceDeleteBlocker({ builders: [ref(7, 'A'), ref(8, 'B')], subscriptions: 3 }))
-      .toBe('используется построителями «A», «B»; на нём проданы 3 подписки');
+      .toBe('используется сборками «A», «B»; на нём проданы 3 подписки');
     expect(sourceDeleteBlocker({ builders: [], subscriptions: 1 })).toBe('на нём продана 1 подписка');
     expect(sourceDeleteBlocker({ builders: [], subscriptions: 5 })).toBe('на нём продано 5 подписок');
   });
-
-  it('names the plans and counts the overriding subscriptions of a builder', () => {
-    expect(builderDeleteBlocker({ plans: [], subscriptions: 0 })).toBe('');
-    expect(builderDeleteBlocker({ plans: [ref(1, 'Trial')], subscriptions: 2 })).toBe('назначен плану «Trial»; назначен лично 2 подпискам');
-    expect(builderDeleteBlocker({ plans: [ref(1, 'A'), ref(2, 'B')], subscriptions: 1 })).toBe('назначен планам «A», «B»; назначен лично 1 подписке');
-  });
 });
 
-describe('builder rules against the catalogue', () => {
-  const a = source({ id: 1, name: 'A' });
-  const b = source({ id: 2, name: 'B', enabled: false });
-  const rule = { kind: 'country' as const, source_id: 1, country_code: 'DE', fingerprint: '', original_name: '', custom_name: null, enabled: true };
-
-  it('shows what a dynamic country rule yields now', () => {
-    const r = ruleSummary(rule, [a, b], [1, 2]);
-    expect(r.title).toBe('🇩🇪 DE');
-    expect(r.detail).toBe('Все серверы страны 🇩🇪 DE из «A» · сейчас 3 сервера');
-    expect(r.warning).toBe('');
-  });
-
-  it('warns when the rule serves nothing', () => {
-    expect(ruleSummary({ ...rule, country_code: 'US' }, [a], [1]).warning).toContain('нет серверов этой страны');
-    expect(ruleSummary(rule, [a], []).warning).toContain('не подключён');
-    expect(ruleSummary({ ...rule, source_id: 2 }, [a, b], [1, 2]).warning).toContain('отключён');
-  });
-
-  it('names a node rule by its custom or original name', () => {
-    const node = { ...rule, kind: 'node' as const, country_code: '', fingerprint: 'abcdef0123456789', original_name: 'DE-1' };
-    expect(ruleSummary(node, [a], [1]).title).toBe('DE-1');
-    const custom = ruleSummary({ ...node, custom_name: 'Германия' }, [a], [1]);
-    expect(custom.title).toBe('Германия');
-    expect(custom.detail).toBe('Сервер из «A» · в источнике: DE-1');
-    expect(ruleSummary({ ...node, original_name: '' }, [a], [1]).title).toBe('abcdef012345…');
-  });
-
+describe('node rules against the catalogue', () => {
   it('matches original names in the database tiers', () => {
     expect(matchOriginalName('DE 1', ['DE 1', 'DE%201'])).toEqual([0]);
     expect(matchOriginalName('DE%201', ['DE 1', 'NL'])).toEqual([0]);
@@ -281,76 +208,14 @@ describe('preview summary', () => {
   });
 });
 
-describe('builder list card (service.BuilderView)', () => {
-  let nextItem = 1;
-  const rule = (over: Partial<BuilderItem> = {}): BuilderItem => ({
-    id: nextItem++, kind: 'country', source_id: 1, country_code: 'DE', fingerprint: '', original_name: '',
-    custom_name: null, description: '', position: 0, enabled: true, ...over,
-  });
-  const linked = (...ids: number[]) => ids.map((source_id, position) => ({ source_id, position }));
-
-  it('counts the stored sources and rules with Russian plurals', () => {
-    const s = builderCardSummary({
-      version: 4, sources: linked(1, 2),
-      items: [rule({ position: 0 }), rule({ country_code: 'NL', position: 1 }), rule({ kind: 'node', source_id: 2, fingerprint: 'b2', position: 2 })],
-    });
-    expect(s).toMatchObject({ sources: 2, rules: 3, countries: ['DE', 'NL'], nodes: 1, empty: false });
-    expect(s.meta).toBe('v4 · 2 источника · 3 правила');
-    expect(s.composition).toBe('Страны: 🇩🇪 DE, 🇳🇱 NL · отдельных серверов: 1');
-    expect(builderCardSummary({ version: 1, sources: linked(1), items: [rule()] }).meta).toBe('v1 · 1 источник · 1 правило');
-    expect(builderCardSummary({ version: 1, sources: linked(1, 2, 3, 4, 5), items: [] }).meta).toBe('v1 · 5 источников · 0 правил');
-  });
-
-  it('a builder without rules serves every server of its sources; without sources nothing', () => {
-    expect(builderCardSummary({ version: 2, sources: linked(1), items: [] }))
-      .toMatchObject({ composition: 'Без правил: все серверы подключённых источников.', empty: false });
-    const none = builderCardSummary({ version: 1, sources: [], items: [] });
-    expect(none.meta).toBe('v1 · 0 источников · 0 правил');
-    expect(none).toMatchObject({ composition: 'Источники не подключены: подписка не соберётся.', empty: true });
-    // A partial record (missing arrays) is never shown as configured.
-    expect(builderCardSummary({ version: 1, sources: null, items: null }).empty).toBe(true);
-  });
-
-  it('disabled rules and rules on an unlinked source are reported like /sub skips them', () => {
-    const s = builderCardSummary({
-      version: 3, sources: linked(1),
-      items: [rule({ enabled: false }), rule({ source_id: 9, country_code: 'US' }), rule({ country_code: 'de', position: 2 }), rule({ country_code: '', position: 3 })],
-    });
-    expect(s.meta).toBe('v3 · 1 источник · 4 правила (1 выкл., 1 без источника)');
-    expect(s.countries).toEqual(['DE', '']);
-    expect(s.composition).toBe('Страны: 🇩🇪 DE, без страны');
-    const off = builderCardSummary({ version: 1, sources: linked(1), items: [rule({ enabled: false })] });
-    expect(off).toMatchObject({ composition: 'Ни одно правило не применяется: подписка не соберётся.', empty: true });
-  });
-
-  it('follows the rule order, not the array order', () => {
-    const s = builderCardSummary({ version: 1, sources: linked(1), items: [rule({ country_code: 'NL', position: 1 }), rule({ country_code: 'FI', position: 0 })] });
-    expect(s.countries).toEqual(['FI', 'NL']);
-  });
-});
-
 describe('builder configuration save', () => {
-  const item = (over: Partial<BuilderItem>): BuilderItem => ({
-    id: 0, kind: 'country', source_id: 1, country_code: 'DE', fingerprint: '', original_name: '',
-    custom_name: null, description: '', position: 0, enabled: true, ...over,
-  });
-
-  it('sends rules in display order, placeholders as new, only the fields of the kind', () => {
-    expect(builderConfigItems([
-      item({ id: 12, country_code: 'NL', fingerprint: 'stale', enabled: false }),
-      item({ id: -3, kind: 'node', fingerprint: 'b2', original_name: 'Dallas', country_code: 'US', custom_name: 'Даллас' }),
-    ])).toEqual([
-      { id: 12, kind: 'country', source_id: 1, country_code: 'NL', fingerprint: '', original_name: '', custom_name: null, description: '', enabled: false },
-      { id: 0, kind: 'node', source_id: 1, country_code: '', fingerprint: 'b2', original_name: 'Dallas', custom_name: 'Даллас', description: '', enabled: true },
-    ]);
-  });
-
   it('PUTs the whole configuration and reports a version conflict', async () => {
     const transport = vi.fn<typeof fetch>();
     const api = new AdminApi(transport);
     const input = {
       request_key: 'ui-k', version: 3, name: 'FINLAN', description: '', enabled: true, profile_title: '', support_url: '', announce: '',
-      source_ids: [1, 2], items: builderConfigItems([item({ id: 5 })]),
+      source_ids: [1, 2],
+      items: [{ id: 5, kind: 'country' as const, source_id: 1, country_code: 'DE', fingerprint: '', original_name: '', custom_name: null, description: '', enabled: true }],
     };
     transport.mockResolvedValueOnce(json({ builder: { id: 7, version: 4, sources: [], items: [] }, audit: {} }));
     await expect(api.saveBuilderConfiguration(7, input)).resolves.toMatchObject({ builder: { version: 4 } });

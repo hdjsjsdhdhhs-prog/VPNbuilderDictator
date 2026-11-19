@@ -1,17 +1,19 @@
 import { describe, expect, it, vi } from 'vitest';
 import { AdminApi, ApiError, type AdminTariff } from '../admin/src/api';
 import {
-  botButtonLabel, catalogueOrder, durationLabel, featuresFromText, formFromTariff, formatTariffPrice, moveItem,
+  SERVER_FIELDS, botButtonLabel, catalogueOrder, durationLabel, featuresFromText, formFromTariff, formatTariffPrice, moveItem,
   parsePriceInput, pluralRu, priceInputValue, reorderIds, sameForm, termsChanged, validateTariffForm,
 } from '../admin/src/tariffs';
 
 // Pure logic of the admin tariff editor (admin/src/tariffs.ts) and the tariff
 // part of the admin API client (admin/src/api.ts), against the server bounds
 // of database.TariffInput.Validate and the service.TariffView wire shape.
+// A tariff is sold on a сборка (builder_id); the plan behind it is internal
+// and never sent by the panel.
 
 const tariff = (over: Partial<AdminTariff> = {}): AdminTariff => ({
-  id: 7, offer_id: 'a'.repeat(32), name: 'Месяц', plan_id: 3, plan_name: 'Стандарт', plan_active: true, builder_id: null,
-  duration_days: 30, price_cents: 19900, currency: 'RUB', is_active: true, description: '', features: [], badge: '',
+  id: 7, offer_id: 'a'.repeat(32), name: 'Месяц', plan_id: 5, plan_name: 'Европа', plan_active: true, builder_id: 3,
+  builder_name: 'Европа', duration_days: 30, price_cents: 19900, currency: 'RUB', is_active: true, description: '', features: [], badge: '',
   sort_order: 0, version: 1, previous_id: null, replaced_by_id: null, orders: 0, subscriptions: 0, in_use: false,
   offer_ends_at: null, created_at: '2026-09-01T10:00:00Z', updated_at: '2026-09-02T10:00:00.123456789Z', ...over,
 });
@@ -67,20 +69,23 @@ describe('tariff form', () => {
     const { input, errors } = validateTariffForm({ ...valid(), description: ' Лучшее\r\nпредложение ', features: 'Все серверы\n\n  Поддержка  \n', badge: ' Хит ' });
     expect(errors).toEqual({});
     expect(input).toEqual({
-      name: 'Год', plan_id: 3, duration_days: 365, price_cents: 199000, currency: 'RUB',
+      name: 'Год', builder_id: 3, duration_days: 365, price_cents: 199000, currency: 'RUB',
       description: 'Лучшее\nпредложение', features: ['Все серверы', 'Поддержка'], badge: 'Хит', is_active: true, sort_order: null,
     });
+    // The plan is resolved on the server: the panel never names it.
+    expect(input).not.toHaveProperty('plan_id');
     expect(validateTariffForm({ ...valid(), sortOrder: '4' }).input?.sort_order).toBe(4);
   });
 
   it('reports every field outside the server bounds', () => {
     const { input, errors } = validateTariffForm({
-      name: 'я'.repeat(65), planId: null, durationDays: '3651', price: '1000001', currency: 'RUB',
+      name: 'я'.repeat(65), builderId: null, durationDays: '3651', price: '1000001', currency: 'RUB',
       description: 'x'.repeat(501), features: Array.from({ length: 9 }, (_, i) => `f${i}`).join('\n'), badge: 'b'.repeat(25),
       isActive: true, sortOrder: '100001',
     });
     expect(input).toBeNull();
-    expect(Object.keys(errors).sort()).toEqual(['badge', 'description', 'durationDays', 'features', 'name', 'planId', 'price', 'sortOrder']);
+    expect(Object.keys(errors).sort()).toEqual(['badge', 'builderId', 'description', 'durationDays', 'features', 'name', 'price', 'sortOrder']);
+    expect(errors.builderId).toBe('Выберите сборку: что получит покупатель.');
     expect(validateTariffForm({ ...valid(), name: '' }).errors.name).toBe('Введите название.');
     expect(validateTariffForm({ ...valid(), features: 'x'.repeat(81) }).errors.features).toContain('80');
     expect(validateTariffForm({ ...valid(), currency: 'XTR', price: '1,5' }).errors.price).toBe('Цена в звёздах — целое число.');
@@ -105,7 +110,7 @@ describe('tariff form', () => {
   it('round-trips a tariff without spurious changes', () => {
     const source = tariff({ features: ['a', 'b'], description: 'Текст', badge: 'Хит', price_cents: 19990, sort_order: 5 });
     const form = formFromTariff(source, null);
-    expect(form).toMatchObject({ price: '199,90', features: 'a\nb', sortOrder: '5', planId: 3 });
+    expect(form).toMatchObject({ price: '199,90', features: 'a\nb', sortOrder: '5', builderId: 3 });
     expect(sameForm(form, formFromTariff(source, null))).toBe(true);
     const { input } = validateTariffForm(form);
     expect(input && termsChanged(source, input)).toBe(false);
@@ -117,9 +122,35 @@ describe('tariff form', () => {
     expect(base).not.toBeNull();
     if (!base) return;
     expect(termsChanged(source, { ...base, description: 'новое', badge: 'Хит', features: ['x'], is_active: false })).toBe(false);
-    for (const change of [{ name: 'Другой' }, { plan_id: 4 }, { duration_days: 31 }, { price_cents: 1 }, { currency: 'XTR' }]) {
+    for (const change of [{ name: 'Другой' }, { builder_id: 4 }, { duration_days: 31 }, { price_cents: 1 }, { currency: 'XTR' }]) {
       expect(termsChanged(source, { ...base, ...change })).toBe(true);
     }
+  });
+
+  it('a new tariff takes the only сборка and otherwise asks for one', () => {
+    expect(formFromTariff(null, 3).builderId).toBe(3);
+    expect(formFromTariff(null, null).builderId).toBeNull();
+    expect(validateTariffForm({ ...valid(), builderId: null }).errors).toEqual({ builderId: 'Выберите сборку: что получит покупатель.' });
+  });
+
+  it('a legacy tariff without a сборка gets one in place, not as a new version', () => {
+    // The plan of such a tariff (the old "test-customer-1" kind) has no builder:
+    // the form asks for a сборка and the plan adopts it (ensureBuilderSalePlan).
+    const legacy = tariff({ plan_name: 'test-customer-1', builder_id: null, builder_name: '' });
+    const form = formFromTariff(legacy, null);
+    expect(form.builderId).toBeNull();
+    expect(validateTariffForm(form).errors.builderId).toBeDefined();
+    const { input } = validateTariffForm({ ...form, builderId: 9 });
+    expect(input?.builder_id).toBe(9);
+    expect(input && termsChanged(legacy, input)).toBe(false);
+    // Any other term still makes a version.
+    expect(input && termsChanged(legacy, { ...input, price_cents: 1 })).toBe(true);
+  });
+
+  it('maps the server fields of a rejected tariff to the сборка field', () => {
+    expect(SERVER_FIELDS.builder_id).toBe('builderId');
+    // A server that still reports the plan points at the same control.
+    expect(SERVER_FIELDS.plan_id).toBe('builderId');
   });
 
   it('drops blank feature lines', () => {
@@ -159,7 +190,12 @@ describe('tariff API client', () => {
     const { transport, api } = setup();
     transport.mockResolvedValueOnce(json({ tariffs: [tariff(), tariff({ id: 8, builder_id: 2, previous_id: 7 })] }));
     await expect(api.listTariffs()).resolves.toHaveLength(2);
-    for (const bad of [{ features: null }, { price_cents: -1 }, { currency: 'rub' }, { version: 0 }, { in_use: 'no' }]) {
+    // A legacy plan without a сборка, and a response without the builder name.
+    const withoutName: Record<string, unknown> = { ...tariff({ builder_id: null }) };
+    delete withoutName.builder_name;
+    transport.mockResolvedValueOnce(json({ tariffs: [withoutName] }));
+    await expect(api.listTariffs()).resolves.toMatchObject([{ builder_id: null, builder_name: '' }]);
+    for (const bad of [{ features: null }, { price_cents: -1 }, { currency: 'rub' }, { version: 0 }, { in_use: 'no' }, { builder_name: 7 }]) {
       transport.mockResolvedValueOnce(json({ tariffs: [tariff(bad as Partial<AdminTariff>)] }));
       await expect(api.listTariffs()).rejects.toMatchObject({ code: 'invalid_response' });
     }
@@ -169,12 +205,13 @@ describe('tariff API client', () => {
     const { transport, api } = setup();
     transport.mockImplementation(() => Promise.resolve(json({ tariff: tariff(), previous: null, versioned: false, replayed: false, audit: {} })));
     const input = {
-      name: 'Месяц', plan_id: 3, duration_days: 30, price_cents: 19900, currency: 'RUB', description: '', features: [],
+      name: 'Месяц', builder_id: 3, duration_days: 30, price_cents: 19900, currency: 'RUB', description: '', features: [],
       badge: '', is_active: true, sort_order: null,
     };
     await api.createTariff(input, 'ui-key');
+    // Exactly these members: the сборка, never a plan.
     expect(JSON.parse(String(transport.mock.calls[0][1]?.body))).toEqual({
-      request_key: 'ui-key', name: 'Месяц', plan_id: 3, duration_days: 30, price_cents: 19900, currency: 'RUB',
+      request_key: 'ui-key', name: 'Месяц', builder_id: 3, duration_days: 30, price_cents: 19900, currency: 'RUB',
       description: '', features: [], badge: '', is_active: true,
     });
     await api.updateTariff(7, 4, { ...input, sort_order: 2 }, 'ui-key-2');
@@ -186,12 +223,13 @@ describe('tariff API client', () => {
 
   it('reports the rejected field of invalid_tariff', async () => {
     const { transport, api } = setup();
-    transport.mockResolvedValueOnce(json({ error: 'invalid_tariff', field: 'plan_id' }, 400));
+    transport.mockResolvedValueOnce(json({ error: 'invalid_tariff', field: 'builder_id' }, 400));
     const error = await api.createTariff({
-      name: 'x', plan_id: 1, duration_days: 1, price_cents: 1, currency: 'RUB', description: '', features: [], badge: '', is_active: true,
+      name: 'x', builder_id: 1, duration_days: 1, price_cents: 1, currency: 'RUB', description: '', features: [], badge: '', is_active: true,
+      sort_order: null,
     }, 'k').catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(ApiError);
-    expect(error).toMatchObject({ code: 'invalid_tariff', status: 400, field: 'plan_id' });
+    expect(error).toMatchObject({ code: 'invalid_tariff', status: 400, field: 'builder_id' });
   });
 
   it('checks the delete confirmation', async () => {

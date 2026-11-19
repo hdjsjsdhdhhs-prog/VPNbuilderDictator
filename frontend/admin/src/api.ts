@@ -191,6 +191,8 @@ function mutationBody(mutation: Mutation, requestKey: string): string | null {
 
 const CSRF_HEADER = 'X-CSRF-Token';
 const REQUEST_TIMEOUT_MS = 12_000;
+/** A manual monitor check fetches every source and probes every server (server budget 25 s). */
+const MONITOR_CHECK_TIMEOUT_MS = 30_000;
 const DEFAULT_RETRY_AFTER_S = 60;
 
 export function errorText(error: unknown): string {
@@ -207,6 +209,8 @@ export function errorText(error: unknown): string {
     case 'service_unavailable': return 'Сервис временно недоступен. Попробуйте позже.';
     case 'invalid_source': return 'Проверьте параметры источника.';
     case 'sync_in_progress': return 'Источник уже синхронизируется. Дождитесь завершения.';
+    case 'check_in_progress': return 'Проверка уже идёт. Подождите несколько секунд.';
+    case 'check_timeout': return 'Проверка не успела завершиться. Результат появится после фоновой проверки.';
     default: return 'Не удалось выполнить действие. Попробуйте ещё раз.';
   }
 }
@@ -424,6 +428,17 @@ export class AdminApi {
   /** GET /admin/api/monitoring: every builder with its current network state. */
   async monitoring(): Promise<MonitorOverview> {
     const overview = parseMonitorOverview(await this.#send('GET', '/admin/api/monitoring'));
+    if (!overview) throw new ApiError('invalid_response');
+    return overview;
+  }
+
+  /**
+   * POST /admin/api/monitoring/check: re-resolves the builders and probes every
+   * served server right now; answers the fresh overview. 409 check_in_progress
+   * while a pass is already running.
+   */
+  async monitoringCheck(): Promise<MonitorOverview> {
+    const overview = parseMonitorOverview(await this.#send('POST', '/admin/api/monitoring/check', '{}', MONITOR_CHECK_TIMEOUT_MS));
     if (!overview) throw new ApiError('invalid_response');
     return overview;
   }
@@ -1021,7 +1036,10 @@ export interface SourceDependents {
 
 /** database.BuilderDependents: a builder is deletable only while both are empty. */
 export interface BuilderDependents {
-  /** Plans whose default builder it is (the trial plan included). */
+  /**
+   * Plans that keep the builder from being deleted: the trial plan, or its
+   * sale plan while it still has tariffs or subscriptions.
+   */
   readonly plans: readonly DependentRef[];
   /** Subscriptions that override their plan with this builder. */
   readonly subscriptions: number;
@@ -1137,6 +1155,14 @@ export interface UpdateSourceInput {
   readonly type: string;
   /** Omitted keeps the stored end, null clears it, RFC 3339 sets it. */
   readonly expires_at?: string | null;
+  /**
+   * Fetch configuration: omitted keeps the stored value, a value replaces it
+   * (providers rotate links). Write-only: the server never sends them back.
+   */
+  readonly subscription_url?: string;
+  readonly hwid?: string;
+  readonly user_agent?: string;
+  readonly headers?: string;
 }
 
 export interface BuilderSource {
@@ -1157,6 +1183,14 @@ export interface BuilderItem {
   readonly enabled: boolean;
 }
 
+/** database.BuilderSales: how a builder ("сборка") is sold and used right now. */
+export interface BuilderSales {
+  /** The internal sale plan; null until the builder has a tariff. */
+  readonly plan_id: number | null;
+  /** Active subscriptions the builder serves (plan default or personal override). */
+  readonly clients: number;
+}
+
 export interface AdminBuilder {
   readonly id: number;
   readonly name: string;
@@ -1169,6 +1203,8 @@ export interface AdminBuilder {
   readonly sources: readonly BuilderSource[] | null;
   readonly items: readonly BuilderItem[] | null;
   readonly dependents: BuilderDependents;
+  /** Absent only in responses of an older server. */
+  readonly sales?: BuilderSales;
   readonly created_at: string;
   readonly updated_at: string;
 }
@@ -1285,8 +1321,9 @@ export const TARIFF_LIMITS = {
 } as const;
 
 /**
- * A tariff is a Product. Purchase terms (name, plan, duration, price,
- * currency) are frozen once orders or subscriptions reference it (in_use):
+ * A tariff is a Product sold on a builder ("сборка"). Purchase terms (name,
+ * builder, duration, price, currency) are frozen once orders or subscriptions
+ * reference it (in_use):
  * changing them creates a successor version. Prices are minor units; for XTR
  * (Telegram Stars) whole Stars.
  */
@@ -1297,8 +1334,10 @@ export interface AdminTariff {
   readonly plan_id: number;
   readonly plan_name: string;
   readonly plan_active: boolean;
-  /** The plan's default builder; builders are assigned per plan, never per tariff. */
+  /** The builder the tariff sells; null only for a legacy plan without one. */
   readonly builder_id: number | null;
+  /** Name of that builder ('' without one). */
+  readonly builder_name: string;
   readonly duration_days: number;
   readonly price_cents: number;
   readonly currency: string;
@@ -1337,7 +1376,8 @@ export interface TariffPlan {
 /** Editable content of a tariff (web.tariffBody without request_key/version). */
 export interface TariffInput {
   readonly name: string;
-  readonly plan_id: number;
+  /** The builder ("сборка") the tariff sells; the plan behind it is resolved on the server. */
+  readonly builder_id: number;
   readonly duration_days: number;
   readonly price_cents: number;
   readonly currency: string;
@@ -1361,7 +1401,7 @@ export interface TariffOutcome {
 function tariffBody(requestKey: string, input: TariffInput, version?: number): string {
   // Exactly the fields web.tariffBody accepts: unknown fields are rejected.
   const body: Record<string, unknown> = {
-    request_key: requestKey, name: input.name, plan_id: input.plan_id, duration_days: input.duration_days,
+    request_key: requestKey, name: input.name, builder_id: input.builder_id, duration_days: input.duration_days,
     price_cents: input.price_cents, currency: input.currency, description: input.description,
     features: input.features, badge: input.badge, is_active: input.is_active,
   };
@@ -1375,19 +1415,19 @@ const isStringList = (value: unknown): value is string[] => Array.isArray(value)
 function parseTariff(value: unknown): AdminTariff | undefined {
   if (!isRecord(value)) return undefined;
   const {
-    id, offer_id, name, plan_id, plan_name, plan_active, builder_id = null, duration_days, price_cents, currency,
+    id, offer_id, name, plan_id, plan_name, plan_active, builder_id = null, builder_name = '', duration_days, price_cents, currency,
     is_active, description, features, badge, sort_order, version, previous_id = null, replaced_by_id = null,
     orders, subscriptions, in_use, offer_ends_at = null, created_at, updated_at,
   } = value;
   if (!isPositive(id) || !isText(offer_id) || !isText(name) || !isCount(plan_id) || !isText(plan_name) ||
-    typeof plan_active !== 'boolean' || !isNullable(builder_id, isPositive) || !isCount(duration_days) ||
+    typeof plan_active !== 'boolean' || !isNullable(builder_id, isPositive) || !isText(builder_name) || !isCount(duration_days) ||
     !isCount(price_cents) || !isCurrency(currency) || typeof is_active !== 'boolean' || !isText(description) ||
     !isStringList(features) || !isText(badge) || !isCount(sort_order) || !isPositive(version) ||
     !isNullable(previous_id, isPositive) || !isNullable(replaced_by_id, isPositive) || !isCount(orders) ||
     !isCount(subscriptions) || typeof in_use !== 'boolean' || !isNullable(offer_ends_at, isTime) ||
     !isTime(created_at) || !isTime(updated_at)) return undefined;
   return {
-    id, offer_id, name, plan_id, plan_name, plan_active, builder_id, duration_days, price_cents, currency,
+    id, offer_id, name, plan_id, plan_name, plan_active, builder_id, builder_name, duration_days, price_cents, currency,
     is_active, description, features, badge, sort_order, version, previous_id, replaced_by_id,
     orders, subscriptions, in_use, offer_ends_at, created_at, updated_at,
   };

@@ -39,7 +39,7 @@ function events(): Json[] {
     builder_id: 1, source_id: null, target_id: 7, country_code: 'NL', notify_status: 'sent', notified_at: at(1), notify_error: '', details: {},
   };
   return [
-    { ...base, id: 3, created_at: at(5), kind: 'server_down', severity: 'critical', title: 'Сервер недоступен', message: 'NL-1 (vless 203.0.113.7:443) · построитель «Основной» · NL' },
+    { ...base, id: 3, created_at: at(5), kind: 'server_down', severity: 'critical', title: 'Сервер недоступен', message: 'NL-1 (vless 203.0.113.7:443) · сборка «Основной» · NL' },
     { ...base, id: 2, created_at: at(20), kind: 'source_expiring', severity: 'warning', title: 'Источник скоро закончится', message: 'Источник «Provider A» действует до 14.11.2026 12:00 (МСК).', target_id: null, source_id: 4, country_code: '' },
     { ...base, id: 1, created_at: at(40), kind: 'server_up', severity: 'ok', title: 'Сервер восстановлен', message: 'NL-2 · простой 12 мин' },
   ];
@@ -81,6 +81,9 @@ async function backend(page: Page) {
         active_expired: 0, paid: 4, expiring_in_7d: 0, audit_last_24h: 0,
       });
     }
+    // The overview also asks for the network verdict (best effort): this stand
+    // runs without the monitor, like a server with NETMON_ENABLED off.
+    if (path === '/admin/api/monitoring' && method === 'GET') return json(route, 503, { error: 'service_unavailable' });
     const promoMatch = /^\/admin\/api\/promos\/(\d+)$/.exec(path);
     if (path === '/admin/api/promos' && method === 'GET') return json(route, 200, { promos });
     if (path === '/admin/api/promos' && method === 'POST') {

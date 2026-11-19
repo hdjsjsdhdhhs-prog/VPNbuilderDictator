@@ -129,6 +129,8 @@ async function backend(page: Page, options: Options = {}) {
 
     if (pathname === '/admin/login' && method === 'GET') return json(route, 200, { authenticated: true, csrf_token: CSRF });
     if (pathname === '/admin/session' && method === 'GET') return json(route, 200, { authenticated: true, csrf_token: CSRF });
+    // The user page also reads the сборки to name its «Сборка» panel (best effort).
+    if (method === 'GET' && pathname === '/admin/api/builders') return json(route, 200, { builders: [] });
     if (method === 'GET' && (pathname === `/admin/api/users/${TELEGRAM_ID}` || pathname === `/admin/api/subscriptions/${SUB_ID}`)) {
       reads.push(pathname);
       return json(route, 200, detail());
@@ -223,8 +225,8 @@ test('user card renders the page the backend sends: no node state, no plan limit
   const subscription = subscriptionPanel(page);
   await expect(subscription).toContainText(/Устройства\s*2/);
   await expect(subscription).not.toContainText('Лимит тарифа');
-  // Without an external provider the content of /sub comes from a builder.
-  await expect(subscription).toContainText(/Источник\s*Построитель/);
+  // Without an external provider the content of /sub comes from a builder («сборка»).
+  await expect(subscription).toContainText(/Источник\s*Сборка/);
   const plan = page.getByRole('region', { name: 'Тариф', exact: true });
   await expect(plan).toContainText('Стандарт');
   await expect(plan).toContainText('Доступен');

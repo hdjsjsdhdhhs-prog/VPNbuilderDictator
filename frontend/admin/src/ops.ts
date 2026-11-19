@@ -583,7 +583,7 @@ export const SEVERITY_TONES: Readonly<Record<OpsSeverity, 'down' | 'warn' | 'ok'
 export const EVENT_KIND_GROUPS: readonly (readonly [group: string, kinds: readonly (readonly [kind: string, label: string])[]])[] = [
   ['Серверы', [['server_down', 'Сервер недоступен'], ['server_up', 'Сервер восстановлен'], ['server_removed', 'Сервер снят с выдачи']]],
   ['Страны', [['country_down', 'Страна недоступна'], ['country_degraded', 'Страна работает частично'], ['country_up', 'Страна восстановлена'], ['country_removed', 'Страна снята с выдачи']]],
-  ['Построители', [['builder_down', 'Построитель недоступен'], ['builder_up', 'Построитель восстановлен'], ['builder_disabled', 'Построитель отключён']]],
+  ['Сборки', [['builder_down', 'Сборка недоступна'], ['builder_up', 'Сборка восстановлена'], ['builder_disabled', 'Сборка отключена']]],
   ['Источники', [['source_failing', 'Источник не загружается'], ['source_recovered', 'Источник снова работает'], ['source_expiring', 'Источник скоро закончится'], ['source_expired', 'Срок источника истёк'], ['source_disabled', 'Источник отключён']]],
   ['Мониторинг', [['monitor_stalled', 'Проверки остановились'], ['monitor_recovered', 'Проверки возобновились']]],
   ['Отчёты', [['daily_report', 'Итоги дня'], ['test', 'Проверка уведомлений']]],
@@ -678,7 +678,7 @@ export function reportFigures(s: OpsDailyStats): { business: ReportFigure[]; inf
     { label: 'Открытых инцидентов', value: c(s.open_incidents), tone: s.open_incidents > 0 ? 'down' : 'ok' },
     { label: 'Инцидентов за день', value: c(s.incidents_country + s.incidents_server), note: `стран ${c(s.incidents_country)} · серверов ${c(s.incidents_server)}`, tone: s.incidents_country + s.incidents_server > 0 ? 'warn' : 'ok' },
     { label: 'Источников', value: c(s.sources_total), note: `не работает: ${c(s.sources_unusable)}`, tone: s.sources_unusable > 0 ? 'down' : 'ok' },
-    { label: 'Построителей включено', value: c(s.builders_enabled) },
+    { label: 'Сборок включено', value: c(s.builders_enabled) },
   ];
   return { business, infra };
 }

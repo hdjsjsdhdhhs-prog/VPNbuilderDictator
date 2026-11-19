@@ -305,6 +305,9 @@ async function backend(page: Page, options: Options = {}) {
         return json(route, 200, view());
       }
       if (pathname === '/admin/api/tariffs') return json(route, 200, { tariffs: [] });
+      // The Tariffs page also reads the plans for its «Бесплатный доступ» panel
+      // (covered by tariffs.spec.ts); here there is nothing to show.
+      if (pathname === '/admin/api/plans') return json(route, 200, { plans: [] });
       if (pathname === '/admin/api/sources') return json(route, 200, { sources: sources.map(sourceView) });
       const list = /^\/admin\/api\/sources\/(\d+)\/entries$/.exec(pathname);
       if (list) {
@@ -403,7 +406,7 @@ test('route: the Tariffs page links to #/tariffs/trial and back', async ({ page 
   await page.goto('/#/tariffs');
   await expect(heading(page, 'Тарифы')).toBeVisible();
   const entryPanel = page.getByRole('region', { name: 'Пробная подписка' });
-  await expect(entryPanel).toContainText('Платные тарифы и их построители не меняются.');
+  await expect(entryPanel).toContainText('Платные тарифы и их сборки не меняются.');
   await entryPanel.getByRole('link', { name: 'Настроить пробную подписку' }).click();
   await expect(page).toHaveURL(/#\/tariffs\/trial$/);
   await expect(heading(page, 'Пробная подписка')).toBeVisible();
@@ -434,7 +437,7 @@ test('load: stored settings, composition and preview are shown', async ({ page }
   await expect(page.getByLabel('Описание')).toHaveValue('Три дня бесплатно');
   await expect(page.getByLabel('Преимущества')).toHaveValue('Без карты');
   await expect(page.getByLabel('Бейдж', { exact: true })).toHaveValue('Бесплатно');
-  await expect(page.getByLabel('Построитель', { exact: true })).toHaveValue('7');
+  await expect(page.getByLabel('Сборка', { exact: true })).toHaveValue('7');
   await expect(page.locator('.page-desc')).toContainText('Версия 1');
   await expect(page.getByRole('radio', { name: /^Все страны/ })).toBeChecked();
   await expect(editor(page).getByText('Изменений нет.')).toBeVisible();
@@ -463,18 +466,18 @@ test('load: nothing stored shows the environment values and saves version 0', as
   await expect(page.locator('.page-desc')).toContainText('Сейчас действуют значения из окружения сервера.');
   await expect(page.getByLabel('Срок', { exact: true })).toHaveValue('3');
   await expect(page.getByLabel('Единица')).toHaveValue('hours');
-  await expect(page.getByLabel('Построитель', { exact: true })).toHaveValue('');
-  await expect(page.getByRole('region', { name: 'Состав' })).toContainText('Пробная подписка собирается только построителем тарифа «trial»: без него она не выдаётся.');
-  await expect(page.getByRole('region', { name: 'Страны' })).toContainText('Выберите построитель в разделе «Состав»');
+  await expect(page.getByLabel('Сборка', { exact: true })).toHaveValue('');
+  await expect(page.getByRole('region', { name: 'Состав' })).toContainText('Пробная подписка выдаёт серверы выбранной сборки: без неё она не выдаётся.');
+  await expect(page.getByRole('region', { name: 'Страны' })).toContainText('Выберите сборку в разделе «Состав»');
   // Without a builder /sub has nothing to serve: the preview blocks issuance.
   await expect(preview(page).locator('[data-preview="blocked"]')).toContainText('С такой конфигурацией пробная подписка не выдаётся.');
-  await expect(preview(page).locator('.trial-problems')).toContainText('Выберите построитель: без него пробная подписка не выдаётся.');
+  await expect(preview(page).locator('.trial-problems')).toContainText('Выберите сборку: без неё пробная подписка не выдаётся.');
 
   // Switched on, the server refuses it and marks the builder field.
   await page.getByLabel('Название', { exact: true }).fill('Пробный');
   await saveButton(page).click();
-  await expect(statusText(page)).toContainText('Сервер не сохранил настройки: Выберите построитель');
-  await expect(page.getByLabel('Построитель', { exact: true })).toHaveAttribute('aria-invalid', 'true');
+  await expect(statusText(page)).toContainText('Сервер не сохранил настройки: Выберите сборку');
+  await expect(page.getByLabel('Сборка', { exact: true })).toHaveAttribute('aria-invalid', 'true');
   expect(api.settings().version).toBe(0);
 
   // Switched off, the configuration may be prepared without a builder.
@@ -552,9 +555,9 @@ test('duration: presets, units, bounds and the saved value', async ({ page }) =>
 test('builder: switching builders shows their composition and usage', async ({ page }) => {
   const api = await backend(page);
   await openTrial(page);
-  const select = page.getByLabel('Построитель', { exact: true });
+  const select = page.getByLabel('Сборка', { exact: true });
   await expect(select.locator('option')).toHaveText([
-    'Не выбран — пробная подписка не выдаётся', 'Основной — общий', 'Отключённый — отключён', 'Пробный',
+    'Не выбрана — пробная подписка не выдаётся', 'Основной — общая', 'Отключённый — отключена', 'Пробный',
   ]);
   const composition = page.getByRole('region', { name: 'Состав' });
   await expect(composition).toContainText('Только пробной подпиской');
@@ -572,8 +575,8 @@ test('builder: switching builders shows their composition and usage', async ({ p
 
   // Without a builder: nothing to serve, no countries, issuance is blocked.
   await select.selectOption('');
-  await expect(composition).toContainText('Пробная подписка собирается только построителем тарифа «trial»');
-  await expect(preview(page).locator('.trial-problems')).toContainText('Выберите построитель: без него пробная подписка не выдаётся.');
+  await expect(composition).toContainText('Пробная подписка выдаёт серверы выбранной сборки');
+  await expect(preview(page).locator('.trial-problems')).toContainText('Выберите сборку: без неё пробная подписка не выдаётся.');
 
   await select.selectOption('8');
   await expect(composition).toContainText('тарифы: Стандарт');
@@ -620,7 +623,7 @@ test('countries and nodes: selection maps to country and node rules', async ({ p
   await expect(countries.locator('.trial-country').filter({ hasText: 'Без страны' })).toContainText('выбирается по серверам');
 
   // A second source: its catalogue loads and its countries can be added.
-  await page.getByRole('group', { name: 'Источники построителя' }).getByRole('checkbox', { name: /^Provider B/ }).check();
+  await page.getByRole('group', { name: 'Источники сборки' }).getByRole('checkbox', { name: /^Provider B/ }).check();
   await expect(countryBox(page, 'JP')).toBeVisible();
   await countryBox(page, 'JP').check();
 
@@ -667,16 +670,16 @@ test('preview: the server evaluates the draft without saving; problems block iss
   expect(api.history()).toHaveLength(0);
 
   // A disabled builder: the preview names the problem.
-  await page.getByLabel('Построитель', { exact: true }).selectOption('9');
+  await page.getByLabel('Сборка', { exact: true }).selectOption('9');
   const blocked = preview(page).locator('[data-preview="blocked"]');
   await expect(blocked).toContainText('С такой конфигурацией пробная подписка не выдаётся.');
-  await expect(preview(page).locator('.trial-problems')).toContainText('Построитель отключён: новые пробные подписки не выдаются.');
-  await expect(page.getByRole('region', { name: 'Состав' })).toContainText('Новые пробные подписки не выдаются, пока построитель отключён.');
+  await expect(preview(page).locator('.trial-problems')).toContainText('Сборка отключена: новые пробные подписки не выдаются.');
+  await expect(page.getByRole('region', { name: 'Состав' })).toContainText('Новые пробные подписки не выдаются, пока сборка отключена.');
 
   // Saving it switched on is refused by the server and the field is marked.
   await saveButton(page).click();
-  await expect(statusText(page)).toContainText('Сервер не сохранил настройки: Построитель отключён');
-  await expect(page.getByLabel('Построитель', { exact: true })).toHaveAttribute('aria-invalid', 'true');
+  await expect(statusText(page)).toContainText('Сервер не сохранил настройки: Сборка отключена');
+  await expect(page.getByLabel('Сборка', { exact: true })).toHaveAttribute('aria-invalid', 'true');
   expect(api.settings().version).toBe(1);
 
   // Switched off, the configuration may be prepared.
@@ -691,7 +694,7 @@ test('preview: the server evaluates the draft without saving; problems block iss
   expect(puts[0].body.request_key).not.toBe(puts[1].body.request_key);
 
   // Switched off with a valid configuration: an informational preview.
-  await page.getByLabel('Построитель', { exact: true }).selectOption('7');
+  await page.getByLabel('Сборка', { exact: true }).selectOption('7');
   await expect(preview(page).locator('[data-preview="off"]')).toContainText('Выдача выключена. Конфигурация корректна');
   expect(api.problems()).toEqual([]);
 });
@@ -758,7 +761,7 @@ test('builder version conflict: rules edited elsewhere are not overwritten', asy
   await countryBox(page, 'NL').check();
   api.touchBuilder(7);
   await saveButton(page).click();
-  await expect(statusText(page).getByRole('alert')).toContainText('Построитель изменили в другом окне.');
+  await expect(statusText(page).getByRole('alert')).toContainText('Сборку изменили в другом окне.');
   expect(api.builder(7).items).toEqual([]);
   expect(api.settings().version).toBe(1);
   expect(api.problems()).toEqual([]);
@@ -768,14 +771,14 @@ test('shared builder: composition is read-only, a copy is created and edited ins
   const api = await backend(page, { trialBuilder: 8 });
   await openTrial(page);
   const composition = page.getByRole('region', { name: 'Состав' });
-  await expect(page.getByLabel('Построитель', { exact: true })).toHaveValue('8');
-  await expect(composition).toContainText('Этот построитель используют другие тарифы или подписки');
+  await expect(page.getByLabel('Сборка', { exact: true })).toHaveValue('8');
+  await expect(composition).toContainText('Эту сборку используют другие тарифы или подписки');
   await expect(countryBox(page, 'DE')).toBeDisabled();
-  await expect(page.getByRole('group', { name: 'Источники построителя' })).toHaveCount(0);
+  await expect(page.getByRole('group', { name: 'Источники сборки' })).toHaveCount(0);
 
   // Cancelling the confirmation sends nothing.
   await composition.getByRole('button', { name: 'Создать копию для пробной подписки' }).click();
-  const confirm = page.getByRole('dialog', { name: 'Создать копию построителя?' });
+  const confirm = page.getByRole('dialog', { name: 'Создать копию сборки?' });
   await expect(confirm).toContainText('Тарифы и подписки, которые используют «Основной», не изменятся.');
   await confirm.getByRole('button', { name: 'Отмена' }).click();
   await expect(confirm).toBeHidden();
@@ -783,10 +786,10 @@ test('shared builder: composition is read-only, a copy is created and edited ins
 
   await composition.getByRole('button', { name: 'Создать копию для пробной подписки' }).click();
   await confirm.getByRole('button', { name: 'Создать копию' }).click();
-  await expect(statusText(page)).toContainText('Создан построитель «Основной · пробная» и назначен пробной подписке.');
+  await expect(statusText(page)).toContainText('Создана сборка «Основной · пробная» и назначена пробной подписке.');
   const [copy] = api.mutations('/admin/api/trial/builder-copy');
   expect(copy.body).toEqual({ request_key: expect.stringMatching(KEY_PATTERN), builder_id: 8 });
-  await expect(page.getByLabel('Построитель', { exact: true })).toHaveValue('10');
+  await expect(page.getByLabel('Сборка', { exact: true })).toHaveValue('10');
   await expect(composition).toContainText('Только пробной подпиской');
   // The copy is already assigned: nothing left to save.
   await expect(saveButton(page)).toBeDisabled();
@@ -803,7 +806,7 @@ test('shared builder: composition is read-only, a copy is created and edited ins
   expect(api.builder(8).items.map(it => it.country_code || it.fingerprint)).toEqual(['US', 'a-nl']);
   expect(api.plan('Стандарт').builder).toBe(8);
   expect(api.plan('trial').builder).toBe(10);
-  await expect(page.getByRole('region', { name: 'Дополнительно' })).toContainText('Создана копия построителя · admin');
+  await expect(page.getByRole('region', { name: 'Дополнительно' })).toContainText('Создана копия сборки · admin');
   expect(api.problems()).toEqual([]);
 });
 

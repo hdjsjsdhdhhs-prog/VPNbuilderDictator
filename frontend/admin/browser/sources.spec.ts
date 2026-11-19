@@ -1,8 +1,10 @@
 import { test, expect } from '@playwright/test';
 import type { Page, Route } from '@playwright/test';
 
-// Source catalogue and its use in the Builder, against a mock backend that
-// follows the real contract:
+// Sources and сборки, against a mock backend that follows the real contract.
+// A source is a provider subscription bought by the owner; a сборка (a
+// subscription builder) is what a client gets: countries and servers of the
+// sources, their names and the price.
 //   routes    internal/web/admin_builder_api.go (create returns {source, sync},
 //             refresh takes no entries and answers 200 with a sync result even
 //             when the upstream failed, unknown fields are rejected)
@@ -50,6 +52,8 @@ interface Builder {
   version: number; sources: { source_id: number; position: number }[]; items: Item[];
   dependents?: { plans: DependentRef[]; subscriptions: number };
 }
+/** service.TariffView of a price created in the constructor. */
+interface Tariff { id: number; builder_id: number; [field: string]: unknown }
 interface Call { method: string; path: string; body: Record<string, unknown> }
 
 const e = (fingerprint: string, original_name: string, country_code: string, protocol = 'vless'): EntryInput =>
@@ -62,7 +66,9 @@ const CATALOGUE_A = [
 const CATALOGUE_B = [e('b1', '🇺🇸 New York', 'US'), e('b2', '🇺🇸 Dallas', 'US'), e('b3', '🇩🇪 Munich', 'DE')];
 
 const CREATE_FIELDS = ['name', 'description', 'type', 'subscription_url', 'hwid', 'user_agent', 'headers', 'enabled', 'expires_at'];
-const UPDATE_FIELDS = ['name', 'description', 'type', 'expires_at'];
+// The link and the request parameters are write-only: sent only when replaced.
+const UPDATE_FIELDS = ['name', 'description', 'type', 'expires_at', 'subscription_url', 'hwid', 'user_agent', 'headers'];
+const TARIFF_FIELDS = ['request_key', 'name', 'builder_id', 'duration_days', 'price_cents', 'currency', 'description', 'features', 'badge', 'sort_order', 'is_active'];
 /** The form the panel sends expires_at in: RFC 3339, UTC, whole seconds. */
 const RFC3339_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 const ITEM_FIELDS = ['id', 'kind', 'source_id', 'country_code', 'fingerprint', 'original_name', 'custom_name', 'description', 'position', 'enabled'];
@@ -143,13 +149,17 @@ async function backend(page: Page, options: BackendOptions = {}) {
     sources: (options.builderSources ?? [1]).map((source_id, position) => ({ source_id, position })), items: [],
   }];
   const reads: string[] = [];
+  const tariffs: Tariff[] = [];
   const failures = { list: false, get: false };
   /** service.BuilderView: a snapshot of the stored row, sources and items by position. */
   const stored = (b: Builder): Builder => structuredClone({
     ...b,
     sources: [...b.sources].sort((x, y) => x.position - y.position),
     items: [...b.items].sort((x, y) => x.position - y.position),
-    dependents: builderDeps,
+    // The fixture сборка carries the configured dependents; a new one has none.
+    dependents: b.id === 7 ? builderDeps : { plans: [], subscriptions: 0 },
+    // database.BuilderSales: the internal sale plan appears with the first tariff.
+    sales: { plan_id: tariffs.some(t => t.builder_id === b.id) ? 100 + b.id : null, clients: 0 },
   });
 
   /** service.SourceView: metadata and catalogue statistics, never the URL or credentials. */
@@ -277,6 +287,10 @@ async function backend(page: Page, options: BackendOptions = {}) {
         const found = builders.find(x => x.id === Number(oneBuilder[1]));
         return found ? json(route, 200, stored(found)) : json(route, 404, { error: 'not_found' });
       }
+      if (pathname === '/admin/api/tariffs') return json(route, 200, { tariffs });
+      // The сборки screens ask for the network verdict (best effort): this
+      // stand runs without the monitor.
+      if (pathname === '/admin/api/monitoring') return json(route, 503, { error: 'service_unavailable' });
       problems.push(`unexpected GET ${pathname}`);
       return json(route, 404, { error: 'not_found' });
     }
@@ -332,6 +346,10 @@ async function backend(page: Page, options: BackendOptions = {}) {
       // stored value re-sent is accepted, any other end must be in the future.
       if (method === 'PATCH') {
         if (unknown(UPDATE_FIELDS).length) { problems.push(`unknown fields ${unknown(UPDATE_FIELDS)}`); return json(route, 400, { error: 'invalid_request' }); }
+        // A replaced link is validated like on create and never echoed.
+        if ('subscription_url' in body && !/^https?:\/\/[^\s/#]+/.test(String(body.subscription_url))) {
+          return json(route, 400, { error: 'invalid_source', field: 'subscription_url' });
+        }
         if ('expires_at' in body) {
           const until = body.expires_at;
           const unchanged = typeof until === 'string' && src.expires_at !== null && Date.parse(until) === Date.parse(src.expires_at);
@@ -353,6 +371,45 @@ async function backend(page: Page, options: BackendOptions = {}) {
       sources.splice(sources.indexOf(src), 1);
       for (let i = entries.length - 1; i >= 0; i--) if (entries[i].source_id === src.id) entries.splice(i, 1);
       return json(route, 200, { deleted: src.id, audit: {} });
+    }
+
+    // service.CreateBuilder: metadata only; sources and rules come with the
+    // configuration save that follows.
+    if (method === 'POST' && pathname === '/admin/api/builders') {
+      const fields = BUILDER_FIELDS.filter(field => field !== 'version');
+      if (unknown(fields).length || !KEY_PATTERN.test(String(body.request_key))) {
+        problems.push(`builder create body ${unknown(fields)}`);
+        return json(route, 400, { error: 'invalid_request' });
+      }
+      if (builders.some(x => x.name === body.name)) return json(route, 409, { error: 'name_taken' });
+      const created: Builder = {
+        id: Math.max(7, ...builders.map(x => x.id)) + 1, name: String(body.name), description: String(body.description),
+        enabled: Boolean(body.enabled), profile_title: String(body.profile_title), support_url: String(body.support_url),
+        announce: String(body.announce), version: 1, sources: [], items: [],
+      };
+      builders.push(created);
+      return json(route, 201, { builder: stored(created), audit: {} });
+    }
+    // web.tariffBody: a price of a сборка is a tariff sold on it — builder_id,
+    // never a plan.
+    if (method === 'POST' && pathname === '/admin/api/tariffs') {
+      if (unknown(TARIFF_FIELDS).length || !KEY_PATTERN.test(String(body.request_key))) {
+        problems.push(`tariff body ${unknown(TARIFF_FIELDS)}`);
+        return json(route, 400, { error: 'invalid_request' });
+      }
+      const owner = builders.find(x => x.id === body.builder_id);
+      if (!owner) return json(route, 400, { error: 'invalid_tariff', field: 'builder_id' });
+      const id = tariffs.length + 1;
+      const tariff: Tariff = {
+        id, offer_id: String(id).padStart(32, '0'), name: String(body.name), plan_id: 100 + owner.id, plan_name: owner.name,
+        plan_active: true, builder_id: owner.id, builder_name: owner.name, duration_days: Number(body.duration_days),
+        price_cents: Number(body.price_cents), currency: String(body.currency), is_active: Boolean(body.is_active),
+        description: String(body.description), features: body.features as string[], badge: String(body.badge), sort_order: id - 1,
+        version: 1, previous_id: null, replaced_by_id: null, orders: 0, subscriptions: 0, in_use: false, offer_ends_at: null,
+        created_at: T0, updated_at: T0,
+      };
+      tariffs.push(tariff);
+      return json(route, 201, { tariff, previous: null, versioned: false, replayed: false, audit: {} });
     }
 
     const bm = /^\/admin\/api\/builders\/(\d+)(?:\/(sources|items|reorder|preview|enable|disable|configuration))?(?:\/(\d+))?$/.exec(pathname);
@@ -442,6 +499,8 @@ async function backend(page: Page, options: BackendOptions = {}) {
       (!path || (typeof path === 'string' ? c.path === path : path.test(c.path))) && (!method || c.method === method)),
     problems: () => problems,
     builder: () => builders[0],
+    builders: () => builders,
+    tariffs: () => tariffs,
     /** GET requests of the builder list and of single builders, in order. */
     reads: () => reads,
     failures,
@@ -472,16 +531,23 @@ async function openDetail(page: Page, id: number, name: string) {
   await expect(region(page, 'Сводка')).toBeVisible();
 }
 
-async function openBuilder(page: Page) {
-  await page.goto('/#/builders');
-  await page.getByRole('button', { name: 'Редактировать' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Построитель: Основной' });
-  await expect(dialog).toBeVisible();
-  // The editor loads the source catalogues itself when the list was not visited.
-  await expect(dialog.locator('.source-pick-item', { hasText: 'Provider A' })).toBeVisible();
-  return dialog;
-}
+/** A card of the «Сборки» list. */
+const buildCard = (page: Page, id = 7) => page.locator(`.bd-card[data-build-id="${id}"]`);
+const buildForm = (page: Page) => page.getByRole('form', { name: 'Параметры сборки' });
+/** The live preview of the constructor: what a client gets. */
+const buildPreview = (page: Page) => region(page, 'Подписка клиента');
+const previewTotal = (page: Page) => buildPreview(page).locator('.bd-preview-total');
+const sourcePick = (page: Page, name: string) =>
+  page.getByRole('group', { name: 'Источники сборки' }).getByRole('checkbox', { name: new RegExp(`^${name}`) });
+const countryPick = (page: Page, name: string) => page.locator('.bd-country', { hasText: name }).locator('.bd-country-head input');
 
+/** Opens the constructor of a stored сборка and waits for its catalogue. */
+async function openBuild(page: Page, id = 7, name = 'Основной') {
+  await page.goto(`/#/builders/${id}`);
+  await expect(heading(page, name)).toBeVisible();
+  await expect(buildForm(page)).toBeVisible();
+  await expect(previewTotal(page)).not.toHaveText('Считаем серверы…');
+}
 test.describe('sources', () => {
   test('list: sync status, servers and countries of each source', async ({ page }) => {
     const api = await backend(page);
@@ -507,13 +573,28 @@ test.describe('sources', () => {
     expect(api.problems()).toEqual([]);
   });
 
-  test('create: Auto format by default, validation, initial sync, no URL echo', async ({ page }) => {
+  test('create: the link is the only required field; validation, initial sync, no URL echo', async ({ page }) => {
     const api = await backend(page, { outcomes: { 4: [{ entries: [e('n1', '🇫🇮 Helsinki', 'FI'), e('n2', '🇫🇮 Tampere', 'FI', 'trojan'), e('n3', '🇸🇪 Stockholm', 'SE')] }] } });
     await page.goto('/#/sources');
     await page.getByRole('button', { name: 'Добавить источник' }).first().click();
     const dialog = page.getByRole('dialog', { name: 'Новый источник' });
     await expect(dialog).toBeVisible();
+    // The common case is one field: it comes first and has the focus; what a
+    // provider rarely needs is folded away.
+    const link = dialog.getByLabel('Ссылка на подписку провайдера');
+    await expect(link).toBeFocused();
+    await expect(dialog.getByLabel('Формат подписки')).toBeHidden();
 
+    const submit = dialog.getByRole('button', { name: 'Создать и синхронизировать' });
+    await submit.click();
+    await expect(dialog.getByText('Нужен полный адрес http:// или https:// без #фрагмента.')).toBeVisible();
+    await link.fill('provider.test/sub');
+    await submit.click();
+    await expect(dialog.getByText('Нужен полный адрес http:// или https:// без #фрагмента.')).toBeVisible();
+    await expect(link).toHaveAttribute('aria-invalid', 'true');
+    await link.fill(SECRET_URL);
+
+    await dialog.getByText('Дополнительно', { exact: true }).click();
     const format = dialog.getByLabel('Формат подписки');
     await expect(format).toHaveValue('auto');
     await expect(format.locator('option')).toHaveText([
@@ -522,20 +603,12 @@ test.describe('sources', () => {
     await format.selectOption('clash');
     await expect(dialog).toContainText('YAML-конфиг с разделом proxies.');
     await format.selectOption('auto');
-
-    const submit = dialog.getByRole('button', { name: 'Создать и синхронизировать' });
-    await submit.click();
-    await expect(dialog.getByText('Введите название (до 255 символов).')).toBeVisible();
-    await dialog.getByLabel('Название').fill('Nordic');
-    await dialog.getByLabel('URL подписки').fill('provider.test/sub');
-    await submit.click();
-    await expect(dialog.getByText('Нужен полный адрес http:// или https:// без #фрагмента.')).toBeVisible();
-    await dialog.getByLabel('URL подписки').fill(SECRET_URL);
     await dialog.getByLabel('Дополнительные заголовки').fill('{broken');
     await submit.click();
     await expect(dialog.getByText(/Заголовки — JSON-объект/)).toBeVisible();
     expect(api.calls('/admin/api/sources', 'POST')).toHaveLength(0);
 
+    await dialog.getByLabel('Название').fill('Nordic');
     await dialog.getByLabel('Дополнительные заголовки').fill('{"X-Client": "panel"}');
     await submit.click();
     await expect(heading(page, 'Nordic')).toBeVisible();
@@ -557,20 +630,23 @@ test.describe('sources', () => {
     expect(api.problems()).toEqual([]);
   });
 
-  test('create: a failed initial sync keeps the source and says why; server field errors', async ({ page }) => {
+  test('create: the name defaults to the host of the link; a failed initial sync keeps the source and says why', async ({ page }) => {
     const api = await backend(page, { outcomes: { 4: [{ error: 'http_403' }] } });
     await page.goto('/#/sources');
     await page.getByRole('button', { name: 'Добавить источник' }).first().click();
     const dialog = page.getByRole('dialog', { name: 'Новый источник' });
-    await dialog.getByLabel('Название').fill('Guarded');
-    await dialog.getByLabel('URL подписки').fill('https://provider.test/rejected');
+    const link = dialog.getByLabel('Ссылка на подписку провайдера');
+    // The server names the field it rejects.
+    await link.fill('https://provider.test/rejected');
     await dialog.getByRole('button', { name: 'Создать и синхронизировать' }).click();
     await expect(dialog.getByText('Нужен полный адрес http:// или https:// без #фрагмента.')).toBeVisible();
-    await expect(dialog.getByLabel('URL подписки')).toHaveAttribute('aria-invalid', 'true');
+    await expect(link).toHaveAttribute('aria-invalid', 'true');
 
-    await dialog.getByLabel('URL подписки').fill('https://provider.test/guarded');
+    await link.fill('https://www.guarded.example/list');
     await dialog.getByRole('button', { name: 'Создать и синхронизировать' }).click();
-    await expect(heading(page, 'Guarded')).toBeVisible();
+    // No name was typed: the source is called after the host of its link.
+    await expect(heading(page, 'guarded.example')).toBeVisible();
+    expect(api.calls('/admin/api/sources', 'POST').at(-1)!.body).toMatchObject({ name: 'guarded.example', type: 'auto', enabled: true });
     const status = page.locator('.source-sync-status');
     await expect(status).toContainText('Синхронизация не удалась. Источник ответил ошибкой HTTP 403. Каталог пуст.');
     await expect(region(page, 'Сводка')).toContainText('Ошибка синхронизации');
@@ -578,6 +654,35 @@ test.describe('sources', () => {
     expect(api.problems()).toEqual([]);
   });
 
+  test('edit: a new link from the provider replaces the stored one and the catalogue is read again', async ({ page }) => {
+    const api = await backend(page);
+    api.queue(1, { entries: [...CATALOGUE_A, e('a7', '🇫🇷 Paris', 'FR')] });
+    await page.goto('/#/sources');
+    const list = region(page, 'Источники');
+    await list.getByRole('button', { name: 'Изменить «Provider A»' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Источник: Provider A' });
+    await dialog.getByText('Заменить ссылку подписки', { exact: true }).click();
+    // The stored link never reaches the browser: the field starts empty.
+    const link = dialog.getByLabel('Новая ссылка на подписку');
+    await expect(link).toHaveValue('');
+    await link.fill('not a link');
+    await dialog.getByRole('button', { name: 'Сохранить' }).click();
+    await expect(dialog.getByText('Нужен полный адрес http:// или https:// без #фрагмента.')).toBeVisible();
+    expect(api.calls('/admin/api/sources/1', 'PATCH')).toHaveLength(0);
+
+    await link.fill('https://rotated.example/list');
+    await dialog.getByRole('button', { name: 'Сохранить' }).click();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(page.locator('.toast-region')).toContainText('Изменения сохранены, каталог серверов обновлён.');
+    // Only what was typed is replaced; then the source is read again at once.
+    expect(api.calls('/admin/api/sources/1', 'PATCH').map(c => c.body)).toEqual([
+      { name: 'Provider A', description: '', type: 'auto', subscription_url: 'https://rotated.example/list' },
+    ]);
+    expect(api.calls('/admin/api/sources/1/refresh')).toHaveLength(1);
+    await expect(list.getByRole('listitem', { name: 'Provider A' }).locator('.source-stats')).toHaveText('6 серверов · 3 страны');
+    await expect(page.locator('body')).not.toContainText('rotated.example');
+    expect(api.problems()).toEqual([]);
+  });
   test('details: statistics and country breakdown', async ({ page }) => {
     const api = await backend(page);
     await openDetail(page, 1, 'Provider A');
@@ -685,338 +790,177 @@ test.describe('sources', () => {
   });
 });
 
-test.describe('builder list shows the stored configuration', () => {
-  const card = (page: Page) => page.locator('.builder-item', { hasText: 'Основной' });
-  const addCountry = async (page: Page, dialog: ReturnType<Page['getByRole']>, code: string) => {
-    await dialog.getByRole('button', { name: 'Добавить правило' }).click();
-    const rule = page.getByRole('dialog', { name: 'Новое правило' });
-    await rule.getByLabel('Страна', { exact: true }).selectOption(code);
-    await rule.getByRole('button', { name: 'Применить' }).click();
-    await expect(rule).toBeHidden();
-  };
+test.describe('сборки', () => {
+  const rule = (over: Partial<Item> & Pick<Item, 'id' | 'kind' | 'source_id' | 'position'>): Item => ({
+    country_code: '', fingerprint: '', original_name: '', custom_name: null, description: '', enabled: true, ...over,
+  });
 
-  test('card counts linked sources and rules and names the countries', async ({ page }) => {
+  test('list: what each сборка gives, its price, health and clients', async ({ page }) => {
     const api = await backend(page, { builderSources: [1, 2] });
     api.changeBuilder(b => {
       b.items = [
-        { id: 51, kind: 'country', source_id: 1, country_code: 'DE', fingerprint: '', original_name: '', custom_name: null, description: '', position: 0, enabled: true },
-        { id: 52, kind: 'node', source_id: 2, country_code: '', fingerprint: 'b2', original_name: '🇺🇸 Dallas', custom_name: null, description: '', position: 1, enabled: true },
-        { id: 53, kind: 'country', source_id: 2, country_code: 'US', fingerprint: '', original_name: '', custom_name: null, description: '', position: 2, enabled: false },
+        rule({ id: 51, kind: 'country', source_id: 1, country_code: 'DE', position: 0 }),
+        rule({ id: 52, kind: 'node', source_id: 2, fingerprint: 'b2', original_name: '🇺🇸 Dallas', position: 1 }),
+        rule({ id: 53, kind: 'country', source_id: 2, country_code: 'US', position: 2, enabled: false }),
       ];
     });
     await page.goto('/#/builders');
-    await expect(card(page).locator('.builder-meta')).toHaveText('v1 · 2 источника · 3 правила (1 выкл.)');
-    await expect(card(page).locator('.builder-composition')).toHaveText('Страны: 🇩🇪 DE · отдельных серверов: 1');
+    await expect(heading(page, 'Сборки')).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Сборки', exact: true })).toHaveAttribute('aria-current', 'page');
+    await expect(page.locator('.bd-summary')).toHaveText('1 сборка · в продаже 0');
+    const card = buildCard(page);
+    await expect(card.locator('.bd-card-title')).toHaveText('Основной');
+    // A whole country counts by the catalogue, a single server as one; the
+    // switched-off rule gives nothing.
+    await expect(card.locator('.bd-card-facts')).toHaveText('4 сервера · 1 страна · выбранные страны и серверы');
+    await expect(card.locator('.bd-codes')).toHaveText('DE');
+    await expect(card).toContainText('Без цены');
+    await expect(card.locator('.bd-card-prices')).toHaveText('Цена не задана: купить эту сборку пока нельзя');
+    await expect(card.locator('.bd-card-meta')).toHaveText('0 клиентов · источник: Provider A, Provider B');
+    await expect(card.locator('.bd-card-health')).toHaveText('Проверка ещё не выполнялась');
+    // The plan a сборка is sold on is internal: the list never mentions one.
+    await expect(page.getByRole('main')).not.toContainText(/план/i);
+
+    await card.getByRole('link', { name: 'Открыть «Основной»' }).click();
+    await expect(page).toHaveURL(/#\/builders\/7$/);
+    await expect(heading(page, 'Основной')).toBeVisible();
     expect(api.problems()).toEqual([]);
   });
 
-  test('saved countries survive closing, reopening, a full reload and another save', async ({ page }) => {
+  test('create: source, countries, names and price on one page; the result is what a client gets', async ({ page }) => {
     const api = await backend(page);
-    await page.goto('/#/builders');
-    await expect(card(page).locator('.builder-meta')).toHaveText('v1 · 1 источник · 0 правил');
-    await expect(card(page).locator('.builder-composition')).toHaveText('Без правил: все серверы подключённых источников.');
+    await page.goto('/#/builders/new');
+    await expect(heading(page, 'Новая сборка')).toBeVisible();
 
-    await card(page).getByRole('button', { name: 'Редактировать' }).click();
-    let dialog = page.getByRole('dialog', { name: 'Построитель: Основной' });
-    await expect(dialog.locator('.source-pick-selected')).toHaveCount(1);
-    await addCountry(page, dialog, 'DE');
-    await addCountry(page, dialog, 'NL');
-    await dialog.getByRole('button', { name: 'Сохранить' }).click();
-    await expect(dialog.getByText('Изменения сохранены.')).toBeVisible();
-    // The card follows the stored record right after the save.
-    await expect(card(page).locator('.builder-meta')).toHaveText('v2 · 1 источник · 2 правила');
-    await expect(card(page).locator('.builder-composition')).toHaveText('Страны: 🇩🇪 DE, 🇳🇱 NL');
-    await dialog.getByRole('button', { name: 'Закрыть' }).click();
-    await expect(dialog).toBeHidden();
+    // 1. The source. Everything it has is the default: a wide subscription.
+    await sourcePick(page, 'Provider A').check();
+    await expect(previewTotal(page)).toHaveText('5 серверов · 2 страны');
+    const name = page.getByLabel('Название сборки');
+    await expect(name).toHaveValue('Все серверы · Provider A');
 
-    // Reopen: the editor reads GET /builders/7, rules and sources are there.
-    await card(page).getByRole('button', { name: 'Редактировать' }).click();
-    dialog = page.getByRole('dialog', { name: 'Построитель: Основной' });
-    await expect(dialog.getByRole('listitem', { name: '🇩🇪 DE' })).toBeVisible();
-    await expect(dialog.getByRole('listitem', { name: '🇳🇱 NL' })).toBeVisible();
-    await expect(dialog.locator('.source-pick-selected')).toHaveText(/Provider A/);
-    await dialog.getByRole('button', { name: 'Закрыть' }).click();
+    // 2. A narrow one: only what is ticked. The name follows the choice.
+    await page.getByRole('radio', { name: /Выбрать страны и серверы/ }).check();
+    await expect(buildPreview(page)).toContainText('Ничего не отмечено: клиент получит пустую подписку.');
+    await countryPick(page, 'Германия').check();
+    await expect(page.locator('.bd-country', { hasText: 'Германия' })).toContainText('Вся страна: новые серверы провайдера добавятся сами.');
+    await expect(previewTotal(page)).toHaveText('3 сервера · 1 страна');
+    await expect(name).toHaveValue('Германия');
+    await page.getByRole('button', { name: 'Показать серверы: Нидерланды' }).click();
+    await page.getByRole('checkbox', { name: '🇳🇱 Amsterdam' }).check();
+    await expect(previewTotal(page)).toHaveText('4 сервера · 2 страны');
+    await expect(name).toHaveValue('Германия и Нидерланды');
 
-    await page.reload();
-    await expect(card(page).locator('.builder-meta')).toHaveText('v2 · 1 источник · 2 правила');
-    await card(page).getByRole('button', { name: 'Редактировать' }).click();
-    dialog = page.getByRole('dialog', { name: 'Построитель: Основной' });
-    await expect(dialog.getByRole('listitem', { name: '🇩🇪 DE' })).toBeVisible();
-    await expect(dialog.locator('.source-pick-selected')).toHaveCount(1);
+    // 3. Names the client sees.
+    await page.getByLabel('Своё название: Германия').fill('DE Fast');
+    await expect(buildPreview(page).locator('.bd-preview-name')).toHaveText(['DE Fast', 'DE Fast', 'DE Fast', '🇳🇱 Amsterdam']);
 
-    // Saving the reopened builder keeps its sources and rules (no empty overwrite).
-    await dialog.getByRole('button', { name: 'Сохранить' }).click();
-    await expect(dialog.getByText('Изменения сохранены.')).toBeVisible();
-    // One configuration request per save, each with the loaded version and the
-    // full source list; no single-step source/rule requests any more.
+    // 5. The price: a preset term, only the amount is typed.
+    await page.getByRole('button', { name: '+ 1 месяц' }).click();
+    await expect(page.getByLabel('Срок, дней')).toHaveValue('30');
+    await page.getByLabel('Цена, ₽').fill('199');
+    expect(api.calls(undefined, 'POST')).toHaveLength(0);
+
+    await buildForm(page).getByRole('button', { name: 'Создать сборку' }).click();
+    await expect(page).toHaveURL(/#\/builders\/8$/);
+    await expect(heading(page, 'Германия и Нидерланды')).toBeVisible();
+    await expect(buildForm(page).locator('.editor-status')).toContainText('Сборка «Германия и Нидерланды» создана и выставлена на продажу: 1 цена.');
+    const price = page.locator('.bd-price');
+    await expect(price).toHaveCount(1);
+    await expect(price).toContainText('1 месяц');
+    await expect(price).toContainText('30 дней · 199 ₽');
+    await expect(price).toContainText('В продаже');
+
+    // One create, one configuration save, one tariff — and no plan anywhere.
+    const meta = { name: 'Германия и Нидерланды', description: '', enabled: true, profile_title: '', support_url: '', announce: '' };
+    expect(api.calls('/admin/api/builders', 'POST').map(c => c.body)).toEqual([{ request_key: expect.stringMatching(KEY_PATTERN), ...meta }]);
+    expect(api.calls('/admin/api/builders/8/configuration', 'PUT').map(c => c.body)).toEqual([{
+      request_key: expect.stringMatching(KEY_PATTERN), version: 1, ...meta, source_ids: [1],
+      items: [
+        { id: 0, kind: 'country', source_id: 1, country_code: 'DE', fingerprint: '', original_name: '', custom_name: 'DE Fast', description: '', enabled: true },
+        { id: 0, kind: 'node', source_id: 1, country_code: '', fingerprint: 'a4', original_name: '🇳🇱 Amsterdam', custom_name: null, description: '', enabled: true },
+      ],
+    }]);
+    expect(api.calls('/admin/api/tariffs', 'POST').map(c => c.body)).toEqual([{
+      request_key: expect.stringMatching(KEY_PATTERN), name: '1 месяц', builder_id: 8, duration_days: 30, price_cents: 19900,
+      currency: 'RUB', description: '', features: [], badge: '', is_active: true,
+    }]);
+    await expect(page.getByRole('main')).not.toContainText(/план/i);
+
+    // The server assembles the saved сборка exactly like for a client.
+    const check = region(page, 'Проверка на сервере');
+    await check.getByRole('button', { name: 'Проверить на сервере' }).click();
+    await expect(check).toContainText('Клиент получит: 4 сервера · 2 страны.');
+    expect(api.problems()).toEqual([]);
+  });
+
+  test('edit: the stored composition is ticked; a stale tab cannot overwrite it', async ({ page }) => {
+    const api = await backend(page);
+    api.changeBuilder(b => { b.items = [rule({ id: 51, kind: 'country', source_id: 1, country_code: 'DE', position: 0 })]; });
+    await openBuild(page);
+    const save = () => buildForm(page).getByRole('button', { name: 'Сохранить', exact: true });
+    await expect(countryPick(page, 'Германия')).toBeChecked();
+    await expect(countryPick(page, 'Нидерланды')).not.toBeChecked();
+    await expect(buildForm(page).getByText('Все изменения сохранены')).toBeVisible();
+    await expect(save()).toBeDisabled();
+    await expect(previewTotal(page)).toHaveText('3 сервера · 1 страна');
+
+    await countryPick(page, 'Нидерланды').check();
+    await expect(buildForm(page).getByText('Есть несохранённые изменения')).toBeVisible();
+    await expect(previewTotal(page)).toHaveText('4 сервера · 2 страны');
+
+    // Another tab saved the сборка meanwhile: this one must not overwrite it.
+    api.changeBuilder(b => { b.version = 5; b.items = []; });
+    await save().click();
+    const status = buildForm(page).locator('.editor-status');
+    await expect(status).toContainText('Изменения не сохранены. Сборку изменили в другом окне или другим администратором. Сохранённая версия не затронута.');
+    expect(api.builder()).toMatchObject({ version: 5, items: [] });
+
+    page.once('dialog', dialog => void dialog.accept());
+    await status.getByRole('button', { name: 'Загрузить актуальную версию' }).click();
+    // The server state: no rules is «все серверы».
+    await expect(page.getByRole('radio', { name: /Все серверы/ })).toBeChecked();
+    await expect(previewTotal(page)).toHaveText('5 серверов · 2 страны');
+
+    await page.getByRole('radio', { name: /Выбрать страны и серверы/ }).check();
+    await countryPick(page, 'Нидерланды').check();
+    await save().click();
+    await expect(buildForm(page).locator('.editor-status')).toContainText('Сборка сохранена. Клиенты получат изменения при следующем обновлении подписки.');
     const saves = api.calls('/admin/api/builders/7/configuration', 'PUT');
-    expect(saves.map(c => [c.body.version, c.body.source_ids])).toEqual([[1, [1]], [2, [1]]]);
-    expect((saves[1].body.items as { id: number }[]).map(i => i.id)).toEqual(api.builder().items.map(i => i.id));
-    expect(api.calls(/^\/admin\/api\/builders\/7\/(sources|items|reorder)/)).toHaveLength(0);
-    expect(api.builder().sources.map(s => s.source_id)).toEqual([1]);
-    expect(api.builder().items.map(i => i.country_code)).toEqual(['DE', 'NL']);
-    await expect(card(page).locator('.builder-meta')).toHaveText('v3 · 1 источник · 2 правила');
-    expect(api.problems()).toEqual([]);
-  });
-
-  test('the editor opens with the server state, not a stale list copy', async ({ page }) => {
-    const api = await backend(page);
-    await page.goto('/#/builders');
-    await expect(card(page).locator('.builder-meta')).toHaveText('v1 · 1 источник · 0 правил');
-    // Another tab linked a second source and added a rule meanwhile.
-    api.changeBuilder(b => {
-      b.version = 5;
-      b.sources = [{ source_id: 1, position: 0 }, { source_id: 2, position: 1 }];
-      b.items = [{ id: 60, kind: 'country', source_id: 2, country_code: 'US', fingerprint: '', original_name: '', custom_name: null, description: '', position: 0, enabled: true }];
-    });
-    await card(page).getByRole('button', { name: 'Редактировать' }).click();
-    const dialog = page.getByRole('dialog', { name: 'Построитель: Основной' });
-    await expect(dialog.locator('.source-pick-selected')).toHaveCount(2);
-    await expect(dialog.getByRole('listitem', { name: '🇺🇸 US' })).toBeVisible();
-    await expect(card(page).locator('.builder-meta')).toHaveText('v5 · 2 источника · 1 правило');
-    await dialog.getByRole('button', { name: 'Сохранить' }).click();
-    await expect(dialog.getByText('Изменения сохранены.')).toBeVisible();
-    const [save] = api.calls('/admin/api/builders/7/configuration', 'PUT');
-    expect(save.body.version).toBe(5);
-    expect(save.body.source_ids).toEqual([1, 2]);
-    expect(api.builder().sources.map(s => s.source_id)).toEqual([1, 2]);
-    expect(api.problems()).toEqual([]);
-  });
-
-  test('a failed load does not open the editor with stale data', async ({ page }) => {
-    const api = await backend(page);
-    await page.goto('/#/builders');
-    await expect(card(page)).toBeVisible();
-    api.failures.get = true;
-    await card(page).getByRole('button', { name: 'Редактировать' }).click();
-    await expect(page.locator('.toast-region')).toContainText('Не удалось загрузить построитель.');
-    await expect(page.getByRole('dialog')).toHaveCount(0);
-    await expect(card(page).getByRole('button', { name: 'Редактировать' })).toBeEnabled();
-    expect(api.calls(/^\/admin\/api\/builders/)).toHaveLength(0);
-    expect(api.problems()).toEqual([]);
-  });
-
-  test('a stale second tab cannot overwrite: 409 is explained and the current version can be loaded', async ({ page }) => {
-    const api = await backend(page);
-    await page.goto('/#/builders');
-    await card(page).getByRole('button', { name: 'Редактировать' }).click();
-    const dialog = page.getByRole('dialog', { name: 'Построитель: Основной' });
-    await expect(dialog.locator('.source-pick-selected')).toHaveCount(1);
-    await addCountry(page, dialog, 'NL');
-
-    // Meanwhile another tab saved a different configuration.
-    api.changeBuilder(b => {
-      b.version = 4;
-      b.sources = [{ source_id: 1, position: 0 }, { source_id: 2, position: 1 }];
-      b.items = [{ id: 70, kind: 'country', source_id: 2, country_code: 'US', fingerprint: '', original_name: '', custom_name: null, description: '', position: 0, enabled: true }];
-    });
-    await dialog.getByRole('button', { name: 'Сохранить' }).click();
-    await expect(dialog.locator('.modal-status')).toContainText('Построитель изменён в другой вкладке или другим администратором. Ваши изменения не сохранены');
-    const [stale] = api.calls('/admin/api/builders/7/configuration', 'PUT');
-    expect(stale.body.version).toBe(1);
-    // Nothing of the stale tab reached the stored builder.
-    expect(api.builder().version).toBe(4);
-    expect(api.builder().items.map(i => i.country_code)).toEqual(['US']);
-    // The unsaved rule is still on screen until the admin decides.
-    await expect(dialog.getByRole('listitem', { name: '🇳🇱 NL' })).toBeVisible();
-    await expect(card(page).locator('.builder-meta')).toHaveText('v4 · 2 источника · 1 правило');
-
-    page.on('dialog', d => void d.accept());
-    await dialog.getByRole('button', { name: 'Загрузить актуальную версию' }).click();
-    const fresh = page.getByRole('dialog', { name: 'Построитель: Основной' });
-    await expect(fresh.getByRole('listitem', { name: '🇺🇸 US' })).toBeVisible();
-    await expect(fresh.getByRole('listitem', { name: '🇳🇱 NL' })).toHaveCount(0);
-    await expect(fresh.locator('.source-pick-selected')).toHaveCount(2);
-    await fresh.getByRole('button', { name: 'Сохранить' }).click();
-    await expect(fresh.getByText('Изменения сохранены.')).toBeVisible();
-    expect(api.calls('/admin/api/builders/7/configuration', 'PUT').at(-1)!.body.version).toBe(4);
-    expect(api.builder().version).toBe(5);
-    expect(api.problems()).toEqual([]);
-  });
-
-  test('toggling keeps the counts; returning to the section reloads the list', async ({ page }) => {
-    const api = await backend(page, { builderSources: [1, 2] });
-    await page.goto('/#/builders');
-    await expect(card(page).locator('.builder-meta')).toHaveText('v1 · 2 источника · 0 правил');
-    await card(page).getByRole('button', { name: 'Отключить' }).click();
-    await expect(card(page)).toContainText('Отключён');
-    await expect(card(page).locator('.builder-meta')).toHaveText('v2 · 2 источника · 0 правил');
-
-    const listReads = () => api.reads().filter(p => p === '/admin/api/builders').length;
-    const before = listReads();
-    api.changeBuilder(b => { b.sources = [{ source_id: 2, position: 0 }]; });
-    await page.goto('/#/sources');
-    await expect(heading(page, 'Источники')).toBeVisible();
-    await page.goto('/#/builders');
-    await expect(card(page).locator('.builder-meta')).toHaveText('v2 · 1 источник · 0 правил');
-    expect(listReads()).toBeGreaterThan(before);
-    expect(api.problems()).toEqual([]);
-  });
-});
-
-test.describe('builder uses the source catalogue', () => {
-  test('selected sources show their servers, countries and sync status; totals merge them', async ({ page }) => {
-    const api = await backend(page);
-    const dialog = await openBuilder(page);
-    const a = dialog.locator('.source-pick-item', { hasText: 'Provider A' });
-    await expect(a.locator('.source-pick-stats')).toHaveText('5 серверов · 2 страны');
-    await expect(a).toContainText('Синхронизирован');
-    const broken = dialog.locator('.source-pick-item', { hasText: 'Broken' });
-    await expect(broken).toContainText('Ошибка синхронизации');
-
-    const total = dialog.locator('.sources-total');
-    await expect(total).toHaveText('Итого: 5 серверов · 2 страны (уникальных) из 1 источника.');
-    await dialog.getByRole('button', { name: 'Добавить «Provider B»' }).click();
-    // DE is in both sources: countries are counted once.
-    await expect(total).toHaveText('Итого: 8 серверов · 3 страны (уникальных) из 2 источников.');
-    await dialog.getByRole('button', { name: 'Убрать «Provider A»' }).click();
-    await expect(total).toHaveText('Итого: 3 сервера · 2 страны (уникальных) из 1 источника.');
-    await dialog.getByRole('button', { name: 'Добавить «Provider A»' }).click();
-
-    await dialog.getByRole('button', { name: 'Сохранить' }).click();
-    await expect(dialog.getByText('Изменения сохранены.')).toBeVisible();
-    expect(api.builder().sources.map(s => s.source_id)).toEqual([2, 1]);
-    expect(api.problems()).toEqual([]);
-  });
-
-  test('dynamic country rule from the real catalogue; preview matches it and follows the catalogue', async ({ page }) => {
-    const api = await backend(page, { builderSources: [1, 2] });
-    const dialog = await openBuilder(page);
-    await dialog.getByRole('button', { name: 'Добавить правило' }).click();
-    const rule = page.getByRole('dialog', { name: 'Новое правило' });
-    await expect(rule.getByLabel('Тип правила')).toHaveValue('country');
-    await expect(rule.getByLabel('Источник').locator('option')).toHaveText([
-      'Provider A — 5 серверов · 2 страны', 'Provider B — 3 сервера · 2 страны',
-    ]);
-    const country = rule.getByLabel('Страна', { exact: true });
-    await expect(country.locator('option')).toHaveText(['🇩🇪 DE — 3 сервера', '🇳🇱 NL — 1 сервер', 'Другая страна…']);
-    await rule.getByLabel('Источник').selectOption('2');
-    await expect(country.locator('option')).toHaveText(['🇺🇸 US — 2 сервера', '🇩🇪 DE — 1 сервер', 'Другая страна…']);
-    await rule.getByLabel('Источник').selectOption('1');
-    await country.selectOption('DE');
-    await expect(rule.locator('.rule-live')).toContainText('Сейчас в каталоге: 3 сервера.');
-
-    // A country that is not in the catalogue yet needs a valid ISO code.
-    await country.selectOption('*other');
-    await rule.getByRole('button', { name: 'Применить' }).click();
-    await expect(rule.getByText('Укажите двухбуквенный код страны латиницей, например DE.')).toBeVisible();
-    await country.selectOption('DE');
-    await rule.getByRole('button', { name: 'Применить' }).click();
-    await expect(rule).toBeHidden();
-
-    const row = dialog.getByRole('listitem', { name: '🇩🇪 DE' });
-    await expect(row.locator('.item-detail')).toHaveText('Все серверы страны 🇩🇪 DE из «Provider A» · сейчас 3 сервера');
-    await expect(dialog.locator('.preview-note')).toContainText('предпросмотр показывает сохранённую версию');
-
-    await dialog.getByRole('button', { name: 'Сохранить' }).click();
-    await expect(dialog.getByText('Изменения сохранены.')).toBeVisible();
-    const [save] = api.calls('/admin/api/builders/7/configuration', 'PUT');
-    expect(save.body.items).toEqual([
-      { id: 0, kind: 'country', source_id: 1, country_code: 'DE', fingerprint: '', original_name: '', custom_name: null, description: '', enabled: true },
-    ]);
-    await expect(dialog.locator('.preview-note')).toBeEmpty();
-
-    // Preview consistency: the same servers the catalogue counts for DE.
-    const previewBtn = dialog.getByRole('button', { name: 'Запустить предпросмотр' });
-    await previewBtn.click();
-    const previewList = dialog.getByRole('list', { name: 'Серверы подписки' });
-    await expect(dialog.locator('.preview-body .preview-stats')).toHaveText('В подписке: 3 сервера · 1 страна');
-    await expect(previewList.locator('.preview-name')).toHaveText(['🇩🇪 Frankfurt 1', '🇩🇪 Frankfurt 2', '🇩🇪 Berlin']);
-    await expect(previewList.locator('.preview-origin').first()).toHaveText('Provider A');
-
-    // The rule is dynamic: a new German server upstream is served without editing the rule.
-    api.resync(1, [...CATALOGUE_A, e('a7', '🇩🇪 Hamburg', 'DE')]);
-    await previewBtn.click();
-    await expect(dialog.locator('.preview-body .preview-stats')).toHaveText('В подписке: 4 сервера · 1 страна');
-    await expect(previewList.locator('.preview-name').last()).toHaveText('🇩🇪 Hamburg');
-    expect(api.problems()).toEqual([]);
-  });
-
-  test('node rule picks a server from the catalogue; removed rules are deleted; saving twice does not duplicate', async ({ page }) => {
-    const api = await backend(page, { builderSources: [1, 2] });
-    const dialog = await openBuilder(page);
-
-    await dialog.getByRole('button', { name: 'Добавить правило' }).click();
-    let rule = page.getByRole('dialog', { name: 'Новое правило' });
-    await rule.getByLabel('Страна', { exact: true }).selectOption('NL');
-    await rule.getByRole('button', { name: 'Применить' }).click();
-
-    await dialog.getByRole('button', { name: 'Добавить правило' }).click();
-    rule = page.getByRole('dialog', { name: 'Новое правило' });
-    await rule.getByLabel('Тип правила').selectOption('node');
-    await rule.getByLabel('Источник').selectOption('2');
-    const picker = rule.getByRole('list', { name: 'Сервер' });
-    await expect(picker.locator('.entry-pick-item')).toHaveCount(3);
-    await rule.getByRole('button', { name: 'Применить' }).click();
-    await expect(rule.getByText('Выберите сервер из списка.')).toBeVisible();
-    await rule.getByLabel('Поиск сервера по имени').fill('dallas');
-    await expect(picker.locator('.entry-pick-item')).toHaveCount(1);
-    await rule.getByLabel('Поиск сервера по имени').fill('');
-    await rule.getByLabel('Страна сервера').selectOption('US');
-    await expect(picker.locator('.entry-pick-item')).toHaveCount(2);
-    await picker.locator('.entry-pick-item[data-fingerprint="b2"]').click();
-    await expect(picker.locator('.entry-pick-item[data-fingerprint="b2"]')).toHaveAttribute('aria-pressed', 'true');
-    await expect(rule.locator('.rule-node-chosen')).toHaveText('Выбран: 🇺🇸 Dallas · Найден');
-    await rule.getByLabel('Своё имя').fill('США — Даллас');
-    await rule.getByRole('button', { name: 'Применить' }).click();
-    await expect(rule).toBeHidden();
-    await expect(dialog.getByRole('listitem', { name: 'США — Даллас' }).locator('.item-detail'))
-      .toHaveText('Сервер из «Provider B» · в источнике: 🇺🇸 Dallas');
-
-    await dialog.getByRole('button', { name: 'Сохранить' }).click();
-    await expect(dialog.getByText('Изменения сохранены.')).toBeVisible();
-    const [first] = api.calls('/admin/api/builders/7/configuration', 'PUT');
-    expect(first.body.items).toEqual([
+    expect(saves.map(c => c.body.version)).toEqual([1, 5]);
+    // A retry after a refusal is a new request, never a replay.
+    expect(saves[0].body.request_key).not.toBe(saves[1].body.request_key);
+    expect(saves[1].body.items).toEqual([
       { id: 0, kind: 'country', source_id: 1, country_code: 'NL', fingerprint: '', original_name: '', custom_name: null, description: '', enabled: true },
-      { id: 0, kind: 'node', source_id: 2, country_code: '', fingerprint: 'b2', original_name: '🇺🇸 Dallas', custom_name: 'США — Даллас', description: '', enabled: true },
     ]);
-    expect(api.builder().items).toHaveLength(2);
-
-    await dialog.getByRole('button', { name: 'Запустить предпросмотр' }).click();
-    await expect(dialog.locator('.preview-body .preview-stats')).toHaveText('В подписке: 2 сервера · 2 страны');
-    await expect(dialog.locator('.preview-sources')).toHaveText('Provider A: 1 · Provider B: 1');
-    await expect(dialog.getByRole('list', { name: 'Серверы подписки' }).locator('.preview-name')).toHaveText(['🇳🇱 Amsterdam', 'США — Даллас']);
-
-    // Remove the country rule: it must be deleted on the server, and the
-    // saved node rule is updated in place, not created again.
-    page.once('dialog', d => void d.accept());
-    await dialog.getByRole('button', { name: 'Удалить правило «🇳🇱 NL»' }).click();
-    await dialog.getByRole('button', { name: 'Сохранить' }).click();
-    await expect(dialog.getByText('Изменения сохранены.')).toBeVisible();
-    // The removed rule is simply absent from the saved list (deleted in the
-    // same transaction); the kept node rule is sent with its server id.
-    expect(api.builder().items.map(i => i.fingerprint)).toEqual(['b2']);
-    const last = api.calls('/admin/api/builders/7/configuration', 'PUT').at(-1)!;
-    expect(last.body.items).toEqual([expect.objectContaining({ id: api.builder().items[0].id, kind: 'node' })]);
-    expect(api.builder().items[0].position).toBe(0);
-    expect(api.calls(/^\/admin\/api\/builders\/7\/(sources|items|reorder)/)).toHaveLength(0);
-
-    await dialog.getByRole('button', { name: 'Запустить предпросмотр' }).click();
-    await expect(dialog.locator('.preview-body .preview-stats')).toHaveText('В подписке: 1 сервер · 1 страна');
+    expect(api.builder().items.map(item => item.country_code)).toEqual(['NL']);
     expect(api.problems()).toEqual([]);
   });
 
-  test('rules on an unlinked source are flagged, like Preview and /sub ignore them', async ({ page }) => {
-    const api = await backend(page, { builderSources: [1, 2] });
-    const dialog = await openBuilder(page);
-    await dialog.getByRole('button', { name: 'Добавить правило' }).click();
-    const rule = page.getByRole('dialog', { name: 'Новое правило' });
-    await rule.getByLabel('Источник').selectOption('2');
-    await rule.getByLabel('Страна', { exact: true }).selectOption('US');
-    await rule.getByRole('button', { name: 'Применить' }).click();
-    const row = dialog.getByRole('listitem', { name: '🇺🇸 US' });
-    await expect(row.locator('.item-warn')).toHaveCount(0);
-    await dialog.getByRole('button', { name: 'Убрать «Provider B»' }).click();
-    await expect(row.locator('.item-warn')).toHaveText('Источник не подключён к построителю: правило не применяется.');
-    await dialog.getByRole('button', { name: 'Сохранить' }).click();
-    await expect(dialog.getByText('Изменения сохранены.')).toBeVisible();
-    await dialog.getByRole('button', { name: 'Запустить предпросмотр' }).click();
-    await expect(dialog.locator('.preview-body .preview-stats')).toHaveText('В подписке: 0 серверов · 0 стран');
-    await expect(dialog.locator('.preview-warn')).toContainText('is not linked to the builder');
+  test('duplicate opens an unsaved copy; switching off stops serving a сборка', async ({ page }) => {
+    const api = await backend(page);
+    await page.goto('/#/builders');
+    await page.getByRole('button', { name: 'Дублировать «Основной»' }).click();
+    await expect(page).toHaveURL(/#\/builders\/new$/);
+    await expect(page.getByLabel('Название сборки')).toHaveValue('Основной (копия)');
+    await expect(sourcePick(page, 'Provider A')).toBeChecked();
+    // Nothing is written until the copy is saved.
+    expect(api.builderIds()).toEqual([7]);
+    await buildForm(page).getByRole('button', { name: 'Создать сборку' }).click();
+    await expect(page).toHaveURL(/#\/builders\/8$/);
+    await expect(heading(page, 'Основной (копия)')).toBeVisible();
+    expect(api.builderIds()).toEqual([7, 8]);
+    expect(api.builders()[1]).toMatchObject({ name: 'Основной (копия)', sources: [{ source_id: 1, position: 0 }], items: [] });
+
+    await page.getByRole('link', { name: 'Назад к сборкам' }).click();
+    await expect(page.locator('.bd-summary')).toHaveText('2 сборки · в продаже 0');
+    await page.getByRole('button', { name: 'Отключить «Основной»' }).click();
+    await expect(page.locator('.toast-region')).toContainText('Сборка «Основной» отключена: клиенты перестали её получать.');
+    await expect(buildCard(page).locator('.bd-card-health')).toHaveText('Отключена: клиентам не выдаётся');
+    await expect(page.getByRole('button', { name: 'Включить «Основной»' })).toBeVisible();
+    expect(api.builder().enabled).toBe(false);
     expect(api.problems()).toEqual([]);
   });
 });
-
 // The browser runs in UTC (playwright.admin.config.ts), so a datetime-local
 // value is the UTC wall clock; dates are relative to the real clock because
 // the panel validates against Date.now().
@@ -1034,7 +978,7 @@ test.describe('source validity end', () => {
     await page.getByRole('button', { name: 'Добавить источник' }).first().click();
     const dialog = page.getByRole('dialog', { name: 'Новый источник' });
     await dialog.getByLabel('Название').fill('Termed');
-    await dialog.getByLabel('URL подписки').fill(SECRET_URL);
+    await dialog.getByLabel('Ссылка на подписку провайдера').fill(SECRET_URL);
     const until = dialog.getByLabel('Действует до');
     await expect(until).toHaveValue('');
     const submit = dialog.getByRole('button', { name: 'Создать и синхронизировать' });
@@ -1117,32 +1061,31 @@ test.describe('source validity end', () => {
     // Expiry does not flip the admin switch: both badges are shown.
     await expect(b).toContainText('Включён');
     await expect(b).toContainText('Срок истёк');
-    await expect(b.locator('.source-error')).toHaveText('Срок действия истёк: построители пропускают источник, как отключённый.');
+    await expect(b.locator('.source-error')).toHaveText('Срок действия истёк: сборки пропускают источник, как отключённый.');
     await expect(b.locator('.source-meta')).toContainText('Срок истёк 01.01.2020, 00:00');
     // Less than three days left.
     await expect(list.getByRole('listitem', { name: 'Provider A' })).toContainText('Скоро истекает');
     await expect(list.getByRole('listitem', { name: 'Broken' })).not.toContainText('истек');
 
     await openDetail(page, 2, 'Provider B');
-    await expect(region(page, 'Сводка')).toContainText('Срок истёк: построители пропускают источник, как отключённый');
+    await expect(region(page, 'Сводка')).toContainText('Срок истёк: сборки пропускают источник, как отключённый');
     await expect(page.locator('body')).toContainText('включён · срок истёк');
 
-    // The builder editor counts only what /sub would serve.
-    const dialog = await openBuilder(page);
-    await expect(dialog.locator('.source-pick-item', { hasText: 'Provider B' })).toContainText('Срок истёк');
-    await expect(dialog.locator('.sources-total')).toHaveText(
-      'Итого: 5 серверов · 2 страны (уникальных) из 2 источников. Отключённые и с истёкшим сроком (1) не учитываются: сборка их пропускает.');
-    await dialog.getByRole('button', { name: 'Запустить предпросмотр' }).click();
-    await expect(dialog.locator('.preview-body .preview-stats')).toHaveText('В подписке: 5 серверов · 2 страны');
-    await dialog.getByRole('button', { name: 'Закрыть' }).click();
-    await expect(page.getByRole('dialog')).toHaveCount(0);
-
+    // The constructor counts only what /sub would serve.
+    await openBuild(page);
+    await expect(page.locator('.bd-source', { hasText: 'Provider B' })).toContainText('Срок истёк');
+    await expect(region(page, '1. Источник')).toContainText('Сейчас не используется: Provider B.');
+    await expect(previewTotal(page)).toHaveText('5 серверов · 2 страны');
+    const check = region(page, 'Проверка на сервере');
+    await check.getByRole('button', { name: 'Проверить на сервере' }).click();
+    await expect(check).toContainText('Клиент получит: 5 серверов · 2 страны.');
     // Renaming an expired source does not reject its past end...
     await page.goto('/#/sources');
     await list.getByRole('button', { name: 'Изменить «Provider B»' }).click();
     let editor = page.getByRole('dialog', { name: 'Источник: Provider B' });
     await expect(editor.getByLabel('Действует до')).toHaveValue('2020-01-01T00:00');
-    await editor.getByLabel('Описание').fill('renewal pending');
+    await editor.getByText('Дополнительно', { exact: true }).click();
+    await editor.getByLabel('Заметка').fill('renewal pending');
     await editor.getByRole('button', { name: 'Сохранить' }).click();
     await expect(page.getByRole('dialog')).toHaveCount(0);
     expect(api.calls('/admin/api/sources/2', 'PATCH')[0].body).toEqual({ name: 'Provider B', description: 'renewal pending', type: 'json' });
@@ -1187,7 +1130,7 @@ test.describe('deleting sources and builders', () => {
 
     // Linked to the builder: nothing is asked and nothing is sent.
     await list.getByRole('button', { name: 'Удалить «Provider A»' }).click();
-    await expect(toasts(page)).toContainText('Источник «Provider A» нельзя удалить: используется построителем «Основной». Его можно отключить.');
+    await expect(toasts(page)).toContainText('Источник «Provider A» нельзя удалить: используется сборкой «Основной». Его можно отключить.');
     await expect(page.getByRole('dialog')).toHaveCount(0);
     expect(sourceDeletes(api)).toHaveLength(0);
 
@@ -1223,7 +1166,7 @@ test.describe('deleting sources and builders', () => {
     const reads = api.sourceListReads();
     await list.getByRole('button', { name: 'Удалить «Provider B»' }).click();
     await page.getByRole('dialog', { name: 'Удалить источник «Provider B»?' }).getByRole('button', { name: 'Удалить' }).click();
-    await expect(toasts(page)).toContainText('Источник «Provider B» уже используется построителем или подпиской: удалить его нельзя, можно отключить.');
+    await expect(toasts(page)).toContainText('Источник «Provider B» уже используется сборкой или подпиской: удалить его нельзя, можно отключить.');
     await expect(list.getByRole('listitem', { name: 'Provider B' })).toBeVisible();
     await expect.poll(() => api.sourceListReads()).toBeGreaterThan(reads);
     expect(api.sourceIds()).toEqual([1, 2, 3]);
@@ -1251,37 +1194,37 @@ test.describe('deleting sources and builders', () => {
     expect(api.problems()).toEqual([]);
   });
 
-  test('builder: a plan that uses it blocks the deletion', async ({ page }) => {
-    const api = await backend(page, { plans: [{ id: 2, name: 'Trial' }] });
+  test('сборка: the trial that runs on it blocks the deletion', async ({ page }) => {
+    const api = await backend(page, { plans: [{ id: 2, name: 'trial' }] });
     await page.goto('/#/builders');
+    await expect(buildCard(page)).toContainText('Пробная подписка');
     await page.getByRole('button', { name: 'Удалить «Основной»' }).click();
-    await expect(toasts(page)).toContainText('Построитель «Основной» нельзя удалить: назначен плану «Trial». Его можно отключить.');
+    await expect(toasts(page)).toContainText('Сборку «Основной» нельзя удалить: на ней работает «пробная подписка». Её можно отключить.');
     await expect(page.getByRole('dialog')).toHaveCount(0);
     expect(builderDeletes(api)).toHaveLength(0);
     expect(api.problems()).toEqual([]);
   });
 
-  test('builder: the loaded version is checked, then it is removed and frees its sources', async ({ page }) => {
+  test('сборка: the loaded version is checked, then it is removed and frees its sources', async ({ page }) => {
     const api = await backend(page);
     await page.goto('/#/builders');
     const remove = page.getByRole('button', { name: 'Удалить «Основной»' });
     await expect(remove).toBeVisible();
-    await expect(page.locator('.builder-meta')).toHaveText('v1 · 1 источник · 0 правил');
 
-    // Another tab saved the builder: the stale card must not delete it.
-    api.changeBuilder(b => { b.version = 5; });
+    // Another tab renamed and saved the сборка: the stale card must not delete it.
+    api.changeBuilder(b => { b.version = 5; b.name = 'Европа'; });
     await remove.click();
-    const confirm = page.getByRole('dialog', { name: 'Удалить построитель «Основной»?' });
-    await expect(confirm).toContainText('Построитель, его список источников и правила будут удалены. Действие нельзя отменить.');
+    const confirm = page.getByRole('dialog', { name: 'Удалить сборку «Основной»?' });
+    await expect(confirm).toContainText('Сборка, её состав и названия серверов будут удалены. Источники и их серверы останутся. Действие нельзя отменить.');
     await confirm.getByRole('button', { name: 'Удалить' }).click();
-    await expect(toasts(page)).toContainText('Построитель «Основной» изменили в другом окне. Список обновлён, повторите удаление.');
-    await expect(page.locator('.builder-meta')).toHaveText('v5 · 1 источник · 0 правил');
+    await expect(toasts(page)).toContainText('Сборка «Основной» не удалена. Сборку изменили в другом окне или другим администратором.');
     expect(api.builderIds()).toEqual([7]);
 
-    await page.getByRole('button', { name: 'Удалить «Основной»' }).click();
-    await page.getByRole('dialog', { name: 'Удалить построитель «Основной»?' }).getByRole('button', { name: 'Удалить' }).click();
-    await expect(page.getByText('Построителей пока нет')).toBeVisible();
-    await expect(toasts(page)).toContainText('Построитель «Основной» удалён.');
+    // The list is read again, so the next attempt carries the current version.
+    await page.getByRole('button', { name: 'Удалить «Европа»' }).click();
+    await page.getByRole('dialog', { name: 'Удалить сборку «Европа»?' }).getByRole('button', { name: 'Удалить' }).click();
+    await expect(page.getByText('Сборок пока нет')).toBeVisible();
+    await expect(toasts(page)).toContainText('Сборка «Европа» удалена.');
     const deletes = builderDeletes(api);
     expect(deletes.map(c => c.body.version)).toEqual([1, 5]);
     for (const c of deletes) {
@@ -1291,7 +1234,6 @@ test.describe('deleting sources and builders', () => {
     // A retry is a new request, not a replay of the rejected one.
     expect(deletes[0].body.request_key).not.toBe(deletes[1].body.request_key);
     expect(api.builderIds()).toEqual([]);
-
     // Its source is no longer referenced and can be deleted now.
     await page.goto('/#/sources');
     await region(page, 'Источники').getByRole('button', { name: 'Удалить «Provider A»' }).click();

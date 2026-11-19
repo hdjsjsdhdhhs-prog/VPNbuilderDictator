@@ -6,8 +6,9 @@ import type { Page, Route } from '@playwright/test';
 //   GET /admin/api/monitoring                 overview of every builder
 //   GET /admin/api/monitoring/builders/{id}   countries and servers of a builder
 //   GET /admin/api/monitoring/history         builder_id, country ('' = no country), target_id, period
-// The page is read-only: it must never send anything but GETs, and a check is
-// never triggered by reading.
+//   POST /admin/api/monitoring/check          one check round right now, answers the fresh overview
+// Reading never triggers a check: the only write of the page is the explicit
+// «Проверить сейчас» button. A builder is shown to the owner as a «сборка».
 
 const CSRF = 'c'.repeat(43);
 const T0 = '2026-09-30T12:00:00Z';
@@ -71,11 +72,20 @@ async function json(route: Route, status: number, body: unknown) {
   await route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
 }
 
-interface Options { monitor?: 'ok' | 'unavailable' }
+interface Options { monitor?: 'ok' | 'unavailable'; check?: 'ok' | 'busy' }
 
-async function backend(page: Page, { monitor = 'ok' }: Options = {}) {
+async function backend(page: Page, { monitor = 'ok', check = 'ok' }: Options = {}) {
   const calls: { method: string; path: string; params: URLSearchParams }[] = [];
   const problems: string[] = [];
+  // After a manual check the outage of builder 3 is over: every server answers.
+  let checked = false;
+  const healthy = {
+    ...BUILDERS[0], status: 'up', countries_up: 3, countries_down: 0, nodes_up: 4, nodes_down: 0, nodes_unknown: 0, source_errors: 0,
+  };
+  const overview = () => ({
+    enabled: true, generated_at: new Date().toISOString(), interval_seconds: 60, down_after: 3, last_round_at: T0,
+    last_refresh_at: T0, builders: checked ? [healthy, BUILDERS[1]] : BUILDERS,
+  });
   await page.route('**/admin/**', async route => {
     const request = route.request();
     const url = new URL(request.url());
@@ -84,6 +94,14 @@ async function backend(page: Page, { monitor = 'ok' }: Options = {}) {
     if ((url.pathname === '/admin/login' || url.pathname === '/admin/session') && method === 'GET') {
       return json(route, 200, { authenticated: true, csrf_token: CSRF });
     }
+    if (method === 'POST' && url.pathname === '/admin/api/monitoring/check') {
+      // web.adminAPI.monitoringCheck: CSRF-protected, the body is "{}".
+      if (request.headers()['x-csrf-token'] !== CSRF) problems.push('check without the CSRF token');
+      if (request.postData() !== '{}') problems.push(`check body ${request.postData()}`);
+      if (check === 'busy') return json(route, 409, { error: 'check_in_progress' });
+      checked = true;
+      return json(route, 200, overview());
+    }
     if (method !== 'GET') {
       problems.push(`unexpected ${method} ${url.pathname}`);
       return json(route, 405, { error: 'method_not_allowed' });
@@ -91,12 +109,7 @@ async function backend(page: Page, { monitor = 'ok' }: Options = {}) {
     if (monitor === 'unavailable' && url.pathname.startsWith('/admin/api/monitoring')) {
       return json(route, 503, { error: 'service_unavailable' });
     }
-    if (url.pathname === '/admin/api/monitoring') {
-      return json(route, 200, {
-        enabled: true, generated_at: new Date().toISOString(), interval_seconds: 60, down_after: 3, last_round_at: T0,
-        last_refresh_at: T0, builders: BUILDERS,
-      });
-    }
+    if (url.pathname === '/admin/api/monitoring') return json(route, 200, overview());
     const detail = /^\/admin\/api\/monitoring\/builders\/(\d+)$/.exec(url.pathname);
     if (detail) {
       if (detail[1] !== '3') return json(route, 404, { error: 'not_found' });
@@ -136,6 +149,7 @@ async function backend(page: Page, { monitor = 'ok' }: Options = {}) {
   const of = (path: string) => calls.filter(call => call.path === path);
   return {
     overviewCalls: () => of('/admin/api/monitoring'),
+    checkCalls: () => of('/admin/api/monitoring/check'),
     builderCalls: () => of('/admin/api/monitoring/builders/3'),
     historyCalls: () => of('/admin/api/monitoring/history'),
     lastHistory: () => of('/admin/api/monitoring/history').at(-1)!.params,
@@ -143,8 +157,8 @@ async function backend(page: Page, { monitor = 'ok' }: Options = {}) {
   };
 }
 
-const builders = (page: Page) => page.getByRole('table', { name: 'Состояние сети по построителям' }).locator(':scope > tbody > tr');
-const countries = (page: Page) => page.getByRole('table', { name: 'Состояние стран построителя' }).locator(':scope > tbody > tr');
+const builders = (page: Page) => page.getByRole('table', { name: 'Состояние сети по сборкам' }).locator(':scope > tbody > tr');
+const countries = (page: Page) => page.getByRole('table', { name: 'Состояние стран сборки' }).locator(':scope > tbody > tr');
 
 async function openBuilder(page: Page) {
   await page.goto('/#/monitoring/3');
@@ -171,14 +185,15 @@ test('overview lists builders with status, countries, servers, latency and the l
   await expect(main).toContainText('NL · Нидерланды: недоступна');
   await expect(main).toContainText('10 мин назад');
   await expect(main).toContainText('Источников с ошибкой: 1');
-  await expect(builders(page).nth(1)).toContainText('Отключён');
+  await expect(builders(page).nth(1).locator('td[data-label="Статус"]')).toHaveText('Отключена');
+  await expect(builders(page).nth(1)).toContainText('Отключена, серверы не выдаются');
   await expect(page.getByText('Сервер становится недоступным после 3 неудачных проверок подряд.')).toBeVisible();
 
-  await page.getByLabel('Статус построителя').selectOption('disabled');
+  await page.getByLabel('Статус сборки').selectOption('disabled');
   await expect(builders(page)).toHaveCount(1);
   await expect(page.getByText('Найдено: 1 из 2')).toBeVisible();
-  await page.getByLabel('Статус построителя').selectOption('down');
-  await expect(page.getByRole('heading', { name: 'Построители не найдены' })).toBeVisible();
+  await page.getByLabel('Статус сборки').selectOption('down');
+  await expect(page.getByRole('heading', { name: 'Сборки не найдены' })).toBeVisible();
   await page.getByRole('button', { name: 'Показать все' }).click();
   await expect(builders(page)).toHaveCount(2);
 
@@ -217,7 +232,7 @@ test('builder page: countries, expandable servers, notices and filters', async (
   await expect(deNodes).toContainText('VLESS');
   await expect(deNodes).toContainText('tcp · reality');
   await expect(deNodes).toContainText('TLS handshake');
-  await expect(deNodes).toContainText('ещё в построителях: 2');
+  await expect(deNodes).toContainText('ещё в сборках: 2');
 
   await page.getByRole('button', { name: 'NL · Нидерланды', exact: true }).click();
   const nlNodes = page.getByRole('table', { name: 'Серверы: NL · Нидерланды' });
@@ -247,7 +262,7 @@ test('history of a builder, a country, a server and periods', async ({ page }) =
   const api = await backend(page);
   await openBuilder(page);
 
-  await expect(page.getByRole('heading', { name: 'История: Весь построитель' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'История: Вся сборка' })).toBeVisible();
   let q = api.lastHistory();
   expect(q.get('builder_id')).toBe('3');
   expect(q.has('country')).toBe(false);
@@ -291,8 +306,8 @@ test('history of a builder, a country, a server and periods', async ({ page }) =
   expect(q.has('builder_id')).toBe(false);
   await expect(page.getByText('За 7 дней сбоев не было.')).toBeVisible();
 
-  await page.getByRole('button', { name: 'Весь построитель' }).click();
-  await expect(page.getByRole('heading', { name: 'История: Весь построитель' })).toBeVisible();
+  await page.getByRole('button', { name: 'Вся сборка' }).click();
+  await expect(page.getByRole('heading', { name: 'История: Вся сборка' })).toBeVisible();
   expect(api.lastHistory().has('target_id')).toBe(false);
   expect(api.problems()).toEqual([]);
 });
@@ -327,6 +342,39 @@ test('polls while open, keeps "ago" labels current and stops after leaving', asy
   expect(api.builderCalls().length).toBe(detail);
 });
 
+test('«Проверить сейчас» runs one check round and repaints with its result', async ({ page }) => {
+  await page.clock.install({ time: new Date(T0) });
+  const api = await backend(page);
+  await page.goto('/#/monitoring');
+  await expect(builders(page)).toHaveCount(2);
+  await expect(page.getByRole('heading', { name: 'Есть сбои' })).toBeVisible();
+  // Opening and polling the page never starts a check.
+  expect(api.checkCalls()).toHaveLength(0);
+
+  await page.getByRole('button', { name: 'Проверить сейчас' }).click();
+  await expect(page.getByRole('heading', { name: 'Всё работает' })).toBeVisible();
+  await expect(builders(page).nth(0).locator('td[data-label="Статус"]')).toHaveText('Работает');
+  await expect(builders(page).nth(0).locator('td[data-label="Серверы"]')).toContainText('4 из 4');
+  await expect(page.locator('.toast-region')).toContainText('Проверка завершена: всё работает.');
+  await expect(page.getByRole('button', { name: 'Проверить сейчас' })).toBeEnabled();
+  expect(api.checkCalls()).toHaveLength(1);
+  expect(api.problems()).toEqual([]);
+});
+
+test('«Проверить сейчас» explains a check that is already running', async ({ page }) => {
+  await page.clock.install({ time: new Date(T0) });
+  const api = await backend(page, { check: 'busy' });
+  await page.goto('/#/monitoring');
+  await expect(builders(page)).toHaveCount(2);
+  await page.getByRole('button', { name: 'Проверить сейчас' }).click();
+  await expect(page.locator('.toast-region')).toContainText('Проверка не выполнена. Проверка уже идёт. Подождите несколько секунд.');
+  // The last snapshot stays on the screen and the button works again.
+  await expect(page.getByRole('heading', { name: 'Есть сбои' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Проверить сейчас' })).toBeEnabled();
+  expect(api.checkCalls()).toHaveLength(1);
+  expect(api.problems()).toEqual([]);
+});
+
 test('explains a backend running without the monitor', async ({ page }) => {
   await backend(page, { monitor: 'unavailable' });
   await page.goto('/#/monitoring');
@@ -337,7 +385,7 @@ test('explains a backend running without the monitor', async ({ page }) => {
 test('shows a missing builder', async ({ page }) => {
   const api = await backend(page);
   await page.goto('/#/monitoring/99');
-  await expect(page.getByRole('heading', { name: 'Построитель не найден' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Сборка не найдена' })).toBeVisible();
   await page.getByRole('link', { name: 'К мониторингу', exact: true }).click();
   await expect(page.getByRole('heading', { level: 1, name: 'Мониторинг' })).toBeVisible();
   expect(api.problems()).toEqual([]);

@@ -3,9 +3,9 @@ import {
   AdminApi, ApiError, errorText, limits, newRequestKey, RENEW_MAX_DAYS,
   type AdminPlan, type AdminSubscription, type Dashboard, type Mutation, type MutationAction,
   type MutationOutcome, type SubscriptionStatus, type UserDetail, type UsersPage, type UsersQuery,
-  type AdminSource, type AdminBuilder, type BuilderItem, type SourceEntry, type SourceSyncResult,
+  type AdminSource, type AdminBuilder, type SourceEntry, type SourceSyncResult,
   type CreateSourceInput, type UpdateSourceInput,
-  type CreateBuilderInput, type SetBuilderInput,
+  type SetBuilderInput,
   TARIFF_LIMITS, type AdminTariff, type TariffPlan, type TariffOutcome,
   type TrialBuilderSummary, type TrialPreview, type TrialView,
   JOURNAL_EVENT_TYPES, PLAN_KINDS, type JournalEvent, type JournalEventType, type JournalPage, type JournalQuery,
@@ -26,10 +26,9 @@ import {
   termsChanged, validateTariffForm, type FieldErrors, type TariffField, type TariffForm,
 } from './tariffs';
 import {
-  COUNTRY_CODE, EMPTY_FILTER, EXPIRY_STATE_LABELS, RESOLUTION_LABELS, SOURCE_FORMATS, SYNC_STATE_LABELS, builderCardSummary, builderConfigItems,
-  builderDeleteBlocker, builderSourcesSummary, catalogueSummary, countriesLabel, countryCount, countryLabel, detectedFormatLabel,
-  expiryState, filterEntries, flagEmoji, formatLabel, normalizeFormat, pickableEntries, previewSummary, protocolsOf, resolveNode,
-  ruleSummary, serversLabel, shortFingerprint, sourceDeleteBlocker, syncErrorText, syncResultMessage, syncState,
+  EMPTY_FILTER, EXPIRY_STATE_LABELS, SOURCE_FORMATS, SYNC_STATE_LABELS, catalogueSummary, countriesLabel, detectedFormatLabel,
+  expiryState, filterEntries, flagEmoji, formatLabel, normalizeFormat, protocolsOf,
+  serversLabel, shortFingerprint, sourceDeleteBlocker, syncErrorText, syncResultMessage, syncState,
   type EntryFilter, type SyncState,
 } from './sources';
 import {
@@ -42,6 +41,8 @@ import { WarmupApi, parseWarmupRoute, warmupHash, type WarmupRoute } from './war
 import { WarmupScreen, resetWarmupMemory, type WarmupHost } from './warmup-ui';
 import { OpsApi, opsHash, parseOpsRoute, type OpsRoute } from './ops';
 import { OpsScreen, resetOpsMemory, type OpsHost } from './ops-ui';
+import { SYSTEM_PLAN_LABELS, buildFacts, buildFactsSummary, buildsHash, parseBuildsRoute, type BuildsRoute } from './builds';
+import { BuildsScreen, resetBuildsMemory, type BuildsHost } from './builds-ui';
 
 // ---------------------------------------------------------------------------
 // Icons. Geometry from Lucide (ISC License, https://lucide.dev), vendored so a
@@ -200,21 +201,41 @@ interface Section {
   id: SectionId;
   label: string;
   description: string;
+  /** Heading of the navigation group this section opens. */
+  group?: string;
   placeholder?: { title: string; text: string };
 }
 
+// The order follows the work: buy a provider subscription (source), assemble
+// what a client gets (сборка), price it (tariff), then watch it and the clients.
 const SECTIONS: readonly Section[] = [
   {
     id: 'overview', label: 'Обзор',
     description: 'Подписки, пользователи и действия в панели по текущим данным сервиса.',
   },
   {
-    id: 'users', label: 'Пользователи',
-    description: 'Клиенты с привязанным Telegram-аккаунтом и их подписки. Пробные подписки без привязки сюда не входят.',
+    id: 'sources', label: 'Источники', group: 'Подписки',
+    description: 'Подписки, купленные у провайдеров: одна ссылка — много стран и серверов. Из них собираются подписки для ваших клиентов.',
+  },
+  {
+    id: 'builders', label: 'Сборки',
+    description: 'Сборка — это подписка, которую получает клиент: страны и серверы из купленных вами подписок провайдеров, их названия и цена.',
   },
   {
     id: 'tariffs', label: 'Тарифы',
-    description: 'Предложения для покупки в Mini App и боте: цена, срок, карточка и порядок показа.',
+    description: 'Цены сборок в Mini App и боте: срок, стоимость, карточка и порядок показа.',
+  },
+  {
+    id: 'monitoring', label: 'Мониторинг', group: 'Контроль',
+    description: 'Доступность серверов, которые сборки сейчас выдают клиентам: сборка, страна, сервер. Проверки идут в фоне на уровне handshake протокола.',
+  },
+  {
+    id: 'events', label: 'События',
+    description: 'Сбои и восстановления серверов, стран, сборок и источников, итоги дня и уведомления в Telegram.',
+  },
+  {
+    id: 'users', label: 'Пользователи', group: 'Клиенты',
+    description: 'Клиенты с привязанным Telegram-аккаунтом и их подписки. Пробные подписки без привязки сюда не входят.',
   },
   {
     id: 'promos', label: 'Промокоды',
@@ -225,23 +246,7 @@ const SECTIONS: readonly Section[] = [
     description: 'Автоматические сообщения в боте: пробный период, окончание подписки и возврат клиентов. Сценарии, тексты, кнопки, скидки и история отправок.',
   },
   {
-    id: 'sources', label: 'Источники',
-    description: 'Внешние подписки-источники VPN-конфигураций для построителей.',
-  },
-  {
-    id: 'builders', label: 'Построители',
-    description: 'Конфигурации подписок: правила фильтрации, порядок серверов, назначение планам.',
-  },
-  {
-    id: 'monitoring', label: 'Мониторинг',
-    description: 'Доступность серверов, которые построители сейчас выдают клиентам: построитель, страна, сервер. Проверки идут в фоне на уровне handshake протокола.',
-  },
-  {
-    id: 'events', label: 'События',
-    description: 'Сбои и восстановления серверов, стран, построителей и источников, итоги дня и уведомления в Telegram.',
-  },
-  {
-    id: 'audit', label: 'Журнал',
+    id: 'audit', label: 'Журнал', group: 'Система',
     description: 'История действий пользователей, администраторов и системы: регистрации, подписки и платежи. Записи создаются автоматически и не редактируются.',
   },
 ];
@@ -251,6 +256,8 @@ const SECTIONS: readonly Section[] = [
 // Tariffs: #/tariffs, #/tariffs/new, #/tariffs/{product_id}, #/tariffs/trial
 // (the trial editor, part of the Tariffs section).
 // Sources: #/sources, #/sources/{source_id} (catalogue of one source).
+// Сборки: #/builders, #/builders/new, #/builders/new/from/{source_id},
+// #/builders/{builder_id} (an unknown path under #/builders opens the list).
 // Monitoring: #/monitoring, #/monitoring/{builder_id} (countries and servers).
 // Warm-up: #/warmup, #/warmup/create, #/warmup/scenario/{id}, #/warmup/settings,
 // #/warmup/deliveries, #/warmup/coupons (an unknown warm-up path opens #/warmup).
@@ -260,6 +267,7 @@ interface Route {
   section: Section; userId: number | null; tariffId: number | 'new' | 'trial' | null; sourceId: number | null; monitorId: number | null;
   warmup: WarmupRoute | null;
   ops: OpsRoute | null;
+  builds: BuildsRoute | null;
 }
 const USER_ROUTE = /^users\/([1-9][0-9]{0,15})$/;
 const TARIFF_ROUTE = /^tariffs\/(new|trial|[1-9][0-9]{0,15})$/;
@@ -268,7 +276,7 @@ const MONITOR_ROUTE = /^monitoring\/([1-9][0-9]{0,15})$/;
 
 function currentRoute(): Route {
   const path = location.hash.replace(/^#\/?/, '');
-  const none = { userId: null, tariffId: null, sourceId: null, monitorId: null, warmup: null, ops: null };
+  const none = { userId: null, tariffId: null, sourceId: null, monitorId: null, warmup: null, ops: null, builds: null };
   const warmupSection = SECTIONS.find(section => section.id === 'warmup');
   if (warmupSection && (path === 'warmup' || path.startsWith('warmup/'))) {
     return { ...none, section: warmupSection, warmup: parseWarmupRoute(path) ?? { view: 'overview' } };
@@ -276,6 +284,10 @@ function currentRoute(): Route {
   const ops = parseOpsRoute(path);
   const opsSection = ops && SECTIONS.find(section => section.id === ops.view);
   if (ops && opsSection) return { ...none, section: opsSection, ops };
+  const buildsSection = SECTIONS.find(section => section.id === 'builders');
+  if (buildsSection && (path === 'builders' || path.startsWith('builders/'))) {
+    return { ...none, section: buildsSection, builds: parseBuildsRoute(path) ?? { view: 'list' } };
+  }
   const match = USER_ROUTE.exec(path);
   const users = SECTIONS.find(section => section.id === 'users');
   if (match && users) {
@@ -497,7 +509,12 @@ function relativeTime(iso: string, now: number): string {
 
 const handle = (username: string) => (username.startsWith('@') ? username : `@${username}`);
 const displayName = (user: AdminSubscription) => (user.username ? handle(user.username) : `Пользователь ${user.telegram_id}`);
-const planLabel = (user: AdminSubscription) => user.plan_name || `Тариф #${user.plan_id}`;
+/**
+ * A plan as the owner knows it: the system plans by what they are for
+ * («Бесплатный доступ», «Пробная подписка»), a sale plan by its сборка.
+ */
+const planDisplayName = (name: string) => SYSTEM_PLAN_LABELS[name] ?? name;
+const planLabel = (user: AdminSubscription) => (user.plan_name ? planDisplayName(user.plan_name) : `Тариф #${user.plan_id}`);
 const statusLabel = (status: string) => STATUS_ROWS.find(row => row.key === status)?.label ?? status;
 const parseStatus = (value: string): SubscriptionStatus | '' => STATUS_ROWS.find(row => row.key === value)?.key ?? '';
 
@@ -623,52 +640,6 @@ function retryButton(onRetry: () => void): HTMLButtonElement {
   return retry;
 }
 
-/**
- * Drag-and-drop reorder for a list. Items with the given CSS class are
- * draggable. The callback receives the new order as an array of data-src-id or
- * data-drag-idx values (strings), depending on which attribute is present.
- */
-function setupDragReorder(list: HTMLElement, itemClass: string, onReorder: (newOrder: string[]) => void) {
-  let dragSrc: HTMLElement | null = null;
-
-  const items = list.querySelectorAll<HTMLElement>(`.${itemClass}`);
-  for (const item of items) {
-    item.addEventListener('dragstart', (e) => {
-      dragSrc = item;
-      item.classList.add('dragging');
-      if (e.dataTransfer) {
-        e.dataTransfer.effectAllowed = 'move';
-        e.dataTransfer.setData('text/plain', item.dataset.srcId ?? item.dataset.dragIdx ?? '');
-      }
-    });
-    item.addEventListener('dragend', () => {
-      item.classList.remove('dragging');
-      list.querySelectorAll('.drag-over').forEach(n => n.classList.remove('drag-over'));
-      dragSrc = null;
-    });
-    item.addEventListener('dragover', (e) => {
-      if (!dragSrc || dragSrc === item) return;
-      e.preventDefault();
-      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
-      list.querySelectorAll('.drag-over').forEach(n => n.classList.remove('drag-over'));
-      item.classList.add('drag-over');
-    });
-    item.addEventListener('drop', (e) => {
-      e.preventDefault();
-      if (!dragSrc || dragSrc === item) return;
-      const allItems = [...list.querySelectorAll<HTMLElement>(`.${itemClass}`)];
-      const fromIdx = allItems.indexOf(dragSrc);
-      const toIdx = allItems.indexOf(item);
-      if (fromIdx === -1 || toIdx === -1) return;
-      allItems.splice(fromIdx, 1);
-      allItems.splice(toIdx, 0, dragSrc);
-      for (const n of allItems) list.append(n);
-      const newOrder = allItems.map(n => n.dataset.srcId ?? n.dataset.dragIdx ?? '');
-      onReorder(newOrder);
-    });
-  }
-}
-
 function skeletonPanel(rows: number, head = true): HTMLElement {
   const panel = el('div', 'panel');
   if (head) {
@@ -728,7 +699,7 @@ function subscriptionPanel(user: AdminSubscription, now: number): HTMLElement {
     fact('Последний запрос', user.last_request ? formatDateTime(user.last_request) : 'Не было',
       user.last_request ? relativeTime(user.last_request, now) : undefined),
     fact('Начало', user.started_at ? formatDateTime(user.started_at) : 'Нет данных'),
-    fact('Источник', user.provider_source_id === null ? 'Построитель' : `Внешний провайдер #${user.provider_source_id}`),
+    fact('Источник', user.provider_source_id === null ? 'Сборка' : `Внешний провайдер #${user.provider_source_id}`),
     fact('Пригласил', referrer),
     fact('Создана', formatDateTime(user.created_at)),
     fact('Обновлена', formatDateTime(user.updated_at)),
@@ -747,7 +718,7 @@ function planPanel(user: AdminSubscription, plan: AdminPlan | null): HTMLElement
   }
   const facts = el('dl', 'facts facts-single');
   facts.append(
-    fact('Название', plan.name || `Тариф #${plan.id}`),
+    fact('Название', plan.name ? planDisplayName(plan.name) : `Тариф #${plan.id}`),
     fact('Состояние', plan.is_active ? 'Доступен' : 'Отключён'),
   );
   panel.append(facts);
@@ -974,7 +945,7 @@ interface MonitorDetailView {
 }
 
 const MONITOR_BUILDER_COLUMNS = [
-  ['Построитель', ''], ['Статус', 'col-status'], ['Страны', 'col-md'], ['Серверы', 'col-md'],
+  ['Сборка', ''], ['Статус', 'col-status'], ['Страны', 'col-md'], ['Серверы', 'col-md'],
   ['Задержка', 'col-md'], ['Проверено', 'col-md'], ['Последний переход', ''],
 ] as const;
 
@@ -1066,10 +1037,22 @@ function healthBanner(h: HealthSummary): HTMLElement {
     }
     stats.append(item);
   };
-  stat('Построители в норме', h.buildersOk, h.builders);
+  stat('Сборки в норме', h.buildersOk, h.builders);
   stat('Страны работают', h.countriesUp, h.countries);
   stat('Серверы отвечают', h.nodesUp, h.nodes, healthBar(h.nodesUp, h.nodesDown, h.nodesUnknown));
   panel.append(lead, stats);
+  return panel;
+}
+
+/** The network verdict on the Overview, with the way to the details. */
+function overviewHealthPanel(data: MonitorOverview): HTMLElement {
+  const panel = healthBanner(overviewHealth(data, Date.now()));
+  const link = el('a', 'btn btn-secondary btn-sm');
+  link.href = '#/monitoring';
+  link.append(icon('monitoring'), el('span', 'btn-label', 'Открыть мониторинг'));
+  const foot = el('div', 'health-foot');
+  foot.append(link);
+  panel.append(foot);
   return panel;
 }
 
@@ -1118,7 +1101,7 @@ function monitorHistoryKey(builderId: number, subject: MonitorHistorySubject, pe
   return `${builderId}|${subject.kind}|${subject.country ?? ''}|${subject.targetId ?? ''}|${period}`;
 }
 
-const BUILDER_HISTORY: MonitorHistorySubject = { kind: 'builder', country: null, targetId: null, label: 'Весь построитель' };
+const BUILDER_HISTORY: MonitorHistorySubject = { kind: 'builder', country: null, targetId: null, label: 'Вся сборка' };
 
 const parseMonitorStatus = (value: string): MonitorStatus | '' =>
   (Object.prototype.hasOwnProperty.call(STATUS_LABELS, value) ? value as MonitorStatus : '');
@@ -1394,6 +1377,8 @@ interface TariffsView {
   refresh: HTMLButtonElement;
   updated: HTMLElement;
   summary: HTMLElement;
+  /** Slot of the «Бесплатный доступ» panel. */
+  free: HTMLElement;
 }
 
 interface TariffEditorView {
@@ -1426,14 +1411,10 @@ interface SourceDetailView {
   sync: HTMLButtonElement;
 }
 
-/** What a builder rule is read against: every source and the builder's selection. */
-interface RuleContext {
-  sources: () => readonly AdminSource[];
-  selectedIds: () => readonly number[];
-}
-
-function enabledBadge(enabled: boolean): HTMLElement {
-  return el('span', enabled ? 'badge badge-active' : 'badge badge-disabled', enabled ? 'Включён' : 'Отключён');
+/** «Включён» / «Отключён» of a source; feminine for a сборка. */
+function enabledBadge(enabled: boolean, feminine = false): HTMLElement {
+  const text = enabled ? (feminine ? 'Включена' : 'Включён') : (feminine ? 'Отключена' : 'Отключён');
+  return el('span', enabled ? 'badge badge-active' : 'badge badge-disabled', text);
 }
 
 /** "Срок истёк" / "Скоро истекает"; null while the source has no limit or it is far away. */
@@ -1467,6 +1448,15 @@ function lastSyncText(src: AdminSource): string {
   return syncState(src) === 'error' ? `Последняя попытка: ${at}` : `Последняя синхронизация: ${at}`;
 }
 
+/** A name for a source created without one: the host of its link. */
+function sourceNameFromUrl(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, '').slice(0, 255);
+  } catch {
+    return '';
+  }
+}
+
 const protocolsText = (protocols: Readonly<Record<string, number>>) =>
   Object.entries(protocols).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .map(([name, n]) => `${name} ${formatCount(n)}`).join(' · ') || '—';
@@ -1482,7 +1472,8 @@ class AdminApp {
   private readonly toasts = el('div', 'toast-region');
   // Last dashboard snapshot, kept in memory only so returning to Overview
   // shows figures at once while a fresh request runs. Cleared on sign-out.
-  private dashboard: { data: Dashboard; at: Date } | null = null;
+  // monitor is the network verdict shown above the figures (null: unknown).
+  private dashboard: { data: Dashboard; at: Date; monitor: MonitorOverview | null } | null = null;
   private overview: OverviewView | null = null;
   private dashboardRequest = 0;
   // Users list state (search, filter, page, last snapshot) survives navigation
@@ -1523,12 +1514,10 @@ class AdminApp {
   private sourceDetailRequest = 0;
   // Outcome of the last sync per source, shown on its row and detail page.
   private syncNotices = new Map<number, Notice>();
-  // Builders section state
+  // Сборки (#/builders…): one screen per route, disposed on leaving. The list
+  // snapshot is shared with the tariff editor and the user page.
   private buildersCache: readonly AdminBuilder[] | null = null;
-  private buildersRequest = 0;
-  private buildersView: { body: HTMLElement; refresh: HTMLButtonElement } | null = null;
-  // Builder editor state (single builder open)
-  private builderEditorRequest = 0;
+  private buildsScreen: BuildsScreen | null = null;
   // Tariffs section state. The catalogue snapshot survives navigation within
   // the session; pendingOrder is an edited, not yet saved catalogue order.
   private tariffsCache: readonly AdminTariff[] | null = null;
@@ -1600,6 +1589,7 @@ class AdminApp {
     this.trialEditorView = null;
     this.disposeWarmup();
     this.disposeOps();
+    this.disposeBuilds();
     this.overview = null;
     this.usersView = null;
     this.detailView = null;
@@ -1667,9 +1657,12 @@ class AdminApp {
     this.tariffsCache = null;
     this.tariffsAt = null;
     this.plansCache = null;
+    this.sourcesCache = null;
+    this.buildersCache = null;
     this.orderKey = null;
     resetWarmupMemory();
     resetOpsMemory();
+    resetBuildsMemory();
 
     const card = el('section', 'auth-card');
     card.setAttribute('aria-labelledby', 'login-title');
@@ -1811,6 +1804,7 @@ class AdminApp {
     nav.setAttribute('aria-label', 'Разделы панели');
     const links = new Map<SectionId, HTMLAnchorElement>();
     for (const section of SECTIONS) {
+      if (section.group) nav.append(el('p', 'nav-group', section.group));
       const link = el('a', 'nav-link');
       link.href = `#/${section.id}`;
       link.append(icon(section.id), el('span', '', section.label));
@@ -1867,10 +1861,11 @@ class AdminApp {
 
   private renderSection(focus: boolean) {
     if (!this.shell) return;
-    const { section, userId, tariffId, sourceId, monitorId, warmup, ops } = currentRoute();
+    const { section, userId, tariffId, sourceId, monitorId, warmup, ops, builds } = currentRoute();
     const canonical = userId !== null ? `#/users/${userId}` : tariffId !== null ? `#/tariffs/${tariffId}`
       : sourceId !== null ? `#/sources/${sourceId}` : monitorId !== null ? `#/monitoring/${monitorId}`
-        : warmup !== null ? warmupHash(warmup) : ops !== null ? opsHash(ops) : `#/${section.id}`;
+        : warmup !== null ? warmupHash(warmup) : ops !== null ? opsHash(ops)
+          : builds !== null ? buildsHash(builds) : `#/${section.id}`;
     if (location.hash !== canonical) history.replaceState(null, '', canonical);
     for (const [id, link] of this.shell.links) {
       if (id === section.id) link.setAttribute('aria-current', 'page');
@@ -1890,12 +1885,12 @@ class AdminApp {
     this.sourcesView = null;
     this.sourceDetailView = null;
     this.sourceDetailRequest++;
-    this.buildersView = null;
     this.tariffsView = null;
     this.tariffEditorView = null;
     this.trialEditorView = null;
     this.disposeWarmup();
     this.disposeOps();
+    this.disposeBuilds();
     this.unsavedChanges = null;
     this.pendingOrder = null;
     this.tariffsRequest++;
@@ -1905,8 +1900,6 @@ class AdminApp {
     this.usersRequest++;
     this.detailRequest++;
     this.sourcesRequest++;
-    this.buildersRequest++;
-    this.builderEditorRequest++;
     this.stopMonitoring();
     window.clearTimeout(this.searchTimer);
 
@@ -1942,6 +1935,17 @@ class AdminApp {
       this.opsScreen = screen;
       page.append(header, screen.body);
       load = () => screen.load();
+    } else if (builds !== null) {
+      if (builds.view !== 'list') {
+        const back = el('a', 'back-link');
+        back.href = '#/builders';
+        back.append(icon('back'), el('span', '', 'Назад к сборкам'));
+        page.append(back);
+      }
+      const screen = new BuildsScreen(this.buildsHost(), builds, { header, title, desc });
+      this.buildsScreen = screen;
+      page.append(header, screen.body);
+      load = () => screen.load();
     } else if (section.id === 'overview') {
       page.append(header, this.buildOverview(header));
       load = () => this.loadDashboard();
@@ -1972,9 +1976,6 @@ class AdminApp {
     } else if (section.id === 'sources') {
       page.append(header, this.buildSourcesSection(header));
       load = () => this.loadSources();
-    } else if (section.id === 'builders') {
-      page.append(header, this.buildBuildersSection(header));
-      load = () => this.loadBuilders();
     } else if (monitorId !== null) {
       const back = el('a', 'back-link');
       back.href = '#/monitoring';
@@ -2032,7 +2033,11 @@ class AdminApp {
     view.body.removeAttribute('aria-busy');
     view.body.removeAttribute('role');
     view.body.removeAttribute('aria-label');
-    view.body.replaceChildren(...overviewContent(data));
+    const nodes = overviewContent(data);
+    // First thing on the first screen: is the network the clients use alive.
+    const monitor = this.dashboard?.monitor ?? null;
+    if (monitor) nodes.unshift(overviewHealthPanel(monitor));
+    view.body.replaceChildren(...nodes);
     view.updated.textContent = `Обновлено в ${clockSeconds(at)}`;
   }
 
@@ -2069,10 +2074,11 @@ class AdminApp {
     this.setRefreshing(view, true);
     if (!this.dashboard) this.paintSkeleton(view);
     try {
-      const data = await this.api.dashboard();
+      // The network verdict is a best-effort extra: the figures work without it.
+      const [data, monitor] = await Promise.all([this.api.dashboard(), this.api.monitoring().catch(() => null)]);
       if (!current()) return;
       const at = new Date();
-      this.dashboard = { data, at };
+      this.dashboard = { data, at, monitor };
       this.lastSessionCheck = Date.now();
       this.paintDashboard(view, data, at);
     } catch (error) {
@@ -3245,9 +3251,15 @@ class AdminApp {
     setRefreshBusy(view.refresh, true);
     if (!shown) this.paintDetailSkeleton(view);
     try {
-      const data = subscriptionId === undefined ? await this.api.user(view.id) : await this.api.subscription(subscriptionId, view.id);
+      // The сборки name the «Сборка» panel: best effort, read once per session
+      // (its pickers load them on demand when this failed).
+      const [data, builders] = await Promise.all([
+        subscriptionId === undefined ? this.api.user(view.id) : this.api.subscription(subscriptionId, view.id),
+        this.buildersCache ? Promise.resolve(null) : this.api.listBuilders().catch(() => null),
+      ]);
       if (!current()) return;
       this.lastSessionCheck = Date.now();
+      if (builders) this.buildersCache = builders;
       const at = new Date();
       this.detailCache = { id: view.id, data, at };
       this.patchUsersRow(data.subscription);
@@ -3338,8 +3350,9 @@ class AdminApp {
   }
 
   // ===========================================================================
-  // Network monitor (#/monitoring, #/monitoring/{builder_id}). Read-only: the
-  // page only GETs snapshots; checks run in the backend worker.
+  // Network monitor (#/monitoring, #/monitoring/{builder_id}). The page GETs
+  // snapshots; checks run in the backend worker and, on «Проверить сейчас»,
+  // right away (POST /monitoring/check).
   // ===========================================================================
 
   /** Stops polling and the "N s ago" ticker and drops every monitor request in flight. */
@@ -3386,6 +3399,52 @@ class AdminApp {
     else this.scheduleMonitorPoll();
   }
 
+  /** «Проверить сейчас» of the overview and of a сборка page. */
+  private monitorCheckButton(): HTMLButtonElement {
+    const check = button('Проверить сейчас', 'btn btn-primary btn-sm', 'monitoring');
+    check.title = 'Проверить все серверы прямо сейчас, не дожидаясь фоновой проверки. Сервер, который не ответил, сразу проверяется повторно.';
+    check.addEventListener('click', () => void this.checkMonitoringNow(check));
+    return check;
+  }
+
+  /**
+   * Runs a check on the server right now (POST /monitoring/check): it re-reads
+   * the sources, probes every served server (one that does not answer is
+   * probed again right away, so the press ends with a verdict) and answers the
+   * fresh overview. A server found down this way is reported to Telegram right
+   * after the check, exactly like one found by the background checks.
+   */
+  private async checkMonitoringNow(trigger: HTMLButtonElement) {
+    if (trigger.disabled) return;
+    const overview = this.monitorView;
+    const detail = this.monitorDetailView;
+    const current = () => (overview !== null && this.monitorView === overview) || (detail !== null && this.monitorDetailView === detail);
+    trigger.disabled = true;
+    trigger.setAttribute('aria-busy', 'true');
+    setLabel(trigger, 'Проверяем…');
+    window.clearTimeout(this.monitorTimer);
+    try {
+      const data = await this.api.monitoringCheck();
+      this.lastSessionCheck = Date.now();
+      const at = new Date();
+      this.monitorState.overview = { data, at };
+      if (!current()) return;
+      if (overview && this.monitorView === overview) this.paintMonitoring(overview, data, at);
+      if (detail && this.monitorDetailView === detail) await this.loadMonitorBuilder(false);
+      const health = overviewHealth(data, Date.now());
+      this.toast(`Проверка завершена: ${health.title.toLocaleLowerCase('ru-RU')}.`);
+    } catch (error) {
+      if (!current()) return;
+      if (await this.endIfSignedOut(error, current)) return;
+      this.toast(`Проверка не выполнена. ${errorText(error)}`);
+    } finally {
+      trigger.disabled = false;
+      trigger.removeAttribute('aria-busy');
+      setLabel(trigger, 'Проверить сейчас');
+      if (current() && overview && this.monitorView === overview) this.scheduleMonitorPoll();
+    }
+  }
+
   /** Error of a monitor request; 503 means the backend runs without the monitor. */
   private monitorErrorPanel(title: string, error: unknown, onRetry: () => void): HTMLElement {
     const text = error instanceof ApiError && error.status === 503
@@ -3398,6 +3457,7 @@ class AdminApp {
 
   private buildMonitoring(header: HTMLElement): HTMLElement {
     const { actions, refresh, updated } = refreshActions(() => void this.loadMonitoring(false));
+    actions.append(this.monitorCheckButton());
     header.classList.add('has-actions');
     header.append(actions);
     const state = this.monitorState;
@@ -3406,7 +3466,7 @@ class AdminApp {
     status.id = 'monitor-overview-status';
     status.append(option('', 'Все статусы'), ...[...FILTER_STATUSES, 'disabled' as const].map(s => option(s, STATUS_LABELS[s])));
     status.value = state.overviewStatus;
-    const caption = el('label', 'sr-only', 'Статус построителя');
+    const caption = el('label', 'sr-only', 'Статус сборки');
     caption.htmlFor = status.id;
     const box = el('div', 'select');
     box.append(status, icon('chevron'));
@@ -3451,7 +3511,7 @@ class AdminApp {
     const nodes: HTMLElement[] = [healthBanner(overviewHealth(data, Date.now()))];
     if (data.builders.length === 0) {
       nodes.push(messagePanel('monitoring', 'Проверять пока нечего',
-        'Мониторинг проверяет серверы, которые построители выдают клиентам. Создайте построитель — он появится здесь.', 'status'));
+        'Мониторинг проверяет серверы, которые сборки выдают клиентам. Создайте сборку — она появится здесь.', 'status'));
       view.results.replaceChildren(...nodes);
       return;
     }
@@ -3462,7 +3522,7 @@ class AdminApp {
         view.status.dispatchEvent(new Event('change'));
         view.status.focus();
       });
-      nodes.push(messagePanel('search', 'Построители не найдены', 'Нет построителей с выбранным статусом.', 'status', reset));
+      nodes.push(messagePanel('search', 'Сборки не найдены', 'Нет сборок с выбранным статусом.', 'status', reset));
       view.results.replaceChildren(...nodes);
       return;
     }
@@ -3470,11 +3530,11 @@ class AdminApp {
     const panel = el('section', 'panel users-panel');
     panel.setAttribute('aria-labelledby', 'monitor-builders-title');
     const head = el('div', 'panel-head');
-    const title = el('h2', 'panel-title', 'Построители');
+    const title = el('h2', 'panel-title', 'Сборки');
     title.id = 'monitor-builders-title';
     head.append(title, monitorRoundMeta(data.interval_seconds, data.last_round_at));
     const table = el('table', 'table table-cards users-table monitor-table');
-    table.append(el('caption', 'sr-only', 'Состояние сети по построителям'), headRow(MONITOR_BUILDER_COLUMNS));
+    table.append(el('caption', 'sr-only', 'Состояние сети по сборкам'), headRow(MONITOR_BUILDER_COLUMNS));
     const body = el('tbody');
     for (const b of list) body.append(this.monitorBuilderRow(b));
     table.append(body);
@@ -3488,11 +3548,11 @@ class AdminApp {
   }
 
   private monitorBuilderRow(b: MonitorBuilderSummary): HTMLTableRowElement {
-    const link = el('a', 'inline-link', b.name || `Построитель #${b.id}`);
+    const link = el('a', 'inline-link', b.name || `Сборка #${b.id}`);
     link.href = `#/monitoring/${b.id}`;
     link.dataset.focusKey = `builder:${b.id}`;
-    const name = cell('Построитель', link, 'col-user');
-    if (!b.enabled) name.append(el('span', 'cell-note', 'Отключён, серверы не выдаются'));
+    const name = cell('Сборка', link, 'col-user');
+    if (!b.enabled) name.append(el('span', 'cell-note', 'Отключена, серверы не выдаются'));
     else if (b.source_errors > 0) name.append(el('span', 'cell-note is-danger', `Источников с ошибкой: ${formatCount(b.source_errors)}`));
 
     const transition = cell('Последний переход', transitionText(b.last_transition), 'cell-wrap');
@@ -3568,6 +3628,7 @@ class AdminApp {
 
   private buildMonitorBuilder(id: number, header: HTMLElement, title: HTMLElement, desc: HTMLElement): HTMLElement {
     const { actions, refresh, updated } = refreshActions(() => void this.loadMonitorBuilder(false));
+    actions.append(this.monitorCheckButton());
     header.classList.add('has-actions');
     header.append(actions);
     const state = this.monitorState;
@@ -3580,8 +3641,8 @@ class AdminApp {
     }
     const cached = state.detail && state.detail.id === id ? state.detail : null;
     const known = cached?.data.builder ?? state.overview?.data.builders.find(b => b.id === id);
-    title.textContent = known ? known.name || `Построитель #${id}` : 'Построитель';
-    desc.textContent = 'Страны и серверы, которые построитель сейчас выдаёт клиентам. Раскройте страну, чтобы увидеть серверы.';
+    title.textContent = known ? known.name || `Сборка #${id}` : 'Сборка';
+    desc.textContent = 'Страны и серверы, которые сборка сейчас выдаёт клиентам. Раскройте страну, чтобы увидеть серверы.';
 
     const toolbar = el('div', 'toolbar');
     toolbar.setAttribute('role', 'search');
@@ -3632,7 +3693,7 @@ class AdminApp {
   }
 
   private paintMonitorBuilderSkeleton(view: MonitorDetailView) {
-    setLoading(view.countries, 'Загружаем состояние построителя');
+    setLoading(view.countries, 'Загружаем состояние сборки');
     view.summary.replaceChildren(skeletonPanel(3));
     view.notices.replaceChildren();
     view.countries.replaceChildren(usersSkeleton());
@@ -3643,7 +3704,7 @@ class AdminApp {
 
   private paintMonitorBuilderMissing(view: MonitorDetailView) {
     setLoading(view.countries, null);
-    view.title.textContent = 'Построитель';
+    view.title.textContent = 'Сборка';
     view.updated.textContent = '';
     view.meta.textContent = '';
     view.summary.replaceChildren();
@@ -3651,13 +3712,13 @@ class AdminApp {
     view.history.replaceChildren();
     const back = el('a', 'btn btn-secondary btn-sm', 'К мониторингу');
     back.href = '#/monitoring';
-    view.countries.replaceChildren(messagePanel('monitoring', 'Построитель не найден',
-      `Построителя #${view.id} нет: возможно, он удалён.`, 'status', back));
+    view.countries.replaceChildren(messagePanel('monitoring', 'Сборка не найдена',
+      `Сборки #${view.id} нет: возможно, она удалена.`, 'status', back));
   }
 
   private paintMonitorBuilder(view: MonitorDetailView, data: MonitorBuilderDetail, at: Date) {
     const b = data.builder;
-    const name = b.name || `Построитель #${b.id}`;
+    const name = b.name || `Сборка #${b.id}`;
     view.title.textContent = name;
     document.title = `${name} · Мониторинг · DictatorVPN Admin`;
     view.updated.textContent = `Обновлено в ${clockSeconds(at)}`;
@@ -3692,12 +3753,16 @@ class AdminApp {
     view.summary.replaceChildren(panel);
 
     const notices: HTMLElement[] = [];
-    if (!b.enabled) notices.push(notice({ tone: 'info', text: 'Построитель отключён: его серверы не выдаются клиентам и не проверяются.' }));
+    if (!b.enabled) notices.push(notice({ tone: 'info', text: 'Сборка отключена: её серверы не выдаются клиентам и не проверяются.' }));
     if (b.source_errors > 0) {
       notices.push(notice({ tone: 'error', text: `Источников с ошибкой загрузки при последнем разборе: ${formatCount(b.source_errors)}. Их серверы могут отсутствовать в списке.` }));
     }
     if (b.unresolved > 0) {
-      notices.push(notice({ tone: 'info', text: `Серверов без проверяемого адреса: ${formatCount(b.unresolved)} (например, конфигурация Xray без основного outbound). Они не проверяются.` }));
+      notices.push(notice({
+        tone: 'info',
+        text: `Серверов без проверяемого адреса: ${formatCount(b.unresolved)}. Обычно это «авто»-подключения провайдера: внутри несколько серверов, ` +
+          'и приложение клиента само выбирает рабочий. Отдельно они не проверяются — их серверы проверяются под своими названиями.',
+      }));
     }
     view.notices.replaceChildren(...notices);
     this.paintMonitorCountries(view);
@@ -3727,9 +3792,9 @@ class AdminApp {
     view.meta.textContent = all.length === 0 ? ''
       : filtered ? `Показано стран: ${formatCount(list.length)} из ${formatCount(all.length)}` : `Стран: ${formatCount(all.length)}`;
     if (all.length === 0) {
-      view.countries.replaceChildren(messagePanel('monitoring', 'Построитель не выдаёт серверов', data.builder.enabled
-        ? 'После правил построителя не осталось ни одного сервера, или источники ещё не загружены.'
-        : 'Построитель отключён.', 'status'));
+      view.countries.replaceChildren(messagePanel('monitoring', 'Сборка не выдаёт серверов', data.builder.enabled
+        ? 'В сборке не осталось ни одного сервера, или источники ещё не загружены.'
+        : 'Сборка отключена.', 'status'));
       return;
     }
     if (list.length === 0) {
@@ -3748,7 +3813,7 @@ class AdminApp {
     panel.setAttribute('aria-labelledby', 'monitor-countries-title');
     panel.append(panelHead('monitor-countries-title', 'Страны', formatCount(list.length)));
     const table = el('table', 'table table-cards users-table monitor-table');
-    table.append(el('caption', 'sr-only', 'Состояние стран построителя'), headRow(MONITOR_COUNTRY_COLUMNS));
+    table.append(el('caption', 'sr-only', 'Состояние стран сборки'), headRow(MONITOR_COUNTRY_COLUMNS));
     const body = el('tbody');
     for (const c of list) {
       const open = state.expanded.has(countryKey(c.country_code));
@@ -3806,7 +3871,7 @@ class AdminApp {
       const label = node.name || `Сервер #${node.target_id}`;
       const name = cell('Сервер', label, 'cell-wrap');
       const origin = [node.source_name || `Источник #${node.source_id}`];
-      if (node.shared_with > 0) origin.push(`ещё в построителях: ${formatCount(node.shared_with)}`);
+      if (node.shared_with > 0) origin.push(`ещё в сборках: ${formatCount(node.shared_with)}`);
       name.append(el('span', 'cell-note', origin.join(' · ')));
       const proto = cell('Протокол', protocolLabel(node.protocol), 'col-md');
       const transport = transportLabel(node);
@@ -3862,7 +3927,7 @@ class AdminApp {
     title.tabIndex = -1;
     head.append(title);
     if (subject.kind !== 'builder') {
-      const whole = button('Весь построитель', 'btn btn-ghost btn-xs');
+      const whole = button('Вся сборка', 'btn btn-ghost btn-xs');
       whole.dataset.focusKey = 'history-builder';
       whole.addEventListener('click', () => this.selectMonitorHistory(view, BUILDER_HISTORY));
       head.append(whole);
@@ -4002,11 +4067,11 @@ class AdminApp {
       } else if (shown) {
         view.countries.removeAttribute('aria-busy');
         if (silent) view.updated.textContent = `Не удалось обновить в ${clockSeconds(new Date())}`;
-        else this.toast(`Не удалось обновить состояние построителя. ${errorText(error)}`);
+        else this.toast(`Не удалось обновить состояние сборки. ${errorText(error)}`);
       } else {
         setLoading(view.countries, null);
         view.summary.replaceChildren();
-        view.countries.replaceChildren(this.monitorErrorPanel('Не удалось загрузить построитель', error,
+        view.countries.replaceChildren(this.monitorErrorPanel('Не удалось загрузить сборку', error,
           () => void this.loadMonitorBuilder(false)));
       }
     } finally {
@@ -4022,19 +4087,19 @@ class AdminApp {
   // Builder assignment panel (Plan → Builder, Subscription → Builder override)
   // ===========================================================================
 
-  /** Renders the "Построитель" panel on the subscription detail page. */
+  /** Renders the «Сборка» panel on the subscription detail page. */
   private builderPanel(data: UserDetail): HTMLElement {
     const sub = data.subscription;
     const plan = data.plan;
     const panel = el('section', 'panel');
     panel.setAttribute('aria-labelledby', 'builder-assign-title');
-    panel.append(panelHead('builder-assign-title', 'Построитель'));
+    panel.append(panelHead('builder-assign-title', 'Сборка'));
 
     const facts = el('dl', 'facts facts-single');
 
     const mkBuilderFact = (label: string, builderId: number | null, note: string, onEdit: () => void, disabled = false) => {
       const name = builderId !== null
-        ? this.buildersCache?.find(b => b.id === builderId)?.name ?? `Построитель #${builderId}`
+        ? this.buildersCache?.find(b => b.id === builderId)?.name ?? `Сборка #${builderId}`
         : '—';
       const factEl = fact(label, name, note);
       const btn = button('Изменить', 'btn btn-secondary btn-xs');
@@ -4047,17 +4112,18 @@ class AdminApp {
     // Plan builder
     const planBuilderId = plan?.subscription_builder_id ?? null;
     facts.append(mkBuilderFact(
-      'Построитель плана',
+      'Сборка тарифа',
       planBuilderId,
-      plan ? 'Применяется ко всем подпискам этого тарифа' : 'Тариф не найден',
+      plan ? 'Её получают все клиенты этого тарифа' : 'Тариф не найден',
       () => {
         if (!plan) return;
         const view = this.detailView;
-        void this.planImpact(plan.id, plan.name).then(impact => {
-          if (this.detailView !== view) return;
+        const current = () => this.detailView === view;
+        void Promise.all([this.planImpact(plan.id, plan.name), this.ensureBuilders(current)]).then(([impact, ready]) => {
+          if (!ready || !current()) return;
           this.openBuilderAssignDialog('plan', plan.id, planBuilderId, (newId) => {
             void this.loadUser();
-            this.toast(newId === null ? 'Построитель плана снят.' : 'Построитель плана назначен.');
+            this.toast(newId === null ? 'Сборка тарифа снята.' : 'Сборка тарифа назначена.');
           }, impact);
         });
       },
@@ -4067,19 +4133,42 @@ class AdminApp {
     // Subscription override
     const subBuilderId = sub.subscription_builder_id;
     facts.append(mkBuilderFact(
-      'Переопределение подписки',
+      'Личная сборка клиента',
       subBuilderId,
-      subBuilderId !== null ? 'Переопределяет построитель плана для этой подписки' : 'Используется построитель плана',
+      subBuilderId !== null ? 'Заменяет сборку тарифа только для этого клиента' : 'Не задана: клиент получает сборку тарифа',
       () => {
-        this.openBuilderAssignDialog('subscription', sub.id, subBuilderId, (newId) => {
-          void this.loadUser();
-          this.toast(newId === null ? 'Переопределение построителя снято.' : 'Построитель подписки назначен.');
+        const view = this.detailView;
+        const current = () => this.detailView === view;
+        void this.ensureBuilders(current).then(ready => {
+          if (!ready) return;
+          this.openBuilderAssignDialog('subscription', sub.id, subBuilderId, (newId) => {
+            void this.loadUser();
+            this.toast(newId === null ? 'Личная сборка снята: клиент получает сборку тарифа.' : 'Личная сборка назначена.');
+          });
         });
       },
     ));
 
     panel.append(facts);
     return panel;
+  }
+
+  /**
+   * Makes sure the сборки are loaded before a picker opens: a page opened
+   * directly (a user, the tariffs) has not read them yet. false when the read
+   * failed (explained in a toast) or the screen changed meanwhile.
+   */
+  private async ensureBuilders(current: () => boolean): Promise<boolean> {
+    if (this.buildersCache) return true;
+    try {
+      this.buildersCache = await this.api.listBuilders();
+    } catch (error) {
+      if (!current()) return false;
+      if (await this.endIfSignedOut(error, current)) return false;
+      this.toast(`Не удалось загрузить сборки. ${errorText(error)}`);
+      return false;
+    }
+    return current();
   }
 
   /** Opens a dialog to assign or clear a builder for a plan or subscription. */
@@ -4089,6 +4178,7 @@ class AdminApp {
     currentBuilderId: number | null,
     onDone: (newBuilderId: number | null) => void,
     impact?: PlanImpact,
+    title?: string,
   ) {
     if (this.dialog || this.view !== 'app') return;
 
@@ -4096,32 +4186,32 @@ class AdminApp {
     const dialog = el('dialog', 'modal modal-wide');
     dialog.setAttribute('aria-labelledby', 'ba-title');
 
-    const titleText = target === 'plan' ? 'Построитель плана' : 'Построитель подписки';
+    const titleText = title ?? (target === 'plan' ? 'Сборка тарифа' : 'Личная сборка клиента');
     const titleEl = el('h2', 'modal-title', titleText);
     titleEl.id = 'ba-title';
 
     // Select
     const sel = el('select', 'input');
     sel.id = 'ba-builder';
-    const optNone = el('option', '', target === 'plan' ? '— Без построителя —' : '— Использовать построитель плана —');
+    const optNone = el('option', '', target === 'plan' ? '— Без сборки —' : '— Как у тарифа —');
     optNone.value = '';
     sel.append(optNone);
     for (const b of builders) {
-      const opt = el('option', '', b.name + (b.enabled ? '' : ' (отключён)'));
+      const opt = el('option', '', b.name + (b.enabled ? '' : ' (отключена)'));
       opt.value = String(b.id);
       sel.append(opt);
     }
     sel.value = currentBuilderId !== null ? String(currentBuilderId) : '';
 
     const selField = el('div', 'field');
-    const selLabel = el('label', 'field-label', 'Построитель');
+    const selLabel = el('label', 'field-label', 'Сборка');
     selLabel.htmlFor = 'ba-builder';
     const selControl = el('div', 'control');
     selControl.append(sel);
     selField.append(selLabel, selControl);
 
     if (builders.length === 0) {
-      selField.append(el('p', 'field-hint', 'Построители не загружены. Откройте раздел «Построители» и вернитесь.'));
+      selField.append(el('p', 'field-hint', 'Сборок пока нет. Создайте первую в разделе «Сборки».'));
     }
 
     const statusEl = el('div', 'modal-status');
@@ -4230,7 +4320,7 @@ class AdminApp {
       const add = button('Добавить источник', 'btn btn-primary btn-sm', 'plus');
       add.addEventListener('click', () => this.openSourceEditor(null));
       body.replaceChildren(messagePanel('sources', 'Источников пока нет',
-        'Добавьте подписку провайдера: сервер скачает её, разберёт серверы и страны, и построители смогут их использовать.', 'status', add));
+        'Добавьте подписку провайдера: сервер скачает её и разберёт на страны и серверы. Из них вы соберёте подписки для клиентов.', 'status', add));
       return;
     }
     const panel = el('section', 'panel');
@@ -4240,7 +4330,7 @@ class AdminApp {
     const list = el('ul', 'source-list');
     for (const src of sources) list.append(this.sourceRow(src));
     panel.append(list,
-      el('p', 'panel-note', 'Каталог каждого источника хранится отдельно. Серверы разных источников объединяются только в построителе.'));
+      el('p', 'panel-note', 'Каталог каждого источника хранится отдельно. Серверы разных источников объединяются только в сборке.'));
     body.replaceChildren(panel);
   }
 
@@ -4260,7 +4350,7 @@ class AdminApp {
       ? 'Каталог ещё не загружен' : catalogueSummary(src.catalogue));
     const meta = el('p', 'source-meta', [formatLabel(src.type), lastSyncText(src), expiryText(src)].filter(Boolean).join(' · '));
     info.append(nameRow, stats, meta);
-    if (src.expired) info.append(el('p', 'source-error', 'Срок действия истёк: построители пропускают источник, как отключённый.'));
+    if (src.expired) info.append(el('p', 'source-error', 'Срок действия истёк: сборки пропускают источник, как отключённый.'));
     if ((state === 'error' || state === 'partial') && src.last_sync_error) {
       info.append(el('p', state === 'error' ? 'source-error' : 'source-warn', syncErrorText(src.last_sync_error)));
     }
@@ -4325,7 +4415,7 @@ class AdminApp {
       trigger.disabled = false;
       trigger.removeAttribute('aria-busy');
       if (error instanceof ApiError && error.code === 'source_in_use') {
-        this.toast(`Источник «${src.name}» уже используется построителем или подпиской: удалить его нельзя, можно отключить.`);
+        this.toast(`Источник «${src.name}» уже используется сборкой или подпиской: удалить его нельзя, можно отключить.`);
         // The dependents on screen are stale: reload them.
         if (this.sourcesView) void this.loadSources();
         if (this.sourceDetailView?.id === src.id) void this.loadSourceDetail();
@@ -4449,8 +4539,10 @@ class AdminApp {
       return { inp, ...f };
     };
 
-    const nameF = mkInput('src-name', 'Название', src?.name ?? '', 'text', 'Например: «Liberty — 20 стран». Видно только в панели.');
-    const descF = mkInput('src-desc', 'Описание', src?.description ?? '');
+    const nameF = mkInput('src-name', 'Название', src?.name ?? '', 'text', isNew
+      ? 'Видно только в панели, например «Liberty — 30 стран». Пусто — подставится адрес подписки.'
+      : 'Видно только в панели.');
+    const descF = mkInput('src-desc', 'Заметка', src?.description ?? '');
 
     // ProviderSource.type is the expected response format, not a provider kind.
     const typeSel = el('select', 'input');
@@ -4466,12 +4558,18 @@ class AdminApp {
     syncTypeHint();
     typeF.root.append(typeHint);
 
-    const urlF = mkInput('src-url', 'URL подписки', '', 'url',
-      'Полный адрес подписки провайдера (http:// или https://). Хранится только на сервере и не показывается в панели.');
-    const hwidF = mkInput('src-hwid', 'HWID', '', 'text', 'Идентификатор устройства, если провайдер его требует (заголовок X-HWID).');
-    const uaF = mkInput('src-ua', 'User-Agent', '', 'text', 'Пусто — стандартный. Некоторые провайдеры отдают формат в зависимости от клиента (например, Happ).');
+    // The link and the request parameters are write-only: the server never
+    // sends them back, so on edit an empty field means "keep the stored value".
+    const keep = isNew ? '' : ' Пусто — не менять.';
+    const urlF = mkInput('src-url', isNew ? 'Ссылка на подписку провайдера' : 'Новая ссылка на подписку', '', 'url', isNew
+      ? 'Ссылка, которую выдал провайдер (http:// или https://). Хранится только на сервере и не показывается в панели.'
+      : 'Провайдер выдал новую ссылку? Вставьте её: сборки и клиенты продолжат работать без изменений. Пусто — оставить прежнюю.');
+    const hwidF = mkInput('src-hwid', 'HWID', '', 'text', `Идентификатор устройства, если провайдер его требует (заголовок X-HWID).${keep}`);
+    const uaF = mkInput('src-ua', 'User-Agent', '', 'text', isNew
+      ? 'Пусто — стандартный. Некоторые провайдеры отдают формат в зависимости от клиента (например, Happ).'
+      : 'Некоторые провайдеры отдают формат в зависимости от клиента (например, Happ). Пусто — не менять.');
     const headersF = mkInput('src-headers', 'Дополнительные заголовки', '', 'text',
-      'JSON-объект, например {"Authorization": "Bearer …"}. Значения только записываются и не показываются.');
+      `JSON-объект, например {"Authorization": "Bearer …"}. Значения только записываются и не показываются.${keep}`);
 
     // End of the provider's own subscription: date and hour, empty = no limit.
     const expiryInput = el('input', 'input');
@@ -4499,7 +4597,7 @@ class AdminApp {
     expiryChips.append(expiryClear);
     expiryF.root.append(expiryChips, el('p', 'field-hint',
       `Дата и час, до которых оплачена подписка у провайдера, в часовом поясе браузера (${timeZoneLabel()}). ` +
-      'Пусто — бессрочно. После этого срока построители пропускают источник, как отключённый.'));
+      'Пусто — бессрочно. После этого срока сборки пропускают источник, как отключённый.'));
     expiryInput.addEventListener('input', () => expiryF.setError(''));
 
     /**
@@ -4524,7 +4622,7 @@ class AdminApp {
     enabledChk.type = 'checkbox';
     enabledChk.id = 'src-enabled';
     enabledChk.checked = src?.enabled ?? true;
-    const enabledLabel = el('label', 'checkbox-label', 'Включён: построители могут использовать источник');
+    const enabledLabel = el('label', 'checkbox-label', 'Включён: сборки могут использовать источник');
     enabledLabel.htmlFor = 'src-enabled';
     const enabledRow = el('div', 'checkbox-row');
     enabledRow.append(enabledChk, enabledLabel);
@@ -4539,25 +4637,41 @@ class AdminApp {
     const acts = el('div', 'modal-actions');
     acts.append(cancel, save);
 
+    // The common case is one field: paste the link. Everything a provider
+    // rarely needs is folded away.
+    const fold = (summary: string, ...nodes: HTMLElement[]) => {
+      const node = el('details', 'modal-fold');
+      node.append(el('summary', '', summary), ...nodes);
+      return node;
+    };
     const body = el('div', 'modal-body');
-    body.append(title, nameF.root, descF.root, typeF.root);
+    body.append(title);
     if (isNew) {
-      body.append(urlF.root, hwidF.root, uaF.root, headersF.root,
-        el('p', 'field-hint', 'После создания сервер сразу скачает подписку и построит каталог серверов.'));
+      body.append(urlF.root, nameF.root, expiryF.root,
+        fold('Дополнительно', typeF.root, hwidF.root, uaF.root, headersF.root, descF.root, enabledRow),
+        el('p', 'field-hint', 'После создания сервер сразу скачает подписку и разберёт её на страны и серверы.'));
     } else {
-      body.append(el('p', 'field-hint', 'URL и учётные данные изменить здесь нельзя: они только записываются при создании.'));
+      body.append(nameF.root, expiryF.root, enabledRow,
+        fold('Заменить ссылку подписки', urlF.root, hwidF.root, uaF.root, headersF.root),
+        fold('Дополнительно', typeF.root, descF.root));
     }
-    body.append(expiryF.root, enabledRow, statusEl, acts);
+    body.append(statusEl, acts);
     dialog.append(body);
+    /** Focuses a control, opening the folded group it sits in. */
+    const reveal = (control: HTMLElement) => {
+      const group = control.closest('details');
+      if (group) group.open = true;
+      control.focus();
+    };
 
     const fields: Readonly<Record<string, { setError: (t: string) => void; focus: () => void }>> = {
-      expires_at: { setError: expiryF.setError, focus: () => expiryInput.focus() },
-      name: { setError: nameF.setError, focus: () => nameF.inp.focus() },
-      type: { setError: typeF.setError, focus: () => typeSel.focus() },
-      subscription_url: { setError: urlF.setError, focus: () => urlF.inp.focus() },
-      headers: { setError: headersF.setError, focus: () => headersF.inp.focus() },
-      hwid: { setError: hwidF.setError, focus: () => hwidF.inp.focus() },
-      user_agent: { setError: uaF.setError, focus: () => uaF.inp.focus() },
+      expires_at: { setError: expiryF.setError, focus: () => reveal(expiryInput) },
+      name: { setError: nameF.setError, focus: () => reveal(nameF.inp) },
+      type: { setError: typeF.setError, focus: () => reveal(typeSel) },
+      subscription_url: { setError: urlF.setError, focus: () => reveal(urlF.inp) },
+      headers: { setError: headersF.setError, focus: () => reveal(headersF.inp) },
+      hwid: { setError: hwidF.setError, focus: () => reveal(hwidF.inp) },
+      user_agent: { setError: uaF.setError, focus: () => reveal(uaF.inp) },
     };
     const FIELD_ERRORS: Readonly<Record<string, string>> = {
       expires_at: 'Срок должен быть корректной датой и временем в будущем.',
@@ -4589,18 +4703,20 @@ class AdminApp {
       if (submitting) return;
       clearErrors();
       showStatus(null);
-      const name = nameF.inp.value.trim();
-      if (!name) { nameF.setError(FIELD_ERRORS.name); nameF.inp.focus(); return; }
       const url = urlF.inp.value.trim();
-      if (isNew && !/^https?:\/\/[^\s/#]+/i.test(url)) { urlF.setError(FIELD_ERRORS.subscription_url); urlF.inp.focus(); return; }
+      // A new source needs the link; on edit an empty one keeps the stored link.
+      if ((isNew || url) && !/^https?:\/\/[^\s/#]+/i.test(url)) { urlF.setError(FIELD_ERRORS.subscription_url); reveal(urlF.inp); return; }
+      // Without a name a new source is called after the host of its link.
+      const name = nameF.inp.value.trim() || (isNew ? sourceNameFromUrl(url) : '');
+      if (!name) { nameF.setError(FIELD_ERRORS.name); reveal(nameF.inp); return; }
       const headers = headersF.inp.value.trim();
-      if (isNew && headers) {
+      if (headers) {
         let ok = false;
         try { const parsed: unknown = JSON.parse(headers); ok = typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed); } catch { ok = false; }
-        if (!ok) { headersF.setError(FIELD_ERRORS.headers); headersF.inp.focus(); return; }
+        if (!ok) { headersF.setError(FIELD_ERRORS.headers); reveal(headersF.inp); return; }
       }
       const expiry = readExpiry();
-      if (expiry.error) { expiryF.setError(expiry.error); expiryInput.focus(); return; }
+      if (expiry.error) { expiryF.setError(expiry.error); reveal(expiryInput); return; }
       submitting = true;
       save.disabled = true; save.setAttribute('aria-busy', 'true');
       setLabel(save, isNew ? 'Создаём и синхронизируем…' : 'Сохраняем…');
@@ -4622,10 +4738,18 @@ class AdminApp {
           this.toast('Источник создан.');
           location.hash = `#/sources/${created.source.id}`;
         } else {
+          const hwid = hwidF.inp.value.trim();
+          const userAgent = uaF.inp.value.trim();
+          // Only what was typed is replaced; the rest of the request stays as stored.
           const input: UpdateSourceInput = {
             name, description: descF.inp.value.trim(), type: typeSel.value,
             ...(expiry.value !== undefined ? { expires_at: expiry.value } : {}),
+            ...(url ? { subscription_url: url } : {}),
+            ...(hwid ? { hwid } : {}),
+            ...(userAgent ? { user_agent: userAgent } : {}),
+            ...(headers ? { headers } : {}),
           };
+          const refetch = Boolean(url || hwid || userAgent || headers);
           const updated = await this.api.updateSource(src!.id, input);
           if (!isOpen()) return;
           this.replaceSource(updated);
@@ -4633,8 +4757,32 @@ class AdminApp {
             this.sourceDetailView.source = updated;
             this.paintSourceDetail(this.sourceDetailView);
           }
+          if (!refetch) {
+            close();
+            this.toast('Источник обновлён.');
+            return;
+          }
+          // The link or the request changed: read the subscription again right
+          // away, so the catalogue shows what the new link serves.
+          setLabel(save, 'Синхронизируем…');
+          showStatus({ tone: 'info', text: 'Изменения сохранены. Сервер скачивает подписку по новым параметрам…' });
+          let synced: SourceSyncResult | null = null;
+          try {
+            synced = await this.api.syncSource(updated.id);
+          } catch (error) {
+            if (!isOpen()) return;
+            if (await this.endIfSignedOut(error, isOpen)) return;
+            close();
+            this.toast(`Изменения сохранены, но синхронизация не выполнена. ${errorText(error)}`);
+            return;
+          }
+          if (!isOpen()) return;
+          this.applySyncResult(synced);
           close();
-          this.toast('Источник обновлён.');
+          if (this.sourceDetailView?.id === updated.id) void this.loadSourceDetail();
+          this.toast(synced.status === 'error'
+            ? 'Изменения сохранены, но подписка не загрузилась: проверьте ссылку.'
+            : 'Изменения сохранены, каталог серверов обновлён.');
         }
       } catch (error) {
         if (!isOpen()) return;
@@ -4656,7 +4804,7 @@ class AdminApp {
     this.dialog = handle;
     this.root.append(dialog);
     dialog.showModal();
-    nameF.inp.focus();
+    (isNew ? urlF.inp : nameF.inp).focus();
   }
 
   // Source details (#/sources/{id}) --------------------------------------------
@@ -4784,7 +4932,7 @@ class AdminApp {
       fact('Когда', src.last_sync_at ? formatDateTime(src.last_sync_at) : 'Ещё не было',
         state === 'error' ? 'Показан каталог последней успешной синхронизации' : undefined),
       fact('Действует до', src.expires_at ? formatDateTime(src.expires_at) : 'Бессрочно',
-        expiryState(src, Date.now()) === 'expired' ? 'Срок истёк: построители пропускают источник, как отключённый'
+        expiryState(src, Date.now()) === 'expired' ? 'Срок истёк: сборки пропускают источник, как отключённый'
           : src.expires_at ? relativeTime(src.expires_at, Date.now()) : undefined,
         expiryState(src, Date.now()) === 'expired' ? 'is-danger' : ''),
     );
@@ -4795,7 +4943,11 @@ class AdminApp {
     toggleBtn.addEventListener('click', () => void this.toggleSource(src, toggleBtn));
     const deleteBtn = button('Удалить', 'btn btn-danger btn-sm', 'trash');
     deleteBtn.addEventListener('click', () => void this.deleteSource(src, deleteBtn));
-    manage.append(editBtn, toggleBtn, deleteBtn);
+    // The next step of the work: a сборка from this source, already selected.
+    const buildLink = el('a', 'btn btn-primary btn-sm');
+    buildLink.href = buildsHash({ view: 'new', sourceId: src.id });
+    buildLink.append(icon('plus'), el('span', 'btn-label', 'Собрать подписку'));
+    manage.append(buildLink, editBtn, toggleBtn, deleteBtn);
     summary.append(panelHead('src-summary-title', 'Сводка', catalogueSummary(c)), facts, manage);
     const deleteBlocker = sourceDeleteBlocker(src.dependents);
     if (deleteBlocker) summary.append(el('p', 'panel-note', `Удалить нельзя: ${deleteBlocker}. Источник можно отключить.`));
@@ -4908,969 +5060,6 @@ class AdminApp {
   }
 
   // ===========================================================================
-  // Builders section
-  // ===========================================================================
-
-  private buildBuildersSection(header: HTMLElement): HTMLElement {
-    const { actions, refresh, updated } = refreshActions(() => void this.loadBuilders());
-    const addBtn = button('Новый построитель', 'btn btn-primary btn-sm', 'plus');
-    addBtn.addEventListener('click', () => this.openBuilderEditor(null));
-    actions.prepend(addBtn);
-    header.classList.add('has-actions');
-    header.append(actions);
-
-    const body = el('div', 'builders-section');
-    this.buildersView = { body, refresh };
-    if (this.buildersCache) this.paintBuilders(body, this.buildersCache, updated);
-    else this.paintBuildersSkeleton(body, updated);
-    return body;
-  }
-
-  private paintBuildersSkeleton(body: HTMLElement, updated: HTMLElement) {
-    setLoading(body, 'Загружаем построители');
-    body.replaceChildren(skeletonPanel(5));
-    updated.textContent = '';
-  }
-
-  private paintBuildersError(body: HTMLElement, updated: HTMLElement, error: unknown) {
-    setLoading(body, null);
-    body.replaceChildren(messagePanel('alert', 'Не удалось загрузить построители', errorText(error), 'alert',
-      retryButton(() => void this.loadBuilders())));
-    updated.textContent = '';
-  }
-
-  private paintBuilders(body: HTMLElement, builders: readonly AdminBuilder[], updated: HTMLElement) {
-    setLoading(body, null);
-    updated.textContent = `Обновлено в ${clockSeconds(new Date())}`;
-    if (builders.length === 0) {
-      body.replaceChildren(messagePanel('builders', 'Построителей пока нет',
-        'Создайте построитель, чтобы задать правила фильтрации и порядок серверов для подписок.', 'status'));
-      return;
-    }
-    const panel = el('section', 'panel');
-    panel.setAttribute('aria-labelledby', 'builders-list-title');
-    panel.append(panelHead('builders-list-title', 'Построители', formatCount(builders.length)));
-    const list = el('ul', 'builder-list');
-    for (const b of builders) list.append(this.builderRow(b));
-    panel.append(list);
-    body.replaceChildren(panel);
-  }
-
-  private builderRow(b: AdminBuilder): HTMLElement {
-    const item = el('li', 'builder-item');
-    const info = el('div', 'builder-info');
-    const nameRow = el('div', 'builder-name-row');
-    const name = el('span', 'builder-name', b.name);
-    const badge = el('span', b.enabled ? 'badge badge-active' : 'badge badge-disabled',
-      b.enabled ? 'Активен' : 'Отключён');
-    nameRow.append(name, badge);
-    // Counts and composition of the SAVED configuration (service.BuilderView).
-    const summary = builderCardSummary(b);
-    const meta = el('p', 'builder-meta', summary.meta);
-    const composition = el('p', summary.empty ? 'builder-composition is-danger' : 'builder-composition', summary.composition);
-    info.append(nameRow, meta, composition);
-    if (b.description) info.append(el('p', 'builder-desc', b.description));
-
-    const acts = el('div', 'builder-actions');
-    const editBtn = button('Редактировать', 'btn btn-primary btn-xs', 'edit');
-    editBtn.setAttribute('aria-label', `Редактировать «${b.name}»`);
-    editBtn.addEventListener('click', () => void this.openSavedBuilder(b.id, editBtn));
-    const toggleBtn = button(b.enabled ? 'Отключить' : 'Включить', 'btn btn-secondary btn-xs');
-    toggleBtn.addEventListener('click', () => void this.toggleBuilder(b, toggleBtn));
-    const deleteBtn = button('Удалить', 'btn btn-danger btn-xs', 'trash');
-    deleteBtn.setAttribute('aria-label', `Удалить «${b.name}»`);
-    deleteBtn.addEventListener('click', () => void this.deleteBuilder(b, deleteBtn));
-    acts.append(editBtn, toggleBtn, deleteBtn);
-    item.append(info, acts);
-    return item;
-  }
-
-  /**
-   * Deletes a builder nothing depends on (with its source links and rules). A
-   * builder a plan or a subscription still uses is only explained: it can be
-   * switched off instead. The backend re-checks the dependents and the loaded
-   * version, so a stale list ends in a refetch.
-   */
-  private async deleteBuilder(b: AdminBuilder, trigger: HTMLButtonElement) {
-    const shown = () => this.buildersView !== null;
-    const blocker = builderDeleteBlocker(b.dependents);
-    if (blocker) {
-      this.toast(`Построитель «${b.name}» нельзя удалить: ${blocker}. Его можно отключить.`);
-      return;
-    }
-    const confirmed = await this.confirmAction(`Удалить построитель «${b.name}»?`,
-      'Построитель, его список источников и правила будут удалены. Действие нельзя отменить.', 'Удалить');
-    if (!shown()) return;
-    if (!confirmed) { trigger.focus(); return; }
-    trigger.disabled = true;
-    trigger.setAttribute('aria-busy', 'true');
-    try {
-      await this.api.deleteBuilder(b.id, b.version, newRequestKey());
-      this.forgetBuilder(b.id);
-      this.toast(`Построитель «${b.name}» удалён.`);
-    } catch (error) {
-      if (await this.endIfSignedOut(error, shown)) return;
-      if (error instanceof ApiError && error.status === 404) {
-        // Already deleted (another tab): the outcome the admin asked for.
-        this.forgetBuilder(b.id);
-        this.toast(`Построителя «${b.name}» уже нет.`);
-        return;
-      }
-      trigger.disabled = false;
-      trigger.removeAttribute('aria-busy');
-      if (error instanceof ApiError && (error.code === 'builder_in_use' || error.code === 'version_conflict')) {
-        this.toast(error.code === 'builder_in_use'
-          ? `Построитель «${b.name}» уже назначен плану или подписке: удалить его нельзя, можно отключить.`
-          : `Построитель «${b.name}» изменили в другом окне. Список обновлён, повторите удаление.`);
-        // The list on screen is stale: reload it.
-        void this.loadBuilders();
-        return;
-      }
-      this.toast(`Не удалось удалить построитель «${b.name}». ${errorText(error)}`);
-    }
-  }
-
-  /** Drops a deleted builder from the list cache and repaints the list if it is open. */
-  private forgetBuilder(id: number) {
-    if (this.buildersCache) this.buildersCache = this.buildersCache.filter(x => x.id !== id);
-    const view = this.buildersView;
-    if (view && this.buildersCache) this.paintBuilders(view.body, this.buildersCache, el('p', 'updated'));
-  }
-
-  private async toggleBuilder(b: AdminBuilder, btn: HTMLButtonElement) {
-    btn.disabled = true;
-    btn.setAttribute('aria-busy', 'true');
-    try {
-      const updated = b.enabled ? await this.api.disableBuilder(b.id) : await this.api.enableBuilder(b.id);
-      if (this.buildersCache) {
-        this.buildersCache = this.buildersCache.map(x => x.id === updated.id ? updated : x);
-        const view = this.buildersView;
-        if (view) {
-          const dummy = el('p', 'updated');
-          this.paintBuilders(view.body, this.buildersCache, dummy);
-        }
-      }
-    } catch (error) {
-      if (await this.endIfSignedOut(error, () => this.buildersView !== null)) return;
-      this.toast(`Не удалось изменить статус построителя. ${errorText(error)}`);
-      btn.disabled = false;
-      btn.removeAttribute('aria-busy');
-    }
-  }
-
-  private async loadBuilders() {
-    const view = this.buildersView;
-    if (!view) return;
-    const request = ++this.buildersRequest;
-    const current = () => this.buildersView === view && request === this.buildersRequest;
-    setRefreshBusy(view.refresh, true);
-    const dummy = el('p', 'updated');
-    if (!this.buildersCache) this.paintBuildersSkeleton(view.body, dummy);
-    try {
-      const builders = await this.api.listBuilders();
-      if (!current()) return;
-      this.lastSessionCheck = Date.now();
-      this.buildersCache = builders;
-      const updated = view.refresh.closest('.page-actions')?.querySelector<HTMLElement>('.updated') ?? dummy;
-      this.paintBuilders(view.body, builders, updated);
-    } catch (error) {
-      if (!current()) return;
-      if (await this.endIfSignedOut(error, current)) return;
-      const updated = view.refresh.closest('.page-actions')?.querySelector<HTMLElement>('.updated') ?? dummy;
-      if (this.buildersCache) this.toast(`Не удалось обновить построители. ${errorText(error)}`);
-      else this.paintBuildersError(view.body, updated, error);
-    } finally {
-      if (current()) setRefreshBusy(view.refresh, false);
-    }
-  }
-
-  /** Replaces one builder in the list cache and repaints the list when shown. */
-  private cacheBuilder(saved: AdminBuilder) {
-    const known = this.buildersCache?.some(x => x.id === saved.id) ?? false;
-    if (this.buildersCache) {
-      this.buildersCache = known ? this.buildersCache.map(x => x.id === saved.id ? saved : x) : [...this.buildersCache, saved];
-    }
-    const view = this.buildersView;
-    if (view && this.buildersCache) this.paintBuilders(view.body, this.buildersCache, el('p', 'updated'));
-  }
-
-  // ===========================================================================
-  // Builder editor (full-screen dialog)
-  // ===========================================================================
-
-  /**
-   * Opens the editor of a saved builder with its CURRENT configuration read
-   * from GET /builders/{id}, never with the list copy: a stale or partial copy
-   * would show missing sources/rules and, once saved, overwrite the stored
-   * sources with that partial state.
-   */
-  private async openSavedBuilder(id: number, trigger: HTMLButtonElement) {
-    if (this.dialog || this.view !== 'app' || trigger.disabled) return;
-    trigger.disabled = true;
-    trigger.setAttribute('aria-busy', 'true');
-    try {
-      const fresh = await this.api.getBuilder(id);
-      if (this.view !== 'app') return;
-      this.cacheBuilder(fresh);
-      this.openBuilderEditor(fresh);
-    } catch (error) {
-      if (await this.endIfSignedOut(error, () => this.view === 'app')) return;
-      const status = error instanceof ApiError ? error.status : 0;
-      this.toast(status === 404
-        ? 'Построитель не найден: возможно, он был удалён. Список обновлён.'
-        : `Не удалось загрузить построитель. ${errorText(error)}`);
-      if (status === 404) void this.loadBuilders();
-    } finally {
-      trigger.disabled = false;
-      trigger.removeAttribute('aria-busy');
-    }
-  }
-
-  private openBuilderEditor(b: AdminBuilder | null) {
-    if (this.dialog || this.view !== 'app') return;
-    const isNew = b === null;
-
-    // ---- State ----
-    let currentBuilder: AdminBuilder | null = b;
-    let unsaved = false;
-    let submitting = false;
-    // Ordered list of source IDs (drag-reorder)
-    let selectedSourceIds: number[] = b?.sources?.slice().sort((a, x) => a.position - x.position).map(s => s.source_id) ?? [];
-    // Items (rules) — local copy for drag-reorder
-    let localItems: BuilderItem[] = b?.items?.slice().sort((a, x) => a.position - x.position) ?? [];
-    // Assigned below; the source picker repaints the rules (their warnings
-    // depend on which sources are linked).
-    let renderItems: () => void = () => {};
-    // Preview always reflects the SAVED builder, exactly like /sub.
-    const previewNote = el('p', 'field-hint preview-note');
-
-    // ---- Dialog shell ----
-    const dialog = el('dialog', 'modal modal-editor');
-    dialog.setAttribute('aria-labelledby', 'be-title');
-
-    const titleEl = el('h2', 'modal-title', isNew ? 'Новый построитель' : `Построитель: ${b!.name}`);
-    titleEl.id = 'be-title';
-
-    // ---- Unsaved indicator ----
-    const unsavedBadge = el('span', 'badge badge-warn unsaved-badge');
-    unsavedBadge.textContent = 'Несохранённые изменения';
-    unsavedBadge.hidden = true;
-    const markUnsaved = () => {
-      unsaved = true;
-      unsavedBadge.hidden = false;
-      previewNote.textContent = 'Есть несохранённые изменения: предпросмотр показывает сохранённую версию. Сохраните, чтобы увидеть результат.';
-    };
-
-    // ---- Basic fields ----
-    const mkInp = (id: string, labelText: string, value = '', hint?: string) => {
-      const inp = el('input', 'input');
-      Object.assign(inp, { id, type: 'text', value, spellcheck: false });
-      const f = field(labelText, inp);
-      if (hint) f.root.append(el('p', 'field-hint', hint));
-      inp.addEventListener('input', markUnsaved);
-      return { inp, ...f };
-    };
-
-    const nameF = mkInp('be-name', 'Название', b?.name ?? '');
-    const descF = mkInp('be-desc', 'Описание', b?.description ?? '');
-    const profileTitleF = mkInp('be-profile-title', 'Заголовок профиля', b?.profile_title ?? '',
-      'Отображается в клиентском приложении как имя подписки.');
-    const supportUrlF = mkInp('be-support-url', 'URL поддержки', b?.support_url ?? '');
-    const announceF = mkInp('be-announce', 'Анонс', b?.announce ?? '',
-      'Короткое сообщение, которое клиент видит при обновлении подписки.');
-
-    const enabledChk = el('input', 'checkbox');
-    enabledChk.type = 'checkbox';
-    enabledChk.id = 'be-enabled';
-    enabledChk.checked = b?.enabled ?? true;
-    enabledChk.addEventListener('change', markUnsaved);
-    const enabledLabel = el('label', 'checkbox-label', 'Активен');
-    enabledLabel.htmlFor = 'be-enabled';
-    const enabledRow = el('div', 'checkbox-row');
-    enabledRow.append(enabledChk, enabledLabel);
-
-    // ---- Sources panel ----
-    const sourcesPanel = el('section', 'editor-panel');
-    sourcesPanel.setAttribute('aria-labelledby', 'be-sources-title');
-    const sourcesPanelHead = panelHead('be-sources-title', 'Источники');
-    sourcesPanelHead.append(el('p', 'panel-note', 'Выберите источники и задайте их порядок перетаскиванием. Построитель использует их в указанном порядке.'));
-    sourcesPanel.append(sourcesPanelHead);
-
-    const sourcesListEl = el('ul', 'sources-picker');
-    sourcesListEl.setAttribute('aria-label', 'Источники построителя');
-    const sourcesTotal = el('p', 'sources-total');
-    sourcesTotal.setAttribute('aria-live', 'polite');
-    const sourceMeta = (src: AdminSource) => {
-      const meta = el('span', 'source-pick-meta');
-      const state = syncState(src);
-      meta.append(el('span', 'source-pick-stats', state === 'never' && src.catalogue.entries === 0
-        ? 'каталог не загружен' : catalogueSummary(src.catalogue)), syncBadge(state));
-      if (!src.enabled) meta.append(enabledBadge(false));
-      const expiry = expiryBadge(src);
-      if (expiry) meta.append(expiry);
-      return meta;
-    };
-    const renderSourcesPicker = () => {
-      sourcesListEl.replaceChildren();
-      const allSources = this.sourcesCache ?? [];
-      const selected = selectedSourceIds.map(id => allSources.find(s => s.id === id)).filter(Boolean) as AdminSource[];
-      const unselected = allSources.filter(s => !selectedSourceIds.includes(s.id));
-
-      for (const src of selected) {
-        const li = el('li', 'source-pick-item source-pick-selected');
-        li.draggable = true;
-        li.dataset.srcId = String(src.id);
-        const dragHandle = el('span', 'drag-handle');
-        dragHandle.append(icon('drag'));
-        dragHandle.setAttribute('aria-hidden', 'true');
-        const lbl = el('span', 'source-pick-name', src.name);
-        const removeBtn = button('Убрать', 'btn btn-secondary btn-xs');
-        removeBtn.setAttribute('aria-label', `Убрать «${src.name}»`);
-        removeBtn.addEventListener('click', () => {
-          selectedSourceIds = selectedSourceIds.filter(id => id !== src.id);
-          markUnsaved();
-          renderSourcesPicker();
-        });
-        li.append(dragHandle, lbl, sourceMeta(src), removeBtn);
-        sourcesListEl.append(li);
-      }
-      for (const src of unselected) {
-        const li = el('li', 'source-pick-item');
-        li.dataset.srcId = String(src.id);
-        const lbl = el('span', 'source-pick-name', src.name);
-        const addBtn = button('Добавить', 'btn btn-primary btn-xs');
-        addBtn.setAttribute('aria-label', `Добавить «${src.name}»`);
-        addBtn.addEventListener('click', () => {
-          selectedSourceIds = [...selectedSourceIds, src.id];
-          markUnsaved();
-          renderSourcesPicker();
-        });
-        li.append(lbl, sourceMeta(src), addBtn);
-        sourcesListEl.append(li);
-      }
-      if (allSources.length === 0) {
-        sourcesListEl.append(el('li', 'source-pick-empty', this.sourcesCache ? 'Источников нет. Добавьте их в разделе «Источники».' : 'Загружаем источники…'));
-      }
-      // Sources are merged only here: the total is the sum of the selected
-      // catalogues, countries are counted once across them.
-      const total = builderSourcesSummary(selected);
-      const skipped = total.disabled > 0 ? ` Отключённые и с истёкшим сроком (${formatCount(total.disabled)}) не учитываются: сборка их пропускает.` : '';
-      sourcesTotal.textContent = selected.length === 0 ? 'Источники не выбраны.'
-        : `Итого: ${serversLabel(total.entries)} · ${countriesLabel(total.countries)} (уникальных) из ${formatCount(selected.length)} ${pluralRu(selected.length, 'источника', 'источников', 'источников')}.${skipped}`;
-      setupDragReorder(sourcesListEl, 'source-pick-selected', (newOrder) => {
-        selectedSourceIds = newOrder.map(Number);
-        markUnsaved();
-        renderSourcesPicker();
-      });
-      renderItems();
-    };
-    renderSourcesPicker();
-    if (!this.sourcesCache) {
-      void this.api.listSources().then(sources => {
-        this.sourcesCache = sources;
-        if (dialog.isConnected) renderSourcesPicker();
-      }).catch(() => {
-        if (dialog.isConnected) sourcesListEl.replaceChildren(el('li', 'source-pick-empty', 'Не удалось загрузить источники. Закройте редактор и повторите.'));
-      });
-    }
-    sourcesPanel.append(sourcesListEl, sourcesTotal);
-
-    // ---- Items (rules) panel ----
-    const itemsPanel = el('section', 'editor-panel');
-    itemsPanel.setAttribute('aria-labelledby', 'be-items-title');
-    const itemsPanelHead = panelHead('be-items-title', 'Правила');
-    itemsPanelHead.append(el('p', 'panel-note',
-      'Правила определяют, какие серверы и страны включаются в подписку и в каком порядке. Без правил в подписку попадают все серверы подключённых источников.'));
-    itemsPanel.append(itemsPanelHead);
-
-    const itemsListEl = el('ul', 'items-list');
-    itemsListEl.setAttribute('aria-label', 'Правила построителя');
-    const addItemBtn = button('Добавить правило', 'btn btn-secondary btn-sm', 'plus');
-    const ruleContext: RuleContext = {
-      sources: () => this.sourcesCache ?? [],
-      selectedIds: () => selectedSourceIds,
-    };
-
-    renderItems = () => {
-      itemsListEl.replaceChildren();
-      if (localItems.length === 0) {
-        itemsListEl.append(el('li', 'items-empty', 'Правил пока нет. Добавьте страну или конкретный сервер.'));
-      }
-      for (let i = 0; i < localItems.length; i++) {
-        const item = localItems[i];
-        itemsListEl.append(this.buildItemRow(item, i, localItems, (updated) => {
-          localItems = updated;
-          markUnsaved();
-          renderItems();
-        }, ruleContext));
-      }
-      setupDragReorder(itemsListEl, 'item-row', (newOrder) => {
-        const reordered = newOrder.map(idx => localItems[Number(idx)]);
-        localItems = reordered.map((it, pos) => ({ ...it, position: pos }));
-        markUnsaved();
-        renderItems();
-      });
-    };
-    renderItems();
-
-    addItemBtn.addEventListener('click', () => {
-      this.openItemEditor(null, ruleContext, (newItem) => {
-        localItems = [...localItems, { ...newItem, position: localItems.length }];
-        markUnsaved();
-        renderItems();
-      });
-    });
-    itemsPanel.append(itemsListEl, addItemBtn);
-
-    // ---- Preview panel ----
-    const previewPanel = el('section', 'editor-panel');
-    previewPanel.setAttribute('aria-labelledby', 'be-preview-title');
-    previewPanel.append(panelHead('be-preview-title', 'Предпросмотр'));
-    const previewBody = el('div', 'preview-body');
-    const previewBtn = button('Запустить предпросмотр', 'btn btn-secondary btn-sm', 'eye');
-    previewBtn.disabled = isNew;
-    previewBtn.title = isNew ? 'Сначала сохраните построитель' : '';
-    previewBtn.addEventListener('click', () => void this.runPreview(currentBuilder, previewBody, previewBtn));
-    previewPanel.append(previewNote, previewBody, previewBtn);
-
-    // ---- Status / actions ----
-    const statusEl = el('div', 'modal-status');
-    statusEl.setAttribute('role', 'alert');
-    const showStatus = (n: Notice | null) => statusEl.replaceChildren(...(n ? [notice(n)] : []));
-
-    const cancelBtn = button('Закрыть', 'btn btn-secondary');
-    const saveBtn = button(isNew ? 'Создать' : 'Сохранить', 'btn btn-primary');
-
-    const actionsRow = el('div', 'modal-actions');
-    actionsRow.append(cancelBtn, saveBtn);
-
-    // ---- Assemble body ----
-    const bodyEl = el('div', 'modal-body editor-body');
-    bodyEl.append(
-      titleEl, unsavedBadge,
-      el('div', 'editor-section-title', 'Основные настройки'),
-      nameF.root, descF.root, profileTitleF.root, supportUrlF.root, announceF.root, enabledRow,
-      sourcesPanel,
-      itemsPanel,
-      previewPanel,
-      statusEl, actionsRow,
-    );
-    dialog.append(bodyEl);
-
-    // ---- Dialog lifecycle ----
-    const handle = {
-      dismiss: () => { if (dialog.open) dialog.close(); dialog.remove(); },
-    };
-    const isOpen = () => this.dialog === handle;
-    const close = (force = false) => {
-      if (!isOpen()) return;
-      if (unsaved && !force) {
-        if (!window.confirm('Есть несохранённые изменения. Закрыть без сохранения?')) return;
-      }
-      this.dialog = null;
-      handle.dismiss();
-    };
-
-    cancelBtn.addEventListener('click', () => close());
-    dialog.addEventListener('keydown', e => { if (e.key === 'Escape' && !submitting) close(); });
-    dialog.addEventListener('cancel', e => { e.preventDefault(); if (!submitting) close(); });
-
-    // ---- Save ----
-    saveBtn.addEventListener('click', async () => {
-      if (submitting) return;
-      nameF.setError('');
-      const name = nameF.inp.value.trim();
-      if (!name) { nameF.setError('Введите название.'); nameF.inp.focus(); return; }
-
-      submitting = true;
-      saveBtn.disabled = true; saveBtn.setAttribute('aria-busy', 'true');
-      setLabel(saveBtn, 'Сохраняем…');
-      showStatus(null);
-
-      try {
-        const meta = {
-          name, description: descF.inp.value.trim(),
-          enabled: enabledChk.checked,
-          profile_title: profileTitleF.inp.value.trim(),
-          support_url: supportUrlF.inp.value.trim(),
-          announce: announceF.inp.value.trim(),
-        };
-        // A new builder is created once; later saves in the same editor update it.
-        const creating = currentBuilder === null;
-        if (creating) {
-          const input: CreateBuilderInput = { request_key: newRequestKey(), ...meta };
-          const res = await this.api.createBuilder(input);
-          if (!isOpen()) return;
-          // The row exists from here on: if the configuration save below
-          // fails, the next save updates it instead of creating it again.
-          currentBuilder = res.builder;
-        }
-        // Metadata, sources and rules (order, on/off state, removed rules) in
-        // ONE transaction with the version this editor loaded: a builder
-        // changed in another tab is refused with 409, never overwritten, and a
-        // failure leaves the stored configuration untouched.
-        const res = await this.api.saveBuilderConfiguration(currentBuilder!.id, {
-          request_key: newRequestKey(),
-          version: currentBuilder!.version,
-          ...meta,
-          source_ids: selectedSourceIds,
-          items: builderConfigItems(localItems),
-        });
-        const saved = res.builder;
-        this.cacheBuilder(saved);
-        // The server ids replace the local placeholders: a second save updates
-        // these rules instead of creating copies.
-        localItems = (saved.items ?? []).slice().sort((a, x) => a.position - x.position || a.id - x.id);
-        selectedSourceIds = (saved.sources ?? []).slice().sort((a, x) => a.position - x.position).map(s => s.source_id);
-
-        if (!isOpen()) return;
-        currentBuilder = saved;
-        previewNote.textContent = '';
-        renderSourcesPicker();
-        unsaved = false;
-        unsavedBadge.hidden = true;
-        titleEl.textContent = `Построитель: ${saved.name}`;
-        previewBtn.disabled = false;
-        previewBtn.title = '';
-
-        // The list card was updated from the stored record above; reload the
-        // whole list so other builders are current too.
-        void this.loadBuilders();
-        this.toast(creating ? 'Построитель создан.' : 'Построитель сохранён.');
-        submitting = false;
-        saveBtn.disabled = false; saveBtn.removeAttribute('aria-busy');
-        setLabel(saveBtn, 'Сохранить');
-        showStatus({ tone: 'success', text: 'Изменения сохранены.' });
-      } catch (error) {
-        if (!isOpen()) return;
-        submitting = false;
-        saveBtn.disabled = false; saveBtn.removeAttribute('aria-busy');
-        setLabel(saveBtn, currentBuilder === null ? 'Создать' : 'Сохранить');
-        if (await this.endIfSignedOut(error, isOpen)) return;
-        const code = error instanceof ApiError ? error.code : '';
-        const status = error instanceof ApiError ? error.status : 0;
-        if (status === 409 && code === 'version_conflict' && currentBuilder) {
-          // Nothing was written. The edits here stay on screen; loading the
-          // current version discards them (the confirmation says so).
-          const id = currentBuilder.id;
-          const reload = button('Загрузить актуальную версию', 'btn btn-secondary btn-sm', 'refresh');
-          reload.addEventListener('click', () => {
-            if (!window.confirm('Ваши несохранённые изменения будут потеряны. Загрузить актуальную версию?')) return;
-            close(true);
-            void this.openSavedBuilder(id, reload);
-          });
-          statusEl.replaceChildren(notice({ tone: 'error', text: 'Построитель изменён в другой вкладке или другим администратором. Ваши изменения не сохранены, сохранённая конфигурация не затронута.' }), reload);
-          void this.loadBuilders();
-        } else if (status === 404 && code === 'not_found') {
-          showStatus({ tone: 'error', text: 'Построитель или одно из его правил больше не существует. Изменения не сохранены. Закройте редактор и откройте его снова.' });
-        } else if (status === 409 && code === 'name_taken') {
-          nameF.setError('Построитель с таким названием уже существует.');
-          nameF.inp.focus();
-        } else {
-          showStatus({ tone: 'error', text: `Не удалось сохранить. ${errorText(error)}` });
-        }
-      }
-    });
-
-    this.dialog = handle;
-    this.root.append(dialog);
-    dialog.showModal();
-    nameF.inp.focus();
-  }
-
-  // ---- Item row in builder editor ----
-  // A rule reads against the real catalogue of its source: a country rule
-  // shows how many servers it yields now, a rule on an unlinked or disabled
-  // source says it serves nothing.
-  private buildItemRow(
-    item: BuilderItem,
-    index: number,
-    allItems: BuilderItem[],
-    onChange: (updated: BuilderItem[]) => void,
-    ctx: RuleContext,
-  ): HTMLElement {
-    const summary = ruleSummary(item, ctx.sources(), ctx.selectedIds());
-    const li = el('li', item.enabled ? 'item-row' : 'item-row is-disabled');
-    li.draggable = true;
-    li.dataset.dragIdx = String(index);
-    li.dataset.kind = item.kind;
-    li.setAttribute('aria-label', summary.title);
-
-    const dragHandle = el('span', 'drag-handle');
-    dragHandle.append(icon('drag'));
-    dragHandle.setAttribute('aria-hidden', 'true');
-
-    const body = el('div', 'item-body');
-    const head = el('div', 'item-head');
-    head.append(
-      el('span', item.kind === 'country' ? 'tag tag-on' : 'tag', item.kind === 'country' ? 'Страна' : 'Сервер'),
-      el('span', 'item-name', summary.title),
-    );
-    if (!item.enabled) head.append(el('span', 'tag', 'Выключено'));
-    body.append(head, el('p', 'item-detail', summary.detail));
-    if (summary.warning) body.append(el('p', 'item-warn', summary.warning));
-
-    const editBtn = button('Изменить', 'btn btn-secondary btn-xs', 'edit');
-    editBtn.setAttribute('aria-label', `Изменить правило «${summary.title}»`);
-    editBtn.addEventListener('click', () => {
-      this.openItemEditor(item, ctx, (updated) => {
-        onChange(allItems.map((it, i) => i === index ? { ...updated, position: it.position } : it));
-      });
-    });
-
-    const deleteBtn = button('Удалить', 'btn btn-secondary btn-xs', 'trash');
-    deleteBtn.setAttribute('aria-label', `Удалить правило «${summary.title}»`);
-    deleteBtn.addEventListener('click', () => {
-      if (!window.confirm('Удалить правило?')) return;
-      // The builder editor deletes it on the server on the next save.
-      onChange(allItems.filter((_, i) => i !== index).map((it, pos) => ({ ...it, position: pos })));
-    });
-
-    const acts = el('div', 'item-actions');
-    acts.append(editBtn, deleteBtn);
-
-    li.append(dragHandle, body, acts);
-    return li;
-  }
-
-  // ---- Item editor sub-dialog ----
-  // Source, country and server come from the source catalogues; nothing is
-  // typed by hand except an ISO code for a country not in the catalogue yet.
-  private openItemEditor(item: BuilderItem | null, ctx: RuleContext, onSave: (item: BuilderItem) => void) {
-    const isNew = item === null;
-    const dialog = el('dialog', 'modal modal-wide rule-editor');
-    dialog.setAttribute('aria-labelledby', 'ie-title');
-    const close = () => { if (dialog.open) dialog.close(); dialog.remove(); };
-
-    const titleEl = el('h2', 'modal-title', isNew ? 'Новое правило' : 'Изменить правило');
-    titleEl.id = 'ie-title';
-
-    // The builder's sources in their order, plus the rule's own source when
-    // it was unlinked meanwhile (so the rule can be moved to a linked one).
-    const all = ctx.sources();
-    const selectedIds = ctx.selectedIds();
-    const choices = selectedIds.map(id => all.find(s => s.id === id)).filter((s): s is AdminSource => s !== undefined);
-    if (item && !choices.some(s => s.id === item.source_id)) {
-      const own = all.find(s => s.id === item.source_id);
-      if (own) choices.push(own);
-    }
-
-    const kindSel = el('select', 'input');
-    kindSel.id = 'ie-kind';
-    kindSel.append(option('country', 'Страна — все её серверы (динамически)'), option('node', 'Конкретный сервер'));
-    kindSel.value = item?.kind ?? 'country';
-    const kindF = field('Тип правила', kindSel);
-
-    const sourceSel = el('select', 'input');
-    sourceSel.id = 'ie-source';
-    for (const s of choices) {
-      const unlinked = selectedIds.includes(s.id) ? '' : ' (не подключён)';
-      sourceSel.append(option(String(s.id), `${s.name} — ${catalogueSummary(s.catalogue)}${unlinked}`));
-    }
-    sourceSel.value = String(item?.source_id ?? choices[0]?.id ?? '');
-    const sourceF = field('Источник', sourceSel);
-    const sourceHint = el('p', 'field-hint');
-    sourceF.root.append(sourceHint);
-    const currentSource = () => choices.find(s => String(s.id) === sourceSel.value);
-
-    // ---- Country rule ----
-    const OTHER = '*other';
-    const countrySel = el('select', 'input');
-    countrySel.id = 'ie-country';
-    const countryF = field('Страна', countrySel);
-    const countryHint = el('p', 'field-hint rule-live');
-    countryHint.setAttribute('aria-live', 'polite');
-    countryF.root.append(countryHint);
-    const otherInp = el('input', 'input');
-    Object.assign(otherInp, { id: 'ie-country-other', type: 'text', maxLength: 2, placeholder: 'Например: NL', spellcheck: false, autocomplete: 'off' });
-    const otherF = field('Код страны (ISO 3166-1 alpha-2)', otherInp);
-    otherF.root.append(el('p', 'field-hint', 'Правило начнёт работать, когда серверы этой страны появятся в источнике.'));
-    let countryValue = item?.kind === 'country' ? item.country_code.toUpperCase() : '';
-    const chosenCountry = () => (countrySel.value === OTHER ? otherInp.value.trim().toUpperCase() : countrySel.value);
-    const syncCountry = () => {
-      otherF.root.hidden = kindSel.value !== 'country' || countrySel.value !== OTHER;
-      const code = chosenCountry();
-      countryHint.textContent = COUNTRY_CODE.test(code)
-        ? `Динамическое правило: при каждой сборке подписки берутся все серверы ${countryLabel(code)} из источника. Сейчас в каталоге: ${serversLabel(countryCount(currentSource(), code))}.`
-        : '';
-    };
-    const fillCountries = () => {
-      const list = currentSource()?.catalogue.by_country ?? [];
-      countrySel.replaceChildren(...list.map(({ code, count }) => option(code, `${countryLabel(code)} — ${serversLabel(count)}`)),
-        option(OTHER, 'Другая страна…'));
-      if (countryValue && list.some(c => c.code === countryValue)) countrySel.value = countryValue;
-      else if (countryValue) { countrySel.value = OTHER; otherInp.value = countryValue; }
-      else countrySel.value = list[0]?.code ?? OTHER;
-      syncCountry();
-    };
-    countrySel.addEventListener('change', () => {
-      countryValue = chosenCountry();
-      countryF.setError(''); otherF.setError('');
-      syncCountry();
-    });
-    otherInp.addEventListener('input', () => {
-      countryValue = chosenCountry();
-      otherF.setError('');
-      syncCountry();
-    });
-
-    // ---- Node rule: pick a server from the source catalogue ----
-    const nodeBox = el('div', 'field rule-node');
-    const nodeLabel = el('p', 'field-label', 'Сервер');
-    nodeLabel.id = 'ie-node-label';
-    const nodeChosen = el('p', 'rule-node-chosen');
-    nodeChosen.setAttribute('aria-live', 'polite');
-    const nodeSearch = el('input', 'input');
-    Object.assign(nodeSearch, { id: 'ie-node-q', type: 'search', placeholder: 'Поиск по имени', spellcheck: false, autocomplete: 'off' });
-    nodeSearch.setAttribute('aria-label', 'Поиск сервера по имени');
-    const nodeCountry = el('select', 'input');
-    nodeCountry.id = 'ie-node-country';
-    nodeCountry.setAttribute('aria-label', 'Страна сервера');
-    const nodeTools = el('div', 'rule-node-tools');
-    nodeTools.append(nodeSearch, nodeCountry);
-    const nodeList = el('ul', 'entry-pick');
-    nodeList.setAttribute('aria-labelledby', nodeLabel.id);
-    const nodeCount = el('p', 'field-hint');
-    const nodeError = el('p', 'field-error');
-    nodeBox.append(nodeLabel, nodeChosen, nodeTools, nodeList, nodeCount, nodeError);
-
-    let picked: { sourceId: number; fingerprint: string; original_name: string } | null =
-      item?.kind === 'node' ? { sourceId: item.source_id, fingerprint: item.fingerprint, original_name: item.original_name } : null;
-    let entries: readonly SourceEntry[] | null = null;
-    let entriesFor = 0;
-    let entriesRequest = 0;
-
-    const paintNodes = () => {
-      const src = currentSource();
-      const mine = picked && src && picked.sourceId === src.id ? picked : null;
-      const res = mine && entries ? resolveNode(mine.fingerprint, mine.original_name, entries) : null;
-      if (!mine) {
-        nodeChosen.textContent = 'Сервер не выбран.';
-        nodeChosen.className = 'rule-node-chosen';
-      } else {
-        const name = mine.original_name || shortFingerprint(mine.fingerprint);
-        nodeChosen.textContent = `Выбран: ${name}${res ? ` · ${RESOLUTION_LABELS[res.status]}` : ''}`;
-        nodeChosen.className = res && (res.status === 'missing' || res.status === 'conflict') ? 'rule-node-chosen is-danger' : 'rule-node-chosen';
-      }
-      if (!entries) return;
-      const { shown, total } = pickableEntries(entries, nodeSearch.value, nodeCountry.value);
-      nodeList.replaceChildren(...shown.map(e => {
-        const li = el('li');
-        const pick = el('button', 'entry-pick-item');
-        pick.type = 'button';
-        pick.dataset.fingerprint = e.fingerprint;
-        pick.setAttribute('aria-pressed', String(res?.entry?.fingerprint === e.fingerprint));
-        pick.append(el('span', 'entry-pick-name', e.original_name || '(без имени)'),
-          el('span', 'entry-pick-meta', [e.country_code ? countryLabel(e.country_code) : 'Без страны', e.protocol].filter(Boolean).join(' · ')));
-        pick.addEventListener('click', () => {
-          picked = { sourceId: e.source_id, fingerprint: e.fingerprint, original_name: e.original_name };
-          nodeError.textContent = '';
-          paintNodes();
-          nodeList.querySelector<HTMLButtonElement>(`[data-fingerprint="${CSS.escape(e.fingerprint)}"]`)?.focus();
-        });
-        li.append(pick);
-        return li;
-      }));
-      if (total === 0) {
-        nodeList.append(el('li', 'entry-pick-empty',
-          entries.length === 0 ? 'Каталог источника пуст. Синхронизируйте источник.' : 'Нет серверов под выбранный фильтр.'));
-      }
-      nodeCount.textContent = total > shown.length
-        ? `Показаны первые ${formatCount(shown.length)} из ${formatCount(total)}. Уточните поиск.`
-        : `Серверов: ${formatCount(total)}`;
-    };
-
-    const loadEntries = async () => {
-      const src = currentSource();
-      if (!src) return;
-      if (entries && entriesFor === src.id) { paintNodes(); return; }
-      const request = ++entriesRequest;
-      entries = null;
-      nodeCount.textContent = '';
-      nodeList.replaceChildren(el('li', 'entry-pick-empty', 'Загружаем серверы источника…'));
-      paintNodes();
-      try {
-        const list = await this.api.listSourceEntries(src.id);
-        if (request !== entriesRequest || !dialog.isConnected) return;
-        entries = list;
-        entriesFor = src.id;
-        nodeCountry.replaceChildren(option('', 'Все страны'),
-          ...src.catalogue.by_country.map(({ code, count }) => option(code, `${countryLabel(code)} (${formatCount(count)})`)));
-        if (src.catalogue.no_country > 0) nodeCountry.append(option('-', `Без страны (${formatCount(src.catalogue.no_country)})`));
-        paintNodes();
-      } catch (error) {
-        if (request !== entriesRequest || !dialog.isConnected) return;
-        if (await this.endIfSignedOut(error, () => dialog.isConnected)) { close(); return; }
-        nodeList.replaceChildren(el('li', 'entry-pick-empty', `Не удалось загрузить серверы. ${errorText(error)}`));
-      }
-    };
-    nodeSearch.addEventListener('input', paintNodes);
-    nodeCountry.addEventListener('change', paintNodes);
-
-    const mkInp = (id: string, labelText: string, value = '', hint?: string) => {
-      const inp = el('input', 'input');
-      Object.assign(inp, { id, type: 'text', value, spellcheck: false, autocomplete: 'off' });
-      const f = field(labelText, inp);
-      if (hint) f.root.append(el('p', 'field-hint', hint));
-      return { inp, ...f };
-    };
-    const customNameF = mkInp('ie-custom-name', 'Своё имя', item?.custom_name ?? '',
-      'Если задано, заменяет имя сервера в подписке (для правила страны — у каждого её сервера).');
-    const descF = mkInp('ie-desc', 'Описание', item?.description ?? '', 'Видно только в панели.');
-
-    const enabledChk = el('input', 'checkbox');
-    enabledChk.type = 'checkbox';
-    enabledChk.id = 'ie-enabled';
-    enabledChk.checked = item?.enabled ?? true;
-    const enabledLabel = el('label', 'checkbox-label', 'Включено');
-    enabledLabel.htmlFor = 'ie-enabled';
-    const enabledRow = el('div', 'checkbox-row');
-    enabledRow.append(enabledChk, enabledLabel);
-
-    const syncSource = () => {
-      const src = currentSource();
-      sourceHint.textContent = !src ? ''
-        : !selectedIds.includes(src.id) ? 'Источник не подключён к построителю: такое правило не применяется. Выберите подключённый источник.'
-          : !src.enabled ? 'Источник отключён: сборка его пропускает.'
-            : src.expired ? 'Срок действия источника истёк: сборка его пропускает.'
-              : syncState(src) === 'never' ? 'Источник ещё не синхронизирован: каталог пуст.'
-                : `Каталог: ${catalogueSummary(src.catalogue)} · ${lastSyncText(src)}`;
-      fillCountries();
-    };
-    const updateKind = () => {
-      const isCountry = kindSel.value === 'country';
-      countryF.root.hidden = !isCountry;
-      nodeBox.hidden = isCountry;
-      syncCountry();
-      if (!isCountry) void loadEntries();
-    };
-    sourceSel.addEventListener('change', () => { syncSource(); if (kindSel.value === 'node') void loadEntries(); });
-    kindSel.addEventListener('change', updateKind);
-
-    const statusEl = el('div', 'modal-status');
-    statusEl.setAttribute('role', 'alert');
-
-    const cancelBtn = button('Отмена', 'btn btn-secondary');
-    const saveBtn = button('Применить', 'btn btn-primary');
-    const acts = el('div', 'modal-actions');
-    acts.append(cancelBtn, saveBtn);
-
-    const body = el('div', 'modal-body');
-    if (choices.length === 0) {
-      saveBtn.disabled = true;
-      body.append(titleEl, notice({ tone: 'info', text: 'Сначала добавьте в построитель хотя бы один источник: правила выбирают серверы из его каталога.' }), acts);
-    } else {
-      body.append(titleEl, kindF.root, sourceF.root, countryF.root, otherF.root, nodeBox,
-        customNameF.root, descF.root, enabledRow, statusEl, acts);
-      syncSource();
-      updateKind();
-    }
-    dialog.append(body);
-
-    cancelBtn.addEventListener('click', close);
-    dialog.addEventListener('cancel', e => { e.preventDefault(); close(); });
-
-    saveBtn.addEventListener('click', () => {
-      const src = currentSource();
-      if (!src) return;
-      const kind = kindSel.value as 'country' | 'node';
-      let countryCode = '';
-      if (kind === 'country') {
-        countryCode = chosenCountry();
-        if (!COUNTRY_CODE.test(countryCode)) {
-          const target = countrySel.value === OTHER ? otherF : countryF;
-          target.setError('Укажите двухбуквенный код страны латиницей, например DE.');
-          (countrySel.value === OTHER ? otherInp : countrySel).focus();
-          return;
-        }
-      }
-      const node = kind === 'node' && picked && picked.sourceId === src.id ? picked : null;
-      if (kind === 'node' && !node) {
-        nodeError.textContent = 'Выберите сервер из списка.';
-        nodeSearch.focus();
-        return;
-      }
-      onSave({
-        id: item?.id ?? 0,
-        kind,
-        source_id: src.id,
-        country_code: countryCode,
-        fingerprint: node?.fingerprint ?? '',
-        original_name: node?.original_name ?? '',
-        custom_name: customNameF.inp.value.trim() || null,
-        description: descF.inp.value.trim(),
-        position: item?.position ?? 0,
-        enabled: enabledChk.checked,
-      });
-      close();
-    });
-
-    document.body.append(dialog);
-    dialog.showModal();
-    kindSel.focus();
-  }
-
-  // ---- Preview ----
-  // Dry run of the SAVED builder by the backend against the stored catalogue,
-  // with the same rules /sub applies.
-  private async runPreview(builder: AdminBuilder | null, body: HTMLElement, btn: HTMLButtonElement) {
-    if (!builder) return;
-    btn.disabled = true;
-    btn.setAttribute('aria-busy', 'true');
-    body.replaceChildren(el('p', 'preview-loading', 'Загружаем предпросмотр…'));
-    const sourceName = (id: number) => this.sourcesCache?.find(s => s.id === id)?.name ?? `Источник #${id}`;
-    try {
-      const preview = await this.api.previewBuilder(builder.id);
-      body.replaceChildren();
-      const sum = previewSummary(preview);
-
-      const stats = el('p', 'preview-stats');
-      stats.textContent = [
-        `В подписке: ${serversLabel(sum.servers)} · ${countriesLabel(sum.countries)}`,
-        preview.missing > 0 ? `не найдено: ${formatCount(preview.missing)}` : '',
-        preview.conflicts > 0 ? `неоднозначно: ${formatCount(preview.conflicts)}` : '',
-      ].filter(Boolean).join(' · ');
-      body.append(stats);
-      if (sum.bySource.length > 1) {
-        body.append(el('p', 'preview-sources',
-          sum.bySource.map(s => `${sourceName(s.sourceId)}: ${formatCount(s.count)}`).join(' · ')));
-      }
-
-      if (preview.warnings && preview.warnings.length > 0) {
-        const warnBox = el('div', 'preview-warnings');
-        for (const w of preview.warnings) warnBox.append(el('p', 'preview-warn', w));
-        body.append(warnBox);
-      }
-
-      if (preview.items.length === 0) {
-        body.append(el('p', 'preview-empty', 'Предпросмотр пуст — нет подходящих серверов.'));
-      } else {
-        const list = el('ol', 'preview-list');
-        list.setAttribute('aria-label', 'Серверы подписки');
-        for (const pi of preview.items) {
-          const li = el('li', `preview-item preview-${pi.status}`);
-          const served = pi.status === 'matched' || pi.status === 'fallback';
-          const pos = el('span', 'preview-pos', served ? String(pi.position + 1) : '—');
-          const name = el('span', 'preview-name', pi.display_name || pi.entry?.original_name || '—');
-          const code = pi.entry?.country_code ?? '';
-          const country = el('span', 'preview-country', code ? countryLabel(code) : '');
-          const origin = el('span', 'preview-origin', sourceName(pi.source_id));
-          const statusBadge = el('span', `tag preview-status-${pi.status}`, RESOLUTION_LABELS[pi.status] ?? pi.status);
-          li.append(pos, name, country, origin, statusBadge);
-          list.append(li);
-        }
-        body.append(list);
-      }
-    } catch (error) {
-      if (await this.endIfSignedOut(error, () => body.isConnected)) return;
-      body.replaceChildren(el('p', 'preview-error', `Ошибка предпросмотра: ${errorText(error)}`));
-    } finally {
-      btn.disabled = false;
-      btn.removeAttribute('aria-busy');
-    }
-  }
-
-  // ===========================================================================
   // Tariffs: catalogue list and order (#/tariffs)
   // ===========================================================================
 
@@ -5898,14 +5087,58 @@ class AdminApp {
     toggle.append(retired, el('span', '', 'Показывать прежние версии'));
     toolbar.append(summary, toggle);
     const body = el('div', 'tariffs-body');
-    root.append(toolbar, body, trialEntryPanel());
+    const free = el('div', 'tariffs-free');
+    root.append(toolbar, body, trialEntryPanel(), free);
 
-    const view: TariffsView = { body, refresh, updated, summary };
+    const view: TariffsView = { body, refresh, updated, summary, free };
     this.tariffsView = view;
     this.unsavedChanges = () => this.pendingOrder !== null;
     if (this.tariffsCache) this.paintTariffs(view);
     else this.paintTariffsSkeleton(view);
+    this.paintFreeAccess(view);
     return root;
+  }
+
+  /**
+   * «Бесплатный доступ»: the сборка of clients without a paid tariff (the
+   * system plan database.FreePlanName). They land on it after activating a
+   * trial and when a paid term ends; without a сборка their subscription has
+   * no servers. Hidden until the plans are known.
+   */
+  private paintFreeAccess(view: TariffsView) {
+    const plan = this.plansCache?.find(item => item.name === 'free');
+    if (!plan) {
+      view.free.replaceChildren();
+      return;
+    }
+    const panel = el('section', 'panel trial-entry');
+    panel.setAttribute('aria-labelledby', 'free-access-title');
+    const clients = `${formatCount(plan.subscriptions)} ${pluralRu(plan.subscriptions, 'подписка', 'подписки', 'подписок')}`;
+    panel.append(panelHead('free-access-title', 'Бесплатный доступ', clients),
+      el('p', 'panel-note', 'Что получают клиенты без оплаченного тарифа: после активации пробной подписки и когда закончился платный срок.'));
+    const assigned = plan.subscription_builder_id !== null;
+    const facts = el('dl', 'facts facts-single');
+    facts.append(fact('Сборка', assigned ? plan.builder_name || `Сборка #${plan.subscription_builder_id}` : 'Не выбрана',
+      assigned ? undefined : 'Бесплатные клиенты не получают серверы: их подписка не открывается.', 'is-danger'));
+    const change = button(assigned ? 'Изменить сборку' : 'Выбрать сборку', 'btn btn-secondary btn-sm');
+    change.addEventListener('click', () => void this.changeFreeAccess(view, plan, change));
+    const foot = el('div', 'panel-foot');
+    foot.append(change);
+    panel.append(facts, foot);
+    view.free.replaceChildren(panel);
+  }
+
+  /** Opens the сборка picker of the free plan; the list of сборки is loaded on demand. */
+  private async changeFreeAccess(view: TariffsView, plan: TariffPlan, trigger: HTMLButtonElement) {
+    const current = () => this.tariffsView === view;
+    trigger.disabled = true;
+    const ready = await this.ensureBuilders(current);
+    trigger.disabled = false;
+    if (!ready) return;
+    this.openBuilderAssignDialog('plan', plan.id, plan.subscription_builder_id, newId => {
+      this.toast(newId === null ? 'Сборка бесплатного доступа снята.' : 'Сборка бесплатного доступа назначена.');
+      void this.loadTariffs();
+    }, { planName: plan.name, subscriptions: plan.subscriptions }, 'Сборка бесплатного доступа');
   }
 
   private paintTariffsSkeleton(view: TariffsView) {
@@ -6000,7 +5233,7 @@ class AdminApp {
     if (tariff.badge) nameRow.append(el('span', 'tag tag-accent', tariff.badge));
     const meta = [
       formatTariffPrice(tariff.price_cents, tariff.currency), durationLabel(tariff.duration_days),
-      `план «${tariff.plan_name}»${tariff.plan_active ? '' : ' (отключён)'}`, tariffUsage(tariff),
+      tariff.builder_name ? `сборка «${tariff.builder_name}»` : 'сборка не выбрана', tariffUsage(tariff),
     ];
     info.append(nameRow, el('p', 'tariff-meta', meta.join(' · ')));
 
@@ -6166,11 +5399,14 @@ class AdminApp {
     const shown = this.tariffsCache !== null;
     if (!shown) this.paintTariffsSkeleton(view);
     try {
-      const tariffs = await this.api.listTariffs();
+      // Plans only feed the «Бесплатный доступ» panel: best effort.
+      const [tariffs, plans] = await Promise.all([this.api.listTariffs(), this.api.listPlans().catch(() => null)]);
       if (!current()) return;
       this.lastSessionCheck = Date.now();
       this.tariffsCache = tariffs;
       this.tariffsAt = new Date();
+      if (plans) this.plansCache = plans;
+      this.paintFreeAccess(view);
       // An edited order survives a refresh only while it covers the same tariffs.
       if (this.pendingOrder) {
         const live = this.liveTariffIds();
@@ -6240,23 +5476,26 @@ class AdminApp {
     const current = () => this.tariffEditorView === view && request === this.tariffEditorRequest;
     this.paintTariffEditorSkeleton(view);
     try {
-      const [plans, tariff] = await Promise.all([
-        this.api.listPlans(),
+      // Sources only feed the «Сборка» facts of the side panel: best effort.
+      const [builders, tariff, sources] = await Promise.all([
+        this.api.listBuilders(),
         view.id === null ? Promise.resolve(null) : this.api.getTariff(view.id).catch((error: unknown) => {
           if (error instanceof ApiError && error.status === 404) return 'missing' as const;
           throw error;
         }),
+        this.api.listSources().catch(() => null),
       ]);
       if (!current()) return;
       this.lastSessionCheck = Date.now();
-      this.plansCache = plans;
+      this.buildersCache = builders;
+      if (sources) this.sourcesCache = sources;
       if (tariff === 'missing') {
         if (view.id !== null) this.removeCachedTariff(view.id);
         this.paintTariffMissing(view);
         return;
       }
       if (tariff) this.applyTariffOutcome({ tariff, previous: null, versioned: false, replayed: false });
-      this.paintTariffEditor(view, tariff, plans);
+      this.paintTariffEditor(view, tariff, builders);
     } catch (error) {
       if (!current()) return;
       if (await this.endIfSignedOut(error, current)) return;
@@ -6266,16 +5505,17 @@ class AdminApp {
 
   /**
    * The editor: purchase terms, card, publication, a live preview of the Mini
-   * App card and the bot button, the plan with its builder, and sale/delete.
+   * App card and the bot button, the сборка the tariff sells, and sale/delete.
+   * The plan behind a сборка is kept by the server and never shown.
    * Saving is idempotent per payload (like openManage): an uncertain outcome
    * freezes the form so the retry carries exactly the same request.
    */
-  private paintTariffEditor(view: TariffEditorView, loaded: AdminTariff | null, plans: readonly TariffPlan[]) {
+  private paintTariffEditor(view: TariffEditorView, loaded: AdminTariff | null, builders: readonly AdminBuilder[]) {
     setLoading(view.body, null);
     let base = loaded;
-    const selectable = plans.filter(plan => plan.selectable);
-    const fallbackPlan = selectable.find(plan => plan.is_active) ?? selectable[0] ?? null;
-    let baseline = formFromTariff(base, fallbackPlan?.id ?? null);
+    // With a single сборка there is nothing to choose; otherwise the choice is explicit.
+    const onlyBuilder = builders.length === 1 ? builders[0] : null;
+    let baseline = formFromTariff(base, onlyBuilder?.id ?? null);
     let form: TariffForm = { ...baseline };
     let saving = false;
     let frozen = false;
@@ -6363,21 +5603,19 @@ class AdminApp {
     register('name', name, nameField.setError);
     counter(nameField.root, name, TARIFF_LIMITS.name);
 
-    const plan = el('select', 'input');
-    plan.id = 'tf-plan';
-    if (!selectable.length) plan.append(option('', 'Нет планов, доступных для продажи'));
-    for (const item of plans) {
-      if (!item.selectable && item.id !== base?.plan_id) continue;
-      const entry = option(String(item.id), `${item.name}${item.is_active ? '' : ' — план отключён'}${item.selectable ? '' : ' — системный'}`);
-      entry.disabled = !item.selectable;
-      plan.append(entry);
+    const build = el('select', 'input');
+    build.id = 'tf-builder';
+    build.append(option('', builders.length ? 'Выберите сборку' : 'Сборок пока нет'));
+    for (const item of builders) build.append(option(String(item.id), `${item.name}${item.enabled ? '' : ' — отключена'}`));
+    const baseBuilderId = base?.builder_id ?? null;
+    if (baseBuilderId !== null && !builders.some(item => item.id === baseBuilderId)) {
+      build.append(option(String(baseBuilderId), base?.builder_name || `Сборка #${baseBuilderId}`));
     }
-    if (base && !plans.some(item => item.id === base?.plan_id)) plan.append(option(String(base.plan_id), base.plan_name || `План #${base.plan_id}`));
-    const planField = field('План', plan);
-    register('planId', plan, planField.setError);
-    hint(planField.root, selectable.length
-      ? 'План задаёт лимиты подписки и построитель конфигурации. Системные планы (пробный, бесплатный) не продаются.'
-      : 'Нет планов, доступных для продажи: создайте план в боте, затем вернитесь сюда.');
+    const buildField = field('Сборка', build);
+    register('builderId', build, buildField.setError);
+    hint(buildField.root, builders.length
+      ? 'Что получит покупатель: страны и серверы этой сборки.'
+      : 'Сначала создайте сборку в разделе «Сборки», затем вернитесь сюда.');
 
     const duration = textInput('tf-duration', 'numeric');
     const durationField = field('Срок, дней', duration);
@@ -6444,18 +5682,18 @@ class AdminApp {
     activeRow.append(active, el('span', '', 'В продаже: показывать в каталоге Mini App и бота'));
 
     const textControls = [name, duration, price, description, features, badge, sort];
-    const choiceControls = [plan, currency, active];
+    const choiceControls = [build, currency, active];
     const chips = [...durationChips.chips, ...priceChips.chips, ...badgeChips.chips];
 
     const read = (): TariffForm => ({
       // Same key order as formFromTariff: sameForm compares serialized forms.
-      name: name.value, planId: plan.value ? Number(plan.value) : null, durationDays: duration.value, price: price.value,
+      name: name.value, builderId: build.value ? Number(build.value) : null, durationDays: duration.value, price: price.value,
       currency: currency.value, description: description.value, features: features.value, badge: badge.value,
       isActive: active.checked, sortOrder: sort.value,
     });
     const write = (next: TariffForm) => {
       name.value = next.name;
-      plan.value = next.planId === null ? '' : String(next.planId);
+      build.value = next.builderId === null ? '' : String(next.builderId);
       duration.value = next.durationDays;
       price.value = next.price;
       currency.value = next.currency;
@@ -6482,7 +5720,7 @@ class AdminApp {
     const termsPanel = el('section', 'panel');
     termsPanel.setAttribute('aria-labelledby', 'tf-terms-title');
     const termsBody = el('div', 'tariff-form');
-    termsBody.append(termsSlot, nameField.root, planField.root, durationField.root, priceRow);
+    termsBody.append(termsSlot, buildField.root, nameField.root, durationField.root, priceRow);
     termsPanel.append(panelHead('tf-terms-title', 'Условия покупки'), termsBody);
 
     const cardPanel = el('section', 'panel');
@@ -6516,9 +5754,9 @@ class AdminApp {
     previewPanel.append(panelHead('tf-preview-title', 'Предпросмотр'), previewBody);
 
     const planPanel = el('section', 'panel');
-    planPanel.setAttribute('aria-labelledby', 'tf-plan-title');
+    planPanel.setAttribute('aria-labelledby', 'tf-build-title');
     const planBody = el('div');
-    planPanel.append(panelHead('tf-plan-title', 'План и построитель'), planBody);
+    planPanel.append(panelHead('tf-build-title', 'Сборка'), planBody);
 
     const managePanel = el('section', 'panel');
     managePanel.setAttribute('aria-labelledby', 'tf-manage-title');
@@ -6542,7 +5780,7 @@ class AdminApp {
         tone: 'info',
         text: versioned
           ? `Тариф уже покупали (${tariffUsage(base)}). Сохранение создаст новую версию тарифа: текущая будет снята с продажи, купленные подписки не изменятся.`
-          : `Тариф уже покупали (${tariffUsage(base)}). Название, план, срок, цена и валюта защищены: их изменение создаст новую версию. Карточку и публикацию можно менять свободно.`,
+          : `Тариф уже покупали (${tariffUsage(base)}). Название, сборка, срок, цена и валюта защищены: их изменение создаст новую версию. Карточку и публикацию можно менять свободно.`,
       });
       node.dataset.terms = versioned ? 'versioned' : 'protected';
       termsSlot.append(node);
@@ -6600,27 +5838,46 @@ class AdminApp {
       previewBody.replaceChildren(...nodes);
     };
 
-    let paintedPlan: number | null | undefined;
-    const paintPlan = (force = false) => {
-      if (!force && paintedPlan === form.planId) return;
-      paintedPlan = form.planId;
-      const selected = (this.plansCache ?? plans).find(item => item.id === form.planId) ?? null;
+    // Repainted when the choice changes or the saved tariff does: a tariff of
+    // the old model stops being one once it is saved with a сборка.
+    let paintedPlan: string | undefined;
+    const paintPlan = () => {
+      const key = `${form.builderId ?? ''}|${base ? base.builder_id ?? 'none' : 'new'}`;
+      if (paintedPlan === key) return;
+      paintedPlan = key;
+      const selected = builders.find(item => item.id === form.builderId) ?? null;
+      const nodes: HTMLElement[] = [];
+      if (base && base.builder_id === null) {
+        // A tariff of the old model: its plan never had a сборка.
+        const legacy = notice({
+          tone: 'info',
+          text: 'У этого тарифа ещё нет сборки. Выберите её: клиенты, уже купившие тариф, тоже начнут получать её серверы.',
+        });
+        legacy.classList.add('tariff-legacy');
+        nodes.push(legacy);
+      }
       if (!selected) {
-        planBody.replaceChildren(el('p', 'panel-note', 'Выберите план: он задаёт построитель конфигурации подписки.'));
+        nodes.push(el('p', 'panel-note', 'Выберите сборку: она определяет, какие страны и серверы получит покупатель.'));
+        const create = el('a', 'btn btn-secondary btn-sm', builders.length ? 'Открыть «Сборки»' : 'Создать сборку');
+        create.href = builders.length ? '#/builders' : '#/builders/new';
+        const foot = el('div', 'panel-foot');
+        foot.append(create);
+        nodes.push(foot);
+        planBody.replaceChildren(...nodes);
         return;
       }
       const facts = el('dl', 'facts facts-single');
-      const builderName = selected.builder_name
-        || (selected.subscription_builder_id !== null ? `Построитель #${selected.subscription_builder_id}` : 'Не назначен');
-      facts.append(
-        fact('План', selected.name, selected.is_active ? undefined : 'План отключён', 'is-danger'),
-        fact('Построитель', builderName, 'Назначается плану и действует для всех его тарифов и подписок.'),
-      );
-      const assign = button('Изменить построитель', 'btn btn-secondary btn-sm', 'builders');
-      assign.addEventListener('click', () => void this.assignPlanBuilder(selected, () => paintPlan(true)));
+      facts.append(fact('Название', selected.name, selected.enabled ? undefined : 'Сборка отключена: покупатель не получит серверы', 'is-danger'));
+      if (this.sourcesCache) {
+        const summary = buildFacts(selected, this.sourcesCache);
+        facts.append(fact('Что получит покупатель', buildFactsSummary(summary), summary.problem || undefined, 'is-danger'));
+      }
+      const open = el('a', 'btn btn-secondary btn-sm', 'Открыть сборку');
+      open.href = buildsHash({ view: 'edit', id: selected.id });
       const foot = el('div', 'panel-foot');
-      foot.append(assign);
-      planBody.replaceChildren(facts, foot);
+      foot.append(open);
+      nodes.push(facts, foot);
+      planBody.replaceChildren(...nodes);
     };
 
     const paintManage = () => {
@@ -6777,7 +6034,7 @@ class AdminApp {
       const code = error instanceof ApiError ? error.code : '';
       if (error instanceof ApiError && code === 'invalid_tariff') {
         const key = SERVER_FIELDS[error.field];
-        if (key) showFieldErrors({ [key]: key === 'planId' ? 'План недоступен для продажи: он системный или удалён.' : 'Сервер отклонил это значение.' });
+        if (key) showFieldErrors({ [key]: key === 'builderId' ? 'Сборка недоступна: возможно, её удалили.' : 'Сервер отклонил это значение.' });
         showStatus({ tone: 'error', text: `${prefix} ${tariffErrorText(error)}` }, [], !key);
         return true;
       }
@@ -6976,34 +6233,6 @@ class AdminApp {
     }
   }
 
-  /** Assigns the plan's builder from the tariff editor (builders are per plan, never per tariff). */
-  private async assignPlanBuilder(plan: TariffPlan, onDone: () => void) {
-    if (this.dialog) return;
-    const view = this.tariffEditorView;
-    const current = () => this.tariffEditorView === view;
-    if (!this.buildersCache) {
-      try {
-        this.buildersCache = await this.api.listBuilders();
-      } catch (error) {
-        if (!current()) return;
-        if (await this.endIfSignedOut(error, current)) return;
-        this.toast(`Не удалось загрузить построители. ${errorText(error)}`);
-        return;
-      }
-      if (!current()) return;
-    }
-    this.openBuilderAssignDialog('plan', plan.id, plan.subscription_builder_id, builderId => {
-      const builderName = builderId === null ? '' : this.buildersCache?.find(item => item.id === builderId)?.name ?? '';
-      this.plansCache = (this.plansCache ?? []).map(item => item.id === plan.id
-        ? { ...item, subscription_builder_id: builderId, builder_name: builderName } : item);
-      if (this.tariffsCache) {
-        this.tariffsCache = this.tariffsCache.map(tariff => tariff.plan_id === plan.id ? { ...tariff, builder_id: builderId } : tariff);
-      }
-      if (current()) onDone();
-      this.toast(builderId === null ? `Построитель плана «${plan.name}» снят.` : `Построитель назначен плану «${plan.name}».`);
-    }, { planName: plan.name, subscriptions: plan.subscriptions });
-  }
-
   /**
    * Subscriptions affected by a plan's builder (TariffPlan.subscriptions, all
    * statuses), from the plans snapshot or GET /admin/api/plans. A failed read
@@ -7199,13 +6428,13 @@ class AdminApp {
 
     const builderSelect = el('select', 'input');
     builderSelect.id = 'tr-builder';
-    const builderField = field('Построитель', builderSelect);
+    const builderField = field('Сборка', builderSelect);
     setters.set('builderId', builderField.setError);
     targets.set('builderId', builderSelect);
     const fillBuilders = () => {
-      builderSelect.replaceChildren(option('', 'Не выбран — пробная подписка не выдаётся'));
+      builderSelect.replaceChildren(option('', 'Не выбрана — пробная подписка не выдаётся'));
       for (const b of base.builders) {
-        const notes = [b.enabled ? '' : 'отключён', b.shared ? 'общий' : ''].filter(Boolean).join(', ');
+        const notes = [b.enabled ? '' : 'отключена', b.shared ? 'общая' : ''].filter(Boolean).join(', ');
         builderSelect.append(option(String(b.id), notes ? `${b.name} — ${notes}` : b.name));
       }
     };
@@ -7260,7 +6489,7 @@ class AdminApp {
     const basics = section('tr-basic', 'Основные');
     basics.content.append(enabledRow, enabledHint, durationRow, presets, expiryHint, titleField.root, descriptionField.root, featuresField.root, badgeField.root,
       el('p', 'field-hint', 'В Mini App пробная подписка не показывается: её выдаёт страница приглашения по реферальной ссылке.'));
-    const composition = section('tr-composition', 'Состав', 'Построитель и источники');
+    const composition = section('tr-composition', 'Состав', 'Сборка и источники');
     const builderBody = el('div', 'trial-builder');
     composition.content.append(builderField.root, builderBody);
     const countries = section('tr-countries', 'Страны', 'Страны и серверы');
@@ -7351,12 +6580,12 @@ class AdminApp {
       builderSelect.disabled = busy;
       const nodes: HTMLElement[] = [];
       if (form.builderId === null) {
-        nodes.push(el('p', 'field-hint', 'Пробная подписка собирается только построителем тарифа «trial»: без него она не выдаётся. Выберите построитель, чтобы настроить источники, страны и серверы.'));
+        nodes.push(el('p', 'field-hint', 'Пробная подписка выдаёт серверы выбранной сборки: без неё она не выдаётся. Выберите сборку, чтобы настроить источники, страны и серверы.'));
         builderBody.replaceChildren(...nodes);
         return;
       }
       if (!summary) {
-        builderBody.replaceChildren(notice({ tone: 'error', text: 'Построитель не найден: возможно, его удалили. Выберите другой.' }));
+        builderBody.replaceChildren(notice({ tone: 'error', text: 'Сборка не найдена: возможно, её удалили. Выберите другую.' }));
         return;
       }
       const facts = el('dl', 'facts facts-single');
@@ -7365,8 +6594,8 @@ class AdminApp {
         summary.usage.subscriptions ? `подписок с переопределением: ${formatCount(summary.usage.subscriptions)}` : '',
       ].filter(Boolean).join('; ');
       facts.append(
-        fact('Состояние', enabledBadge(summary.enabled), summary.enabled ? undefined : 'Новые пробные подписки не выдаются, пока построитель отключён.', 'is-danger'),
-        fact('Сейчас выдаёт', `${serversLabel(summary.total)}, ${countriesLabel(summary.countries)}`, 'По сохранённым правилам построителя.'),
+        fact('Состояние', enabledBadge(summary.enabled, true), summary.enabled ? undefined : 'Новые пробные подписки не выдаются, пока сборка отключена.', 'is-danger'),
+        fact('Сейчас выдаёт', `${serversLabel(summary.total)}, ${countriesLabel(summary.countries)}`, 'По сохранённому составу сборки.'),
         fact('Источники', summary.source_ids.map(sourceName).join(', ') || 'Не выбраны'),
         fact('Используется', usage || 'Только пробной подпиской'),
       );
@@ -7377,17 +6606,17 @@ class AdminApp {
         copy.addEventListener('click', () => void copyBuilder(summary));
         nodes.push(noticeWithActions({
           tone: 'info',
-          text: 'Этот построитель используют другие тарифы или подписки. Пробная подписка может использовать его как есть; изменить страны и серверы только для неё можно в копии — исходный построитель и платные тарифы не изменятся.',
+          text: 'Эту сборку используют другие тарифы или подписки. Пробная подписка может использовать её как есть; изменить страны и серверы только для неё можно в копии — исходная сборка и платные тарифы не изменятся.',
         }, [copy]));
       } else if (summary.disabled_rules > 0) {
-        nodes.push(el('p', 'field-hint', `У построителя есть отключённые правила (${formatCount(summary.disabled_rules)}): при сохранении изменённого состава они будут удалены.`));
+        nodes.push(el('p', 'field-hint', `В сборке есть отключённые правила (${formatCount(summary.disabled_rules)}): при сохранении изменённого состава они будут удалены.`));
       }
       if (builderLoading) {
-        nodes.push(el('p', 'field-hint', 'Загружаем правила построителя…'));
+        nodes.push(el('p', 'field-hint', 'Загружаем состав сборки…'));
       } else if (editable()) {
         const list = el('div', 'trial-source-pick');
         list.setAttribute('role', 'group');
-        list.setAttribute('aria-label', 'Источники построителя');
+        list.setAttribute('aria-label', 'Источники сборки');
         list.append(el('p', 'preview-caption', 'Источники состава'));
         if (!sources.length) list.append(el('p', 'field-hint', 'Источников нет: добавьте их в разделе «Источники».'));
         for (const src of sources) {
@@ -7413,11 +6642,11 @@ class AdminApp {
       const nodes: HTMLElement[] = [];
       const summary = summaryOf(form.builderId);
       if (form.builderId === null || !summary) {
-        countriesBody.replaceChildren(el('p', 'field-hint', 'Выберите построитель в разделе «Состав», чтобы настроить страны и серверы.'));
+        countriesBody.replaceChildren(el('p', 'field-hint', 'Выберите сборку в разделе «Состав», чтобы настроить страны и серверы.'));
         return;
       }
       if (builderLoading) {
-        countriesBody.replaceChildren(el('p', 'field-hint', 'Загружаем правила построителя…'));
+        countriesBody.replaceChildren(el('p', 'field-hint', 'Загружаем состав сборки…'));
         return;
       }
       const canEdit = editable() && !saving;
@@ -7444,7 +6673,7 @@ class AdminApp {
       }
       nodes.push(modes);
       if (!editable()) {
-        nodes.push(el('p', 'field-hint', 'Только просмотр: состав общего построителя меняется в разделе «Построители» или в копии для пробной подписки.'));
+        nodes.push(el('p', 'field-hint', 'Только просмотр: состав общей сборки меняется в разделе «Сборки» или в копии для пробной подписки.'));
       }
 
       if (form.mode === 'all') {
@@ -7555,11 +6784,11 @@ class AdminApp {
       const summary = summaryOf(form.builderId);
       const facts = el('dl', 'facts facts-single');
       facts.append(
-        fact('Profile title', summary ? summary.profile_title || 'Не задан' : '—', 'Заголовок подписки в клиенте берётся из построителя.'),
+        fact('Profile title', summary ? summary.profile_title || 'Не задан' : '—', 'Заголовок подписки в клиенте берётся из сборки.'),
         fact('Support URL', summary ? summary.support_url || 'Не задан' : '—'),
         fact('Пробных без привязки', formatCount(base.active_trials), 'Активные анонимные пробные подписки.'),
       );
-      const link = el('a', 'btn btn-secondary btn-sm', 'Открыть «Построители»');
+      const link = el('a', 'btn btn-secondary btn-sm', 'Открыть «Сборки»');
       link.href = '#/builders';
       const foot = el('div', 'panel-foot');
       foot.append(link);
@@ -7613,9 +6842,9 @@ class AdminApp {
       facts.append(
         fact('Срок', p.duration_hours ? trialDurationLabel(p.duration_hours) : '—',
           p.duration_hours ? `Выданная сейчас истечёт ${formatDateTime(p.expires_at)}` : undefined),
-        fact('Построитель', p.builder ? p.builder.name : 'Не выбран', p.builder
-          ? (p.builder.enabled ? undefined : 'Отключён')
-          : 'Без построителя пробная подписка не выдаётся.', 'is-danger'),
+        fact('Сборка', p.builder ? p.builder.name : 'Не выбрана', p.builder
+          ? (p.builder.enabled ? undefined : 'Отключена')
+          : 'Без сборки пробная подписка не выдаётся.', 'is-danger'),
         fact('Серверов', p.builder ? formatCount(p.total) : '—'),
         fact('Стран', p.builder ? formatCount(p.countries.length) : '—',
           p.countries.length ? p.countries.map(c => `${c.code || 'без страны'} ${formatCount(c.count)}`).join(' · ') : undefined),
@@ -7714,7 +6943,7 @@ class AdminApp {
           if (await this.endIfSignedOut(error, isCurrent)) return;
           builderSelect.value = form.builderId === null ? '' : String(form.builderId);
           refreshAll();
-          showStatus({ tone: 'error', text: `Не удалось загрузить построитель. ${errorText(error)}` });
+          showStatus({ tone: 'error', text: `Не удалось загрузить сборку. ${errorText(error)}` });
           return;
         }
         builderLoading = false;
@@ -7728,8 +6957,8 @@ class AdminApp {
 
     const copyBuilder = async (summary: TrialBuilderSummary) => {
       if (saving) return;
-      const ok = await this.confirmAction('Создать копию построителя?',
-        `Будет создан построитель «${summary.name} · пробная» с теми же источниками и правилами и назначен пробной подписке. ` +
+      const ok = await this.confirmAction('Создать копию сборки?',
+        `Будет создана сборка «${summary.name} · пробная» с теми же источниками и составом и назначена пробной подписке. ` +
         `Тарифы и подписки, которые используют «${summary.name}», не изменятся.`, 'Создать копию');
       if (!ok || !isCurrent()) return;
       saving = true;
@@ -7752,7 +6981,7 @@ class AdminApp {
         write();
         refreshAll();
         schedulePreview();
-        showStatus({ tone: 'success', text: `Создан построитель «${summaryOf(out.target_id)?.name ?? `#${out.target_id}`}» и назначен пробной подписке.` });
+        showStatus({ tone: 'success', text: `Создана сборка «${summaryOf(out.target_id)?.name ?? `#${out.target_id}`}» и назначена пробной подписке.` });
       } catch (error) {
         if (!isCurrent()) return;
         saving = false;
@@ -7889,6 +7118,45 @@ class AdminApp {
     };
   }
 
+  // Сборки ---------------------------------------------------------------------
+
+  private disposeBuilds() {
+    this.buildsScreen?.dispose();
+    this.buildsScreen = null;
+  }
+
+  /** What a сборки screen may use of the shell: session, dialogs, guard, routing, shared lists. */
+  private buildsHost(): BuildsHost {
+    // The screen reads and writes the same snapshots the other sections use.
+    const store = {} as BuildsHost['store'];
+    Object.defineProperties(store, {
+      sources: { get: () => this.sourcesCache, set: (list: readonly AdminSource[] | null) => { this.sourcesCache = list; } },
+      builders: { get: () => this.buildersCache, set: (list: readonly AdminBuilder[] | null) => { this.buildersCache = list; } },
+      tariffs: {
+        get: () => this.tariffsCache,
+        set: (list: readonly AdminTariff[] | null) => {
+          this.tariffsCache = list;
+          this.tariffsAt = list ? new Date() : null;
+        },
+      },
+    });
+    return {
+      api: this.api,
+      store,
+      icon: (name, size) => icon(name, size),
+      toast: text => this.toast(text),
+      confirm: (titleText, text, confirmLabel) => this.confirmAction(titleText, text, confirmLabel),
+      setUnsaved: check => { this.unsavedChanges = check; },
+      signedOut: (error, current) => this.endIfSignedOut(error, current),
+      navigate: hash => {
+        this.unsavedChanges = null;
+        if (location.hash === hash) this.renderSection(true);
+        else location.hash = hash;
+      },
+      sessionUsed: () => { this.lastSessionCheck = Date.now(); },
+    };
+  }
+
   /** A modal yes/no confirmation; resolves false when dismissed in any way. */
   private confirmAction(titleText: string, text: string, confirmLabel: string): Promise<boolean> {
     return new Promise(resolve => {
@@ -7951,13 +7219,13 @@ const TRIAL_RULE_FACTS: readonly string[] = [
 
 const TRIAL_ACTIONS: Readonly<Record<string, string>> = {
   trial_updated: 'Настройки сохранены',
-  trial_builder_copied: 'Создана копия построителя',
+  trial_builder_copied: 'Создана копия сборки',
 };
 
 const TRIAL_REJECTIONS: Readonly<Record<string, string>> = {
   version_conflict: 'Настройки пробной подписки изменили в другом окне.',
-  builder_version_conflict: 'Построитель изменили в другом окне.',
-  builder_name_taken: 'Имя копии построителя уже занято.',
+  builder_version_conflict: 'Сборку изменили в другом окне.',
+  builder_name_taken: 'Имя копии сборки уже занято.',
   request_key_conflict: 'Запрос конфликтует с ранее отправленным.',
   invalid_request: 'Сервер отклонил параметры запроса.',
 };
@@ -7975,7 +7243,7 @@ function trialEntryPanel(): HTMLElement {
   const panel = el('section', 'panel trial-entry');
   panel.setAttribute('aria-labelledby', 'trial-entry-title');
   panel.append(panelHead('trial-entry-title', 'Пробная подписка', 'Выдаётся по реферальной ссылке'),
-    el('p', 'panel-note', 'Срок, построитель и источники, страны и конкретные серверы, ограничения выдачи и карточка на странице приглашения. Платные тарифы и их построители не меняются.'));
+    el('p', 'panel-note', 'Срок, сборка и источники, страны и конкретные серверы, ограничения выдачи и карточка на странице приглашения. Платные тарифы и их сборки не меняются.'));
   const link = el('a', 'btn btn-secondary btn-sm');
   link.href = '#/tariffs/trial';
   link.append(el('span', 'btn-label', 'Настроить пробную подписку'));
@@ -7988,8 +7256,8 @@ function trialEntryPanel(): HTMLElement {
 // ---------------------------------------------------------------------------
 // Tariff helpers
 
-const NEW_TARIFF_DESC = 'Заполните условия покупки и карточку. Включённый тариф сразу появится в каталоге.';
-const TARIFF_FIELD_ORDER: readonly TariffField[] = ['name', 'planId', 'durationDays', 'price', 'currency', 'description', 'features', 'badge', 'sortOrder'];
+const NEW_TARIFF_DESC = 'Выберите сборку, срок и цену. Включённый тариф сразу появится в каталоге.';
+const TARIFF_FIELD_ORDER: readonly TariffField[] = ['builderId', 'name', 'durationDays', 'price', 'currency', 'description', 'features', 'badge', 'sortOrder'];
 const CURRENCY_LABELS: Readonly<Record<string, string>> = {
   RUB: 'RUB — рубли (бот)',
   XTR: 'XTR — Telegram Stars (Mini App)',
@@ -8013,7 +7281,8 @@ const TARIFF_REJECTIONS: Readonly<Record<string, string>> = {
 function tariffErrorText(error: unknown): string {
   if (!(error instanceof ApiError)) return errorText(error);
   if (error.code === 'invalid_tariff') {
-    return error.field === 'plan_id' ? 'План недоступен для продажи: он системный или удалён.' : 'Сервер отклонил значение одного из полей.';
+    return error.field === 'plan_id' || error.field === 'builder_id'
+      ? 'Сборка недоступна: возможно, её удалили.' : 'Сервер отклонил значение одного из полей.';
   }
   if (error.code === 'not_found' && error.status === 404) return 'Тариф не найден: возможно, его уже удалили.';
   return TARIFF_REJECTIONS[error.code] ?? errorText(error);
@@ -8045,12 +7314,13 @@ function iconButton(name: IconName, label: string): HTMLButtonElement {
 /** Subscriptions of a plan reached by a change of its builder; null when unknown. */
 interface PlanImpact { planName: string; subscriptions: number | null }
 
-/** The explicit warning of the plan builder dialog. */
+/** The explicit warning of the «сборка тарифа» dialog: who starts getting other servers. */
 function planImpactText({ planName, subscriptions }: PlanImpact): string {
-  if (subscriptions === null) return `Изменение затронет все подписки плана «${planName}». Число подписок получить не удалось.`;
-  if (subscriptions === 0) return `У плана «${planName}» нет подписок: изменение не затронет ни одной активной подписки.`;
-  return `Изменение затронет ${formatCount(subscriptions)} ${pluralRu(subscriptions, 'подписку', 'подписки', 'подписок')} плана «${planName}». ` +
-    'Учитываются подписки во всех статусах.';
+  const name = planDisplayName(planName);
+  if (subscriptions === null) return `Изменение затронет всех клиентов тарифа «${name}». Их число получить не удалось.`;
+  if (subscriptions === 0) return `На тарифе «${name}» пока нет клиентов: изменение никого не затронет.`;
+  return `Изменение затронет ${formatCount(subscriptions)} ${pluralRu(subscriptions, 'подписку', 'подписки', 'подписок')} тарифа «${name}»: ` +
+    'их клиенты начнут получать серверы выбранной сборки. Учитываются подписки во всех статусах.';
 }
 
 /** The latest server form with the fields edited locally (mine vs before) applied on top. */

@@ -13,7 +13,7 @@ export const STATUS_LABELS: Readonly<Record<MonitorStatus, string>> = {
   degraded: 'Частично',
   down: 'Недоступен',
   unknown: 'Нет данных',
-  disabled: 'Отключён',
+  disabled: 'Отключена',
 };
 
 /** Badge modifier of a status (style.css .badge-*): green means "works". */
@@ -227,7 +227,7 @@ export interface HealthSummary {
 }
 
 const serversWord = (n: number) => pluralRu(n, 'сервер', 'сервера', 'серверов');
-const buildersWord = (n: number) => pluralRu(n, 'построитель', 'построителя', 'построителей');
+const buildersWord = (n: number) => pluralRu(n, 'сборка', 'сборки', 'сборок');
 
 /**
  * The verdict of the overview. Green only when every enabled builder is up,
@@ -246,7 +246,7 @@ export function overviewHealth(o: OverviewInput, now: number): HealthSummary {
   const verdict = (tone: HealthTone, title: string, text: string): HealthSummary => ({ tone, title, text, ...counts });
 
   if (active.length === 0) {
-    return verdict('off', 'Нет включённых построителей', 'Проверять нечего: серверы клиентам сейчас не выдаются.');
+    return verdict('off', 'Нет включённых сборок', 'Проверять нечего: серверы клиентам сейчас не выдаются.');
   }
   if (!o.enabled) {
     return verdict('unknown', 'Проверки отключены', 'Фоновые проверки выключены в конфигурации: ниже последнее сохранённое состояние.');
@@ -258,7 +258,7 @@ export function overviewHealth(o: OverviewInput, now: number): HealthSummary {
   const down = active.filter(b => b.status === 'down');
   if (down.length > 0) {
     return verdict('down', `Недоступно: ${countFormat.format(down.length)} ${buildersWord(down.length)}`,
-      'У этих построителей не отвечает ни один сервер: их клиенты остались без VPN.');
+      'У этих сборок не отвечает ни один сервер: их клиенты остались без VPN.');
   }
   const sourceErrors = sum(b => b.source_errors);
   if (counts.nodesDown > 0 || sourceErrors > 0 || active.some(b => b.status === 'degraded')) {
@@ -270,10 +270,10 @@ export function overviewHealth(o: OverviewInput, now: number): HealthSummary {
   }
   if (counts.nodes === 0 || counts.nodesUp < counts.nodes) {
     return verdict('unknown', 'Нет данных проверки',
-      counts.nodes === 0 ? 'Построители пока не выдают серверов с проверяемым адресом.' : 'Часть серверов ещё не проверена: дождитесь следующего раунда.');
+      counts.nodes === 0 ? 'Сборки пока не выдают серверов с проверяемым адресом.' : 'Часть серверов ещё не проверена: дождитесь следующего раунда.');
   }
   return verdict('ok', 'Всё работает',
-    `Отвечают все ${countFormat.format(counts.nodes)} ${serversWord(counts.nodes)} в ${countFormat.format(counts.builders)} ${pluralRu(counts.builders, 'построителе', 'построителях', 'построителях')}.`);
+    `Отвечают все ${countFormat.format(counts.nodes)} ${serversWord(counts.nodes)} в ${countFormat.format(counts.builders)} ${pluralRu(counts.builders, 'сборке', 'сборках', 'сборках')}.`);
 }
 
 export interface HealthSegment {

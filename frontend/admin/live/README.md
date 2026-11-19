@@ -1,8 +1,10 @@
 # Admin live smoke (real Go API, temporary SQLite)
 
 `builder.live.spec.ts` drives the real admin UI against the real Go server:
-admin auth and CSRF, `/admin/api/builders*` (atomic configuration save,
-ownership checks), Preview and `/sub`. Nothing is mocked. The stand
+admin auth and CSRF, the «Сборки» constructor over `/admin/api/builders*`
+(atomic configuration save, ownership checks), the price of a сборка
+(`/admin/api/tariffs` with `builder_id` and the sale plan behind it), the
+server check and `/sub`. Nothing is mocked. The stand
 (`internal/web/admin_live_smoke_test.go`, build tag `adminsmoke`) uses a
 temporary SQLite database and a local upstream with two test catalogues; it
 never contacts a real provider or database.
@@ -30,6 +32,13 @@ never contacts a real provider or database.
    ```sh
    ADMIN_LIVE_STATE_DIR="$STATE_DIR" ADMIN_LIVE_PASSWORD="$PASSWORD" npm --prefix frontend run test:browser:admin-live
    ```
+
+Optionally set `ADMIN_LIVE_REAL_URL` to a real provider subscription link: the
+last test then adds it as a source, builds a narrow and a wide сборка, prices
+one, reads the real `/sub` and probes the real servers (it reports what the
+servers answer; that depends on the network of the stand). The link is
+write-only in the panel and the test checks that no part of it comes back.
+Without the variable that test is skipped.
 
 The admin namespace requires an https `SITE_URL`, so the stand serves the
 browser through a local TLS proxy with a self-signed test certificate at
