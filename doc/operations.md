@@ -1,4 +1,4 @@
-# Operations Guide — rs8kvn_bot
+# Operations Guide — DictatorVPN
 
 ---
 

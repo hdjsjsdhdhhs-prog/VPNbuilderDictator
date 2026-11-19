@@ -1,6 +1,6 @@
-# Architecture — rs8kvn_bot
+# Architecture — DictatorVPN
 
-rs8kvn_bot — production-ready Telegram bot for distributing VLESS+Reality+Vision VPN subscriptions. Built with Go, following Clean Architecture principles.
+DictatorVPN — Telegram VPN subscription service without VPN servers or panels of its own: it aggregates ready provider subscription URLs (Sources → catalogue → Builders → `/sub`). Built with Go, following Clean Architecture principles. Runtime names (`rs8kvn_bot` binary, `rs8kvn-bot.service`, `rs8kvn.db`) are kept for compatibility, see `README.md`.
 
 A subscription is purely local state: a `subscriptions` row (status, plan, expiry, token). The bot does **not** register clients on any VPN panel. The content served by the `/sub` endpoint is assembled on request by a **Subscription Builder** from **ProviderSource** catalogues (see [Subscription Content Assembly](#subscription-content-assembly)). The legacy 3x-ui/proxman node subsystem (`nodes`, `plan_nodes`, `subscription_nodes`, `internal/vpn`, `internal/xui`, the panel sync/traffic workers) was removed in migration `051_remove_legacy_nodes`.
 
@@ -31,7 +31,7 @@ A subscription is purely local state: a `subscriptions` row (status, plan, expir
                     │
                     ▼
 ┌────────────────────────────────────────────────────────────────────────────┐
-│                         rs8kvn_bot (single binary)                         │
+│                        DictatorVPN (single binary)                         │
 ├────────────────────────────────────────────────────────────────────────────┤
 │ cmd/bot             event loop, graceful shutdown, background workers      │
 │ internal/bot        Telegram layer: commands, callbacks, admin, caches     │
@@ -517,7 +517,19 @@ The stored catalogue (`provider_sources`, `provider_source_entries`) only enrich
 #### Source validity end and deletion
 
 - **Validity end** (`provider_sources.expires_at`, migration `052_provider_source_expiry`): the admin records until which date and hour the provider's own subscription is paid; `NULL` means no limit. Past it the source is unusable **exactly like a disabled one** — `ProviderSource.RequestConfiguration` is the single check shared by `/sub`, the builder preview, the network monitor, the trial issuance check and the purchase policy. The `enabled` switch is not flipped, nothing is written at the moment of expiry, and extending the date brings the source back. A new end must be in the future; editing other fields of an already expired source keeps its stored end. The admin catalogue sync still works for a disabled or expired source (`FetchSourceCatalogue`).
-- **Deletion** (`DELETE /admin/api/sources/{id}`, `DELETE /admin/api/builders/{id}`; `database/config_deletion.go`): a row is physically deleted only while nothing depends on it. A source is blocked by any builder that links it or has a rule on it and by any subscription sold directly on it (`409 source_in_use`); a builder is blocked by any plan whose default it is and by any per-subscription override (`409 builder_in_use`) and needs the loaded version (`409 version_conflict`). The foreign keys would otherwise `SET NULL` those references and leave customers without content, so the check is explicit and switching off stays the way to retire something still referenced. Deletions are audited (`source_deleted`, `builder_deleted`, credential-free) and idempotent by `(actor, request_key)`; the admin views carry `dependents` so the panel can explain a refusal. Subscriptions are never deleted by this path.
+- **Deletion** (`DELETE /admin/api/sources/{id}`, `DELETE /admin/api/builders/{id}`; `database/config_deletion.go`): a row is physically deleted only while nothing depends on it. A source is blocked by any builder that links it or has a rule on it and by any subscription sold directly on it (`409 source_in_use`); a builder is blocked by a plan whose default it is while that plan is a system plan (`trial`, `free`) or still has tariffs or subscriptions, and by any per-subscription override (`409 builder_in_use`), and needs the loaded version (`409 version_conflict`); its own empty sale plan never blocks and is deleted with it. The foreign keys would otherwise `SET NULL` those references and leave customers without content, so the check is explicit and switching off stays the way to retire something still referenced. Deletions are audited (`source_deleted`, `builder_deleted`, credential-free) and idempotent by `(actor, request_key)`; the admin views carry `dependents` so the panel can explain a refusal. Subscriptions are never deleted by this path.
+
+#### Сборки and sale plans (admin panel)
+
+The admin panel calls a Subscription Builder a **сборка** and edits it on one page (`frontend/admin/src/builds.ts`, `builds-ui.ts`; routes `#/builders`, `#/builders/new`, `#/builders/{id}`): sources, composition (everything, or ticked countries and servers), order and names, title and price. The page stores the same builder rows and rules as before (`PUT /admin/api/builders/{id}/configuration`, one transaction with the loaded version). Its live preview mirrors `subserver.selectBuilderEntries`; "Проверить на сервере" runs the real builder preview.
+
+- **Plans are internal.** A tariff is sold on a builder: `POST`/`PATCH /admin/api/tariffs` take `builder_id` (it wins over `plan_id`) and the repository resolves the plan (`database/builder_plans.go`, `ensureBuilderSalePlan`). The sale plan of a builder is its oldest non-system plan. It is created with the first tariff, named after the builder (unique within `plans.name`, never `trial`/`free`), renamed when the builder is renamed, adopts a legacy plan without a builder when a tariff of that plan is moved to the builder, and is deleted with the builder while it has no tariffs and no subscriptions. Tariff views carry `builder_id`/`builder_name`; builder views carry `sales` (`plan_id` and the active `clients`, counted with the same priority as `ResolveSubscriptionBuilder`).
+- **Source link replacement.** `PATCH /admin/api/sources/{id}` optionally takes `subscription_url`, `hwid`, `user_agent` and `headers`: omitted keeps the stored value, a value replaces it after the same validation as on create. They are write-only and never returned; the panel re-syncs the catalogue afterwards.
+- **Manual check.** `POST /admin/api/monitoring/check` (empty body or `{}`) re-resolves the builders, probes every served server once and answers the fresh overview. `409 check_in_progress` while the background loop or another manual check is running (`netmon.Service.CheckNow` is serialized with the loop, so a failure is never counted twice); `504 check_timeout` after 25 s.
+- **Monitor targets and rotating providers.** A single server is a target by what it is (protocol, host, port, transport; a Reality camouflage name does not count). A config with several servers inside (a balancer) is a target by what it is *called*: its key comes from the source and the entry, and the address probed is the one member that is not a server of the subscription by itself, taken from the latest answer. Providers rotate those members per request — a decoy picked from the other servers and, for a "section" heading such as «⬇️ Обходы белых списков ⬇️», even the member of its own — so a rotation moves the probe, not the target: history and open outages continue and nothing is announced as «снят с выдачи». Verified against a real 40-server provider subscription by `builder.live.spec.ts` (`ADMIN_LIVE_REAL_URL`).
+- **Immediate notifications.** The network monitor calls `OpsService.RequestTick` after every completed check round (`SetAfterRound`), which wakes `OpsWorker`: an outage reaches Telegram right after the round that confirmed it instead of on the next minute tick.
+
+Verification: `frontend/tests/admin-builds.test.ts` (pure logic), `frontend/admin/browser/sources.spec.ts` (mocked backend) and `frontend/admin/live/builder.live.spec.ts` (the real Go API on a temporary database, see `frontend/admin/live/README.md`).
 
 ### Subscription lifecycle
 
@@ -542,7 +554,8 @@ Started from `cmd/bot/main.go` (`startBackgroundWorkers`); all stop on context c
 | `SubscriptionExpireWorker` | Every 1h | Expires paid subscriptions past `expires_at` (downgrade to the free plan) |
 | `SubscriptionReminderWorker` | Every 30m | Sends idempotent 3d/1d/3h expiry reminders |
 | `WarmupWorker` | Every 10m (tick budget 8m) | Delivers customer warm-up messages with claim-based idempotency |
-| Network monitor | Optional (`NETMON_ENABLED`) | Best-effort checks of provider sources; never affects serving |
+| Network monitor | Optional (`NETMON_ENABLED`) | Best-effort checks of provider sources; never affects serving. A round can also be started from the admin panel (`POST /admin/api/monitoring/check`) |
+| `OpsWorker` | Every 1m and right after every network monitor round | Turns monitor outages, builder/source state changes and the daily report into `ops_events` and delivers them to Telegram (best-effort, `doc/promo-ops.md`) |
 
 ---
 
@@ -587,6 +600,7 @@ The bot exposes a `/metrics` endpoint (via `promhttp.Handler()`) on the HTTP ser
 | 2026-10 | Remove the legacy node subsystem (migration 051) | Subscriptions are assembled by Builders from ProviderSource catalogues; no panel provisioning, sync queue or panel traffic accounting |
 | 2026-11 | Source validity end (migration 052) and guarded deletion of sources/builders | A provider subscription is sold for a term: past `expires_at` the source is skipped like a disabled one without any worker; unused sources/builders can be deleted, referenced ones are refused instead of silently detaching plans and subscriptions |
 | 2026-11 | Promo codes, free tariffs and operational notifications (migration 053) | A discount lowers the amount of the pending order and is redeemed in the payment-confirmation transaction; nothing to pay is granted without a provider (`ActivateFree`). Infrastructure events and a daily report are a best-effort worker (`OpsWorker`) that only reads monitoring and source state. See `doc/promo-ops.md` |
+| 2026-11 | Сборки: plans hidden behind builders, one-page constructor | The owner customizes provider subscriptions, so the panel speaks about what a client gets and for how much. A plan is a derived internal row (created, named and removed with its builder), which removes the "pick a plan" step and leftover test plans from the tariff editor. Notifications are woken by the monitor instead of waiting for a timer |
 
 ---
 

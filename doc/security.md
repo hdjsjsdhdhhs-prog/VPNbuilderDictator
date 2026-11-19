@@ -1,4 +1,4 @@
-# Security Policy — rs8kvn_bot
+# Security Policy — DictatorVPN
 
 ---
 

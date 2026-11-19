@@ -1,4 +1,4 @@
-# Installation and Setup of rs8kvn_bot
+# Installation and Setup of DictatorVPN
 
 ## Requirements
 

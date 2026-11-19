@@ -7,7 +7,7 @@
   покупки. Тариф с ценой 0 или покупка со скидкой 100 % выдаются без платёжного
   провайдера.
 * **Операционные уведомления** — лента событий инфраструктуры (серверы, страны,
-  построители, источники) и ежедневный отчёт: раздел «События» в админке и
+  сборки, источники) и ежедневный отчёт: раздел «События» в админке и
   сообщения в Telegram.
 
 Документ описывает только то, что реализовано в коде. Источник истины — код,
@@ -25,7 +25,7 @@
 Подтверждение оплаты ──► ConfirmOrderPaidCAS ──► redeemOrderDiscount (скидка погашена)
 
 netmon (outages, Overview), provider_sources (только чтение)
-   ──► scheduler.OpsWorker (тик 1 мин) ──► service.OpsService.Tick
+   ──► scheduler.OpsWorker (тик 1 мин + пробуждение после каждого круга монитора) ──► service.OpsService.Tick
          outages → builders → sources → report → deliver → prune
    ──► ops_events / ops_states ──► OpsTelegramSender ──► Telegram Bot API
 
@@ -132,13 +132,18 @@ Admin UI (frontend/admin/src/ops-ui.ts, ops.ts)
 ### Проход воркера (`OpsService.Tick`)
 
 `scheduler.OpsWorker` запускает проход раз в минуту (первый — через 45 секунд
-после старта, бюджет прохода 50 секунд). Шаги независимы: сбой одного попадает
+после старта, бюджет прохода 50 секунд) и сразу после каждого завершённого круга
+сетевого монитора: монитор вызывает `OpsService.RequestTick`
+(`netmon.SetAfterRound` в `cmd/bot/lifecycle.go`), поэтому сообщение о
+недоступном сервере уходит, как только монитор подтвердил сбой, а не по таймеру.
+Запросы на пробуждение склеиваются. Шаги независимы: сбой одного попадает
 в общую ошибку и не останавливает остальные.
 
 1. **outages** — сбои сетевого монитора превращаются в события: одно при
    открытии, одно при завершении. Глубина — 48 часов, но не раньше
    `baseline_at`, поэтому история до миграции не порождает уведомлений.
-2. **builders** — построитель полностью недоступен, восстановлен, отключён; его
+2. **builders** — сборка (Subscription Builder; в текстах уведомлений и в
+   админке — «сборка») полностью недоступна, восстановлена, отключена; её
    источники не загружаются; монитор не делал проверок 10 интервалов подряд.
 3. **sources** — источник истекает в ближайшие 72 часа, истёк, отключён, снова
    в работе. Первое наблюдение источника молчит, если он не требует внимания.
@@ -157,13 +162,13 @@ Admin UI (frontend/admin/src/ops-ui.ts, ops.ts)
 | Группа | Виды | Выключатель |
 | --- | --- | --- |
 | Серверы | `server_down`, `server_up`, `server_removed`, `monitor_stalled`, `monitor_recovered` | `notify_servers` |
-| Страны и построители | `country_down`, `country_degraded`, `country_up`, `country_removed`, `builder_down`, `builder_up`, `builder_disabled` | `notify_countries` |
+| Страны и сборки | `country_down`, `country_degraded`, `country_up`, `country_removed`, `builder_down`, `builder_up`, `builder_disabled` | `notify_countries` |
 | Источники | `source_failing`, `source_recovered`, `source_expiring`, `source_expired`, `source_disabled` | `notify_sources` |
 | Ежедневный отчёт | `daily_report` | `daily_report` |
 | Проверка из панели | `test` | — (отправляется сразу) |
 
 Вид `builder_degraded` объявлен в `database/ops.go`, но сервис его не создаёт:
-частичные сбои построителя сообщаются по странам.
+частичные сбои сборки сообщаются по странам.
 
 Важность: `ok`, `info`, `warning`, `critical`. Событие выключенной группы всё
 равно попадает в ленту, но со статусом `skipped`. Если уведомления выключены

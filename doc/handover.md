@@ -329,7 +329,7 @@ All tests pass with `-race` detector. Fuzzing enabled for critical functions.
 - **Builder resolution:** `ResolveSubscriptionBuilder` picks `subscriptions.subscription_builder_id`, otherwise the plan default (`plans.subscription_builder_id`); a disabled or dangling builder is skipped.
 - **Sources:** `provider_sources` hold URL, format and headers (server-side only). The stored catalogue (`provider_source_entries`) only enriches entries; live upstream data is authoritative. An optional validity end (`expires_at`, migration 052) takes a source out of `/sub`, preview and monitoring once it passes, exactly like disabling it.
 - **Resilience:** a failing source is skipped; if no source can be fetched the request fails with `ErrProviderSourceUnavailable`. Fetch errors never contain upstream URLs or credentials.
-- **Configuration:** ProviderSources, Builders and their rules are managed in the admin UI/API. A source or a builder can be deleted there only while nothing depends on it (builders/subscriptions for a source, plans/subscription overrides for a builder); otherwise it can only be switched off.
+- **Configuration:** ProviderSources and Builders («сборки» in the admin panel) are managed in the admin UI/API. A сборка is edited on one page: sources, composition, names and price. Plans are internal: a tariff is sold on a builder (`builder_id`) and its sale plan is created, named and removed automatically (`database/builder_plans.go`). A source or a builder can be deleted only while nothing depends on it (builders/subscriptions for a source; a system plan, a sale plan with tariffs or subscriptions, or a subscription override for a builder); otherwise it can only be switched off.
 
 ### Subscription Flow
 - **Trial:** `/i/{code}` → IP rate limit (3/hour) → DB trial record (negative telegram_id) → user clicks link in Telegram → `BindTrialSubscription` sets telegram_id (из отрицательного в реальный), sets referred_by if from invite
@@ -351,7 +351,7 @@ All tests pass with `-race` detector. Fuzzing enabled for critical functions.
 ### Promo Codes, Free Tariffs and Ops Notifications (migration 053)
 - **Discounts:** `RequestPayment` charges the catalogue price lowered by the customer's best unredeemed discount (`user_discounts`); the discount is recorded on the pending order (`order_discounts`) and redeemed inside `ConfirmOrderPaidCAS`. A pending order created for another amount is expired and replaced.
 - **Nothing to pay:** a free tariff (price 0) or a 100 % discount makes `RequestPayment` return `ErrNothingToPay`; the tariff is granted by `OrderService.ActivateFree` (order with amount 0, `payment_provider = 'free'`). A free tariff is refused while the same tariff is running or a paid term is active.
-- **Ops notifications:** `scheduler.OpsWorker` runs `OpsService.Tick` every minute — monitor outages, builder and source state changes and a daily report (Moscow time) become `ops_events`, delivered to Telegram in batches. Best-effort: it never affects subscriptions, payments or `/sub`.
+- **Ops notifications:** `scheduler.OpsWorker` runs `OpsService.Tick` every minute and right after every network monitor round (`netmon.SetAfterRound` → `OpsService.RequestTick`) — monitor outages, builder and source state changes and a daily report (Moscow time) become `ops_events`, delivered to Telegram in batches. Best-effort: it never affects subscriptions, payments or `/sub`.
 - **Admin:** promo codes under `/admin/api/promos`, settings/feed/report/test under `/admin/api/ops`. Details: `doc/promo-ops.md`.
 
 ### Subscription Deletion
@@ -383,7 +383,7 @@ All tests pass with `-race` detector. Fuzzing enabled for critical functions.
 - **trial_requests cleanup:** 1-hour cutoff (matching rate-limit window) + 1s buffer to avoid boundary race
 - **Connection pool:** `MaxOpenConns=1` (SQLite single-writer), `MaxIdle=1`, `ConnMaxLifetime=5m`
 - **Orders:** `orders` table tracks payment lifecycle: pending → paid → expired/canceled. Statuses enforced via CHECK constraint (created with the table, migration 017 — effective, unlike the ALTER-based retry CHECK from 025). Payment window is provider-defined by Platega `expiresIn` and stored as absolute `payment_expires_at`; a new `RequestPayment` after that timestamp terminalizes the pending order as `expired`, while a late `CONFIRMED` for an `expired`/`canceled` order never activates it and is handled as manual review.
-- **Plans:** `plans` table (name, default builder reference) and `products` (duration, price). Builders and ProviderSources live in the `subscription_builders*` and `provider_sources*` tables.
+- **Plans:** `plans` table (name, default builder reference) and `products` (duration, price). Besides the system `free`/`trial` plans, a plan is the internal sale plan of one builder and is not shown in the admin panel. Builders and ProviderSources live in the `subscription_builders*` and `provider_sources*` tables.
 - **Devices tracking:** `subscriptions.devices` column stores JSON array of client request header maps (HWID, Device-OS, etc.). `ips` column stores IP→timestamp entries. `last_request` column (*time, indexed) records the last time a client fetched its subscription via `/sub/{id}` (best-effort, updated on both cache hit and cache miss).
 
 ### Configuration

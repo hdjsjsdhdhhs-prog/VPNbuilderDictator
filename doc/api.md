@@ -1,4 +1,4 @@
-# API Reference — rs8kvn_bot
+# API Reference — DictatorVPN
 
 **Base URL:** `http://localhost:8880` (configurable via `WEB_SERVER_PORT`)
 
