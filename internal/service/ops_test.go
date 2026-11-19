@@ -193,6 +193,46 @@ func TestOpsTick_OutagesBecomeBatchedAlerts(t *testing.T) {
 	assert.Len(t, kinds, 5, "no close event for a changed outage")
 }
 
+// A server is checked once however many сборки hand it out, and the monitor
+// stores its outage without a country: the alert names every affected сборка
+// and takes the country from where the server is listed.
+func TestOpsTick_ServerAlertNamesEveryBuilderAndTheCountry(t *testing.T) {
+	t.Parallel()
+	f := newOpsFixture(t)
+	f.settings(func(in *database.OpsSettingsInput) { in.DailyReport = false; in.NotifyCountries = false })
+	gdb := f.db.GetDB()
+	seen := f.now.Add(-time.Hour)
+	target := &database.MonitorTarget{EndpointKey: "vless|us1.example.com|443", Protocol: "vless", Host: "us1.example.com", Port: 443, Probe: "tls", Active: true, Status: "down", FirstSeenAt: seen, LastSeenAt: seen}
+	require.NoError(t, gdb.Create(target).Error)
+	for i, name := range []string{"Америка", "Все страны", "Стриминг", "Игры", "Старая"} {
+		builder := &database.SubscriptionBuilder{Name: name, Enabled: true, Version: 1}
+		require.NoError(t, gdb.Create(builder).Error)
+		// «Старая» no longer serves the server: it is not affected.
+		require.NoError(t, gdb.Create(&database.MonitorBinding{
+			BuilderID: builder.ID, BuilderName: name, SourceID: 1, Fingerprint: "fp-us", TargetID: target.ID, CountryCode: "US",
+			NodeName: "🇺🇸 Dallas", Active: name != "Старая", FirstSeenAt: seen, LastSeenAt: seen.Add(time.Duration(i) * time.Second),
+		}).Error)
+	}
+	started := f.now.Add(-3 * time.Minute)
+	outage := &database.MonitorOutage{Scope: database.MonitorScopeTarget, TargetID: &target.ID, Kind: database.MonitorOutageDown, StartedAt: started, ErrorCode: "refused"}
+	require.NoError(t, gdb.Create(outage).Error)
+
+	require.NoError(t, f.svc.Tick(f.ctx))
+	events := f.events()
+	require.Len(t, events, 1)
+	assert.Equal(t, "🇺🇸 Dallas (vless us1.example.com:443) · сборки «Америка», «Все страны», «Стриминг» и ещё 1 · US · причина: соединение отклонено", events[0].Message)
+	assert.Equal(t, "US", events[0].CountryCode, "the feed can be filtered by the country of the server")
+	assert.NotContains(t, events[0].Message, "без страны")
+
+	ended := f.now
+	require.NoError(t, gdb.Model(&database.MonitorOutage{}).Where("id = ?", outage.ID).
+		Updates(map[string]any{"ended_at": ended, "end_reason": database.MonitorEndRecovered}).Error)
+	require.NoError(t, f.svc.Tick(f.ctx))
+	events = f.events()
+	require.Len(t, events, 2)
+	assert.Equal(t, "🇺🇸 Dallas (vless us1.example.com:443) · сборки «Америка», «Все страны», «Стриминг» и ещё 1 · US · простой 3 мин", events[1].Message)
+}
+
 func TestOpsTick_HistoryBeforeBaselineIsSilent(t *testing.T) {
 	t.Parallel()
 	f := newOpsFixture(t)
@@ -299,7 +339,7 @@ func TestOpsTick_BuildersAndSources(t *testing.T) {
 		database.OpsKindMonitorStalled, database.OpsKindSourceExpired, database.OpsKindSourceDisabled,
 	}, f.kinds())
 	last := f.sender.texts()[len(f.sender.texts())-1]
-	assert.Contains(t, last, "🔴 <b>Построитель недоступен</b>")
+	assert.Contains(t, last, "🔴 <b>Сборка недоступна</b>")
 	assert.Contains(t, last, "🔴 <b>Срок источника истёк</b>")
 	assert.Contains(t, last, "Мониторинг не проверяет серверы")
 

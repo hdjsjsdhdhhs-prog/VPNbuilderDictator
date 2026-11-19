@@ -98,6 +98,8 @@ func isXrayFullConfig(raw json.RawMessage) bool {
 // The identity covers protocol, address, port and transport of every proxy
 // outbound; credentials (ids, passwords, reality keys, auth) are excluded so
 // it survives renames, credential rotation and reordering of the response.
+// A config with several servers inside (a balancer) is identified by its name
+// instead: its members are rotated by the provider.
 func parseXrayFullConfig(raw json.RawMessage) (xrayConfigInfo, bool) {
 	if !isXrayFullConfig(raw) {
 		return xrayConfigInfo{}, false
@@ -133,7 +135,6 @@ func parseXrayFullConfig(raw json.RawMessage) (xrayConfigInfo, bool) {
 
 	sort.Strings(identities)
 	identities = dedupeSorted(identities)
-	sum := sha256.Sum256([]byte("v1|xray|" + strings.Join(identities, "\n")))
 
 	name := cfg.Remarks
 	if name == "" {
@@ -142,6 +143,18 @@ func parseXrayFullConfig(raw json.RawMessage) (xrayConfigInfo, bool) {
 	if name == "" {
 		name = cfg.Ps
 	}
+
+	identity := "v1|xray|" + strings.Join(identities, "\n")
+	if len(identities) > 1 && strings.TrimSpace(name) != "" {
+		// Several servers inside one config is a balancer. Providers rotate
+		// its members between requests (for example a "decoy" picked from the
+		// other servers of the subscription), so the outbounds are not an
+		// identity: the fingerprint would change on every fetch and a rule on
+		// such a server would only survive through the name fallback. The
+		// name is what stays, so it is the identity.
+		identity = "v1|xray-group|" + name
+	}
+	sum := sha256.Sum256([]byte(identity))
 
 	return xrayConfigInfo{name: name, protocol: primary, fingerprint: hex.EncodeToString(sum[:])}, true
 }
@@ -165,7 +178,7 @@ func xrayOutboundIdentities(ob *xrayOutbound, protocol string) []string {
 		sni = ss.TLSSettings.ServerName
 	}
 	transport := strings.Join([]string{
-		"net=" + ss.Network, "security=" + ss.Security, "sni=" + sni,
+		"net=" + ss.Network, "security=" + ss.Security, "sni=" + identitySNI(ss.Security, sni),
 		"path=" + firstNonEmpty(ss.WSSettings.Path, ss.XHTTPSettings.Path, ss.HTTPUpgradeSettings.Path),
 		"host=" + firstNonEmpty(ss.WSSettings.Host, ss.XHTTPSettings.Host, ss.HTTPUpgradeSettings.Host),
 		"serviceName=" + ss.GRPCSettings.ServiceName, "mode=" + ss.XHTTPSettings.Mode,
@@ -304,7 +317,35 @@ func xrayPrimaryLink(raw json.RawMessage, name string) (string, bool) {
 	if primary == nil {
 		return "", false
 	}
+	return xrayOutboundLink(primary, name)
+}
 
+// xrayOutboundLinks expresses every proxy outbound of a full Xray config as a
+// share link (outbounds that have no link form are left out). The network
+// monitor uses it to see every server of a balancing config; the links are
+// reduced to credential-free endpoints right away and never served.
+func xrayOutboundLinks(raw json.RawMessage) []string {
+	var cfg struct {
+		Outbounds []xrayLinkOutbound `json:"outbounds"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &cfg); err != nil {
+		return nil
+	}
+	var links []string
+	for i := range cfg.Outbounds {
+		ob := &cfg.Outbounds[i]
+		if xrayNonProxyProtocols[normalizeProtocol(ob.Protocol)] || ob.Protocol == "" {
+			continue
+		}
+		if link, ok := xrayOutboundLink(ob, ""); ok {
+			links = append(links, link)
+		}
+	}
+	return links
+}
+
+// xrayOutboundLink expresses one proxy outbound as a share link.
+func xrayOutboundLink(primary *xrayLinkOutbound, name string) (string, bool) {
 	ss := &primary.StreamSettings
 	sc := &serverConfig{
 		Remark:   name,

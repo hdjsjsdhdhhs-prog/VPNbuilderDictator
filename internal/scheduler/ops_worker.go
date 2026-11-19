@@ -11,7 +11,8 @@ import (
 )
 
 // opsWorkerInterval is how often infrastructure events are collected and
-// delivered. The daily report is checked on the same tick.
+// delivered when nothing wakes the worker earlier (the network monitor wakes
+// it after every check round). The daily report is checked on the same tick.
 const opsWorkerInterval = time.Minute
 
 // opsWorkerBudget bounds one pass, so a slow Telegram cannot overlap ticks.
@@ -24,6 +25,8 @@ const opsWorkerStartDelay = 45 * time.Second
 // opsTicker is the narrow contract the worker needs from OpsService.
 type opsTicker interface {
 	Tick(ctx context.Context) error
+	// Wake signals that a pass is wanted right now.
+	Wake() <-chan struct{}
 }
 
 var _ opsTicker = (*service.OpsService)(nil)
@@ -62,9 +65,17 @@ func (w *OpsWorker) Run(ctx context.Context) {
 	ticker := time.NewTicker(opsWorkerInterval)
 	defer ticker.Stop()
 
+	// A nil channel never fires: without a service only the timer runs.
+	var wake <-chan struct{}
+	if w.ops != nil {
+		wake = w.ops.Wake()
+	}
+
 	for {
 		select {
 		case <-ticker.C:
+			w.process(ctx)
+		case <-wake:
 			w.process(ctx)
 		case <-ctx.Done():
 			logger.Info("Ops worker stopped")

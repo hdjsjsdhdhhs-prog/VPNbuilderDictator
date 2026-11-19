@@ -62,6 +62,8 @@ type BuilderRepository interface {
 	SourceDependentsFor(ctx context.Context, sourceID uint) (database.SourceDependents, error)
 	BuilderDependentsAll(ctx context.Context) (map[uint]database.BuilderDependents, error)
 	BuilderDependentsFor(ctx context.Context, builderID uint) (database.BuilderDependents, error)
+	BuilderSalesAll(ctx context.Context) (map[uint]database.BuilderSales, error)
+	BuilderSalesFor(ctx context.Context, builderID uint) (database.BuilderSales, error)
 	DeleteProviderSource(ctx context.Context, meta database.AdminConfigMeta, id uint) (*database.AdminConfigResult, error)
 	DeleteBuilder(ctx context.Context, meta database.AdminConfigMeta, id uint, version int) (*database.AdminConfigResult, error)
 }
@@ -194,8 +196,11 @@ type BuilderView struct {
 	// is, subscriptions overriding their plan with it); it can be deleted only
 	// while both are empty.
 	Dependents database.BuilderDependents `json:"dependents"`
-	CreatedAt  time.Time                  `json:"created_at"`
-	UpdatedAt  time.Time                  `json:"updated_at"`
+	// Sales is how the builder is sold: its internal sale plan (created with
+	// the first tariff) and the active subscriptions it serves.
+	Sales     database.BuilderSales `json:"sales"`
+	CreatedAt time.Time             `json:"created_at"`
+	UpdatedAt time.Time             `json:"updated_at"`
 }
 
 // BuilderSourceView is one source slot in a builder.
@@ -345,11 +350,19 @@ type UpdateSourceInput struct {
 	// clears the limit).
 	ExpiresAtSet bool
 	ExpiresAt    *time.Time
+	// Fetch configuration. nil keeps the stored value; a value replaces it
+	// (providers rotate subscription links, so the URL must be replaceable).
+	// These are write-only: they are validated like on create and never
+	// returned to the browser.
+	SubscriptionURL *string
+	HWID            *string
+	UserAgent       *string
+	Headers         *string
 }
 
-// UpdateSource updates the non-credential metadata of a provider source and,
-// when requested, its validity end. Credentials are NOT updated here — they
-// are managed out-of-band.
+// UpdateSource updates the metadata of a provider source, its validity end
+// and, when given, its fetch configuration (URL, HWID, User-Agent, headers).
+// The catalogue is not refreshed here: the caller syncs the source afterwards.
 func (s *BuilderService) UpdateSource(ctx context.Context, id uint, in UpdateSourceInput) (*SourceView, error) {
 	name, format, err := validateSourceMeta(in.Name, in.Type)
 	if err != nil {
@@ -372,14 +385,40 @@ func (s *BuilderService) UpdateSource(ctx context.Context, id uint, in UpdateSou
 			}
 		}
 	}
+	next := *current
+	changed := false
+	replace := func(dst *string, value *string) {
+		if value == nil {
+			return
+		}
+		if trimmed := strings.TrimSpace(*value); trimmed != *dst {
+			*dst, changed = trimmed, true
+		}
+	}
+	replace(&next.SubscriptionURL, in.SubscriptionURL)
+	replace(&next.HWID, in.HWID)
+	replace(&next.UserAgent, in.UserAgent)
+	if in.Headers != nil {
+		headers := strings.TrimSpace(*in.Headers)
+		if headers == "" {
+			headers = "{}"
+		}
+		replace(&next.Headers, &headers)
+	}
+	if changed {
+		err = validateSourceRequest(next)
+		if err != nil {
+			return nil, err
+		}
+	}
 	updated, err := s.repo.UpdateProviderSource(ctx, id, database.ProviderSourceUpdateInput{
 		Name:            name,
 		Description:     strings.TrimSpace(in.Description),
 		Type:            format,
-		SubscriptionURL: current.SubscriptionURL,
-		HWID:            current.HWID,
-		UserAgent:       current.UserAgent,
-		Headers:         current.Headers,
+		SubscriptionURL: next.SubscriptionURL,
+		HWID:            next.HWID,
+		UserAgent:       next.UserAgent,
+		Headers:         next.Headers,
 		ExpiresAt:       expiresAt,
 	})
 	if err != nil {
@@ -426,12 +465,17 @@ func (s *BuilderService) ListBuilders(ctx context.Context) ([]BuilderView, error
 	if err != nil {
 		return nil, fmt.Errorf("list builders: %w", err)
 	}
+	sales, err := s.repo.BuilderSalesAll(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list builders: %w", err)
+	}
 	views := make([]BuilderView, 0, len(builders))
 	for i := range builders {
 		v := builderViewOf(&builders[i])
 		if d, ok := deps[builders[i].ID]; ok {
 			v.Dependents = d
 		}
+		v.Sales = sales[builders[i].ID]
 		views = append(views, v)
 	}
 	return views, nil
@@ -445,6 +489,11 @@ func (s *BuilderService) builderView(ctx context.Context, b *database.Subscripti
 		return nil, fmt.Errorf("builder dependents: %w", err)
 	}
 	v.Dependents = deps
+	sales, err := s.repo.BuilderSalesFor(ctx, b.ID)
+	if err != nil {
+		return nil, fmt.Errorf("builder sales: %w", err)
+	}
+	v.Sales = sales
 	return &v, nil
 }
 
@@ -749,7 +798,10 @@ func validateSourceRequest(src database.ProviderSource) error {
 		return &SourceFieldError{Field: "subscription_url"}
 	}
 	probe := src
+	// Only the fetch configuration is checked here: a switched-off or expired
+	// source may still have its link replaced.
 	probe.Enabled = true
+	probe.ExpiresAt = nil
 	if _, _, err := probe.RequestConfiguration(); err != nil {
 		if raw := strings.TrimSpace(src.Headers); raw != "" && raw != "{}" {
 			var headers map[string]string

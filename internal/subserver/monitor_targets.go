@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"net"
 	"net/url"
 	"sort"
@@ -140,6 +141,7 @@ func ResolveMonitorBuilders(ctx context.Context, db interfaces.SubscriptionRepos
 
 	// Parse each fetched source once; builders share the parsed entries.
 	parsedByID := make(map[uint]builderSource, len(order))
+	serversByID := make(map[uint]map[string]bool, len(order))
 	for _, id := range order {
 		f := fetched[id]
 		if f.resp == nil {
@@ -151,6 +153,7 @@ func ResolveMonitorBuilders(ctx context.Context, db interfaces.SubscriptionRepos
 		}
 		if len(parsed) == 1 {
 			parsedByID[id] = parsed[0]
+			serversByID[id] = singleServerAddresses(parsed[0].entries)
 		}
 	}
 
@@ -175,7 +178,7 @@ func ResolveMonitorBuilders(ctx context.Context, db interfaces.SubscriptionRepos
 		}
 		if len(parsed) > 0 {
 			for _, pick := range selectBuilderEntries(monitorSubID, b, parsed) {
-				ep, ok := monitorEndpointOf(pick.entry)
+				ep, ok := monitorEndpointOf(pick.entry, serversByID[pick.entry.sourceID])
 				if !ok {
 					mb.Unresolved++
 					continue
@@ -203,14 +206,102 @@ func BuilderConfigSignature(b *database.SubscriptionBuilder) string {
 	return builderCacheKey(monitorSubID, b)
 }
 
-// monitorEndpointOf reduces a selected entry to its endpoint. Full Xray
-// configs are checked through their primary outbound (the one served as a
-// share link); a config without one cannot be resolved.
-func monitorEndpointOf(e builderEntry) (MonitorEndpoint, bool) {
+// monitorEndpointOf reduces a selected entry to its endpoint. A full Xray
+// config with one server is checked through that outbound (the one served as
+// a share link); a config without one cannot be resolved.
+//
+// A config with several servers inside is a balancer: the client application
+// picks a working member, so no single member says whether the config works,
+// and providers rotate the members between requests (a "decoy" taken from the
+// other servers of the subscription). Checking the first member would report
+// somebody else's server under this name — and a different one after every
+// re-read of the source. Such a config is checked only through a member of
+// its own: one that is not a server of the same subscription by itself
+// (servers lists those). That member does not rotate and is what the config
+// exists for. Without exactly one such member the config is not checked; its
+// members that are servers of the subscription are checked under their own
+// names anyway.
+func monitorEndpointOf(e builderEntry, servers map[string]bool) (MonitorEndpoint, bool) {
+	if e.xray {
+		members := xrayOutboundEndpoints(e.raw)
+		if len(members) > 1 {
+			var own []MonitorEndpoint
+			for _, ep := range members {
+				if !servers[endpointAddress(ep)] {
+					own = append(own, ep)
+				}
+			}
+			if len(own) == 1 {
+				// Even this member is not always the same: a provider may hand
+				// a "section" entry (a heading such as «⬇️ Обходы белых списков
+				// ⬇️») a random member of its pool on every request. The
+				// identity of such a config is the config itself, exactly as
+				// for its fingerprint: the target key comes from the source
+				// and the entry, and the address to check is whatever the
+				// latest answer holds. A rotation moves the probe, not the
+				// target, so history and open outages continue and nothing is
+				// reported as removed.
+				ep := own[0]
+				ep.Key = balancerKey(e.sourceID, e.fingerprint)
+				return ep, true
+			}
+			return MonitorEndpoint{}, false
+		}
+	}
 	if e.link == "" {
 		return MonitorEndpoint{}, false
 	}
 	return MonitorEndpointFromLink(e.link)
+}
+
+// balancerKey is the target key of a config with several servers inside: it
+// identifies the entry of a source, not any address that entry points to.
+func balancerKey(sourceID uint, fingerprint string) string {
+	sum := sha256.Sum256([]byte("v1|netmon-group|" + strconv.FormatUint(uint64(sourceID), 10) + "|" + fingerprint))
+	return hex.EncodeToString(sum[:])
+}
+
+func endpointAddress(ep MonitorEndpoint) string {
+	return net.JoinHostPort(ep.Host, strconv.Itoa(ep.Port))
+}
+
+// xrayOutboundEndpoints returns the endpoints of every proxy outbound of a
+// full Xray config, one per distinct address.
+func xrayOutboundEndpoints(raw json.RawMessage) []MonitorEndpoint {
+	var out []MonitorEndpoint
+	seen := make(map[string]bool)
+	for _, link := range xrayOutboundLinks(raw) {
+		ep, ok := MonitorEndpointFromLink(link)
+		if !ok {
+			continue
+		}
+		addr := endpointAddress(ep)
+		if seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		out = append(out, ep)
+	}
+	return out
+}
+
+// singleServerAddresses collects the address of every entry of a source that
+// is one server by itself: a share link or a full Xray config with a single
+// server inside.
+func singleServerAddresses(entries []builderEntry) map[string]bool {
+	out := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if e.xray {
+			if members := xrayOutboundEndpoints(e.raw); len(members) == 1 {
+				out[endpointAddress(members[0])] = true
+			}
+			continue
+		}
+		if ep, ok := MonitorEndpointFromLink(e.link); ok {
+			out[endpointAddress(ep)] = true
+		}
+	}
+	return out
 }
 
 // MonitorEndpointFromLink parses a share link into its endpoint. The link
@@ -254,9 +345,12 @@ func MonitorEndpointFromLink(link string) (MonitorEndpoint, bool) {
 func endpointKey(ep MonitorEndpoint) string {
 	alpn := append([]string(nil), ep.ALPN...)
 	sort.Strings(alpn)
+	// A Reality listener accepts many camouflage names and providers rotate
+	// them between requests: the name is used for the handshake but does not
+	// make another target (identitySNI).
 	identity := strings.Join([]string{
 		"v1", "netmon", ep.Protocol, ep.Host, strconv.Itoa(ep.Port), ep.Security, ep.Transport,
-		strings.ToLower(ep.SNI), strings.Join(alpn, ","), ep.Obfs, ep.Probe,
+		strings.ToLower(identitySNI(ep.Security, ep.SNI)), strings.Join(alpn, ","), ep.Obfs, ep.Probe,
 	}, "|")
 	sum := sha256.Sum256([]byte(identity))
 	return hex.EncodeToString(sum[:])

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -408,7 +409,11 @@ type OpsOutage struct {
 	MonitorOutage
 
 	BuilderName string
-	NodeName    string
+	// BuilderNames lists every builder that serves the server of a target
+	// outage (a server is checked once however many builders hand it out);
+	// the last known builder when none serves it any more.
+	BuilderNames []string
+	NodeName     string
 	Host        string
 	Port        int
 	Protocol    string
@@ -442,6 +447,8 @@ func (s *Service) ListOpsOutages(ctx context.Context, since time.Time, limit int
 	targets := map[uint]MonitorTarget{}
 	nodeNames := map[uint]string{}
 	targetBuilders := map[uint]string{}
+	targetCountries := map[uint]string{}
+	servedBy := map[uint][]string{}
 	if len(targetIDs) > 0 {
 		var rows []MonitorTarget
 		err := s.db.WithContext(ctx).Where("id IN ?", targetIDs).Find(&rows).Error
@@ -452,7 +459,7 @@ func (s *Service) ListOpsOutages(ctx context.Context, since time.Time, limit int
 			targets[t.ID] = t
 		}
 		var bindings []MonitorBinding
-		err = s.db.WithContext(ctx).Where("target_id IN ?", targetIDs).Order("active ASC, last_seen_at ASC").Find(&bindings).Error
+		err = s.db.WithContext(ctx).Where("target_id IN ?", targetIDs).Order("active ASC, last_seen_at ASC, id ASC").Find(&bindings).Error
 		if err != nil {
 			return nil, fmt.Errorf("load outage bindings: %w", err)
 		}
@@ -460,6 +467,10 @@ func (s *Service) ListOpsOutages(ctx context.Context, since time.Time, limit int
 		for _, b := range bindings {
 			nodeNames[b.TargetID] = b.NodeName
 			targetBuilders[b.TargetID] = b.BuilderName
+			targetCountries[b.TargetID] = b.CountryCode
+			if b.Active && b.BuilderName != "" && !slices.Contains(servedBy[b.TargetID], b.BuilderName) {
+				servedBy[b.TargetID] = append(servedBy[b.TargetID], b.BuilderName)
+			}
 		}
 	}
 	builders := map[uint]string{}
@@ -485,6 +496,15 @@ func (s *Service) ListOpsOutages(ctx context.Context, since time.Time, limit int
 			row.NodeName = nodeNames[*o.TargetID]
 			if row.BuilderName == "" {
 				row.BuilderName = targetBuilders[*o.TargetID]
+			}
+			row.BuilderNames = servedBy[*o.TargetID]
+			if len(row.BuilderNames) == 0 && row.BuilderName != "" {
+				row.BuilderNames = []string{row.BuilderName}
+			}
+			// A target outage has no country of its own: the server's country
+			// is the one its builders list it under.
+			if row.CountryCode == "" {
+				row.CountryCode = targetCountries[*o.TargetID]
 			}
 		}
 		out = append(out, row)

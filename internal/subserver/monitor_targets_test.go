@@ -102,7 +102,25 @@ func TestMonitorEndpointKey_IgnoresCredentialsAndName(t *testing.T) {
 	require.True(t, ok)
 
 	assert.Equal(t, a.Key, b.Key, "same endpoint with other credentials/name is one check")
-	assert.NotEqual(t, a.Key, c.Key, "another SNI is another handshake")
+	// A Reality listener accepts many camouflage names and providers hand out
+	// a random one per request: it is the same target (its history and its
+	// outage continue), probed with the name of the latest answer.
+	assert.Equal(t, a.Key, c.Key, "another Reality SNI is the same server")
+	assert.Equal(t, "other.example.com", c.SNI)
+	assert.Equal(t,
+		EntryFingerprint("vless://"+monUUID+"@h.example.com:443?security=reality&sni=s.example.com&type=tcp#A"),
+		EntryFingerprint("vless://"+monUUID+"@h.example.com:443?security=reality&sni=other.example.com&type=tcp#A"),
+		"and the same catalogue entry")
+
+	// Behind TLS the SNI selects the server (CDN fronting): another target.
+	d, ok := MonitorEndpointFromLink("vless://" + monUUID + "@cdn.example.com:443?security=tls&sni=one.example.com&type=ws#A")
+	require.True(t, ok)
+	e, ok := MonitorEndpointFromLink("vless://" + monUUID + "@cdn.example.com:443?security=tls&sni=two.example.com&type=ws#A")
+	require.True(t, ok)
+	assert.NotEqual(t, d.Key, e.Key, "another TLS SNI is another handshake")
+	assert.NotEqual(t,
+		EntryFingerprint("vless://"+monUUID+"@cdn.example.com:443?security=tls&sni=one.example.com&type=ws#A"),
+		EntryFingerprint("vless://"+monUUID+"@cdn.example.com:443?security=tls&sni=two.example.com&type=ws#A"))
 }
 
 // switchingUpstream serves a body that can change between resolutions.
@@ -246,4 +264,81 @@ func TestBuilderConfigSignature_ChangesWithConfiguration(t *testing.T) {
 	b.Items[0].CountryCode = "DE"
 	s.Enabled = false
 	assert.NotEqual(t, base, BuilderConfigSignature(b), "source disabled")
+}
+
+// rotateXrayMember replaces an address inside the config called name: what a
+// provider does when it picks another decoy member for the next request.
+func rotateXrayMember(t *testing.T, body []byte, name, from, to string) []byte {
+	t.Helper()
+	var configs []json.RawMessage
+	require.NoError(t, json.Unmarshal(body, &configs))
+	rotated := false
+	for i, raw := range configs {
+		if info, ok := parseXrayFullConfig(raw); ok && info.name == name {
+			require.Contains(t, string(raw), `"`+from+`"`)
+			configs[i] = json.RawMessage(strings.ReplaceAll(string(raw), `"`+from+`"`, `"`+to+`"`))
+			rotated = true
+		}
+	}
+	require.True(t, rotated, name)
+	out, err := json.Marshal(configs)
+	require.NoError(t, err)
+	return out
+}
+
+// Balancing configs of a real provider response (testdata, see
+// catalogue_test.go): a white-list config holds a "decoy" — another server of
+// the same subscription, a different one on every request — and a member of
+// its own. It is checked through its own member only, so its target does not
+// move with the decoy and never reports somebody else's server under its
+// name. The "auto" config balances 13 servers of the subscription and has
+// nothing of its own: it is not checked (its members are, as themselves).
+func TestResolveMonitorBuilders_BalancerIsCheckedThroughItsOwnMember(t *testing.T) {
+	t.Parallel()
+
+	const (
+		whiteList = "🇩🇪⚪Германия (БС-5)☁️"
+		auto      = "🇪🇺 🚀Авто | Лучший сервер ⚡⚡"
+	)
+	fixture := loadXrayFixture(t)
+	up := newSwitchingUpstream(t, string(fixture))
+	b := testBuilder(3, []*database.ProviderSource{testSource(1, up.srv.URL)})
+	db := monitorTestDB()
+
+	resolve := func() (MonitorBuilder, map[string]MonitorNode) {
+		got, err := ResolveMonitorBuilders(context.Background(), db, []database.SubscriptionBuilder{*b})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		byName := make(map[string]MonitorNode, len(got[0].Nodes))
+		for _, n := range got[0].Nodes {
+			byName[n.Name] = n
+		}
+		return got[0], byName
+	}
+
+	first, nodes := resolve()
+	assert.Empty(t, first.SourceErrors)
+	assert.Equal(t, 1, first.Unresolved, "only the auto balancer has no member of its own")
+	assert.Len(t, first.Nodes, 39)
+	assert.NotContains(t, nodes, auto)
+
+	address := func(n MonitorNode) string { return endpointAddress(n.Endpoint) }
+	// A single server is checked at its own address, as before.
+	assert.Equal(t, "198.51.100.2:8443", address(nodes["🇫🇷⚡Франция"]))
+	// White-list configs: the member of their own, never the decoy.
+	assert.Equal(t, "198.51.100.27:443", address(nodes[whiteList]))
+	assert.Equal(t, "198.51.100.26:9443", address(nodes["🇹🇷⚪Турция (БС-3)☁️"]))
+	assert.Equal(t, "198.51.100.26:8443", address(nodes["🇹🇷⚪Турция (БС-4)☁️"]))
+	assert.Equal(t, "host36.example:10443", address(nodes["🇨🇭⚪Швейцария (БС-1)☁️"]))
+
+	// The next request carries another decoy: «Нидерланды» instead of the
+	// server at 198.51.100.9 (both listen on 443).
+	up.set(string(rotateXrayMember(t, fixture, whiteList, "198.51.100.9", "198.51.100.3")))
+	second, rotated := resolve()
+	assert.Equal(t, first.Unresolved, second.Unresolved)
+	assert.Len(t, second.Nodes, 39)
+	assert.Equal(t, "198.51.100.27:443", address(rotated[whiteList]))
+	assert.Equal(t, nodes[whiteList].Endpoint.Key, rotated[whiteList].Endpoint.Key, "the same target: its history and outages continue")
+	assert.Equal(t, nodes[whiteList].Fingerprint, rotated[whiteList].Fingerprint, "the same server for rules and bindings")
+	assert.Equal(t, "198.51.100.3:443", address(rotated["🇳🇱⚡Нидерланды"]), "the decoy is checked as the server it is")
 }

@@ -633,7 +633,20 @@ func applyBuilderHeaders(src map[string]string, b *database.SubscriptionBuilder)
 // fingerprintQueryKeys are the transport parameters that identify a server.
 // Credentials (uuid/password), reality keys and the display name are excluded
 // so the fingerprint survives renames and credential rotation.
+//
+// The SNI of a Reality server is not part of its identity either: it is the
+// camouflage name, one listener accepts many of them and providers hand out a
+// random one on every request (a wildcard like "*.mail.ru"). Behind TLS the
+// SNI does select the server (CDN fronting), so it stays there.
 var fingerprintQueryKeys = []string{"type", "security", "sni", "host", "path", "serviceName", "mode", "headerType"}
+
+// identitySNI is the SNI as far as it identifies a server (see above).
+func identitySNI(security, sni string) string {
+	if strings.EqualFold(strings.TrimSpace(security), "reality") {
+		return ""
+	}
+	return sni
+}
 
 // EntryFingerprint returns a stable, credential-free identity (sha256 hex) for
 // a share link: protocol, host, port and transport parameters.
@@ -692,7 +705,11 @@ func linkIdentity(link string) (string, bool) {
 	parts := []string{scheme, strings.ToLower(host), port}
 	q := u.Query()
 	for _, k := range fingerprintQueryKeys {
-		parts = append(parts, k+"="+q.Get(k))
+		value := q.Get(k)
+		if k == "sni" {
+			value = identitySNI(q.Get("security"), value)
+		}
+		parts = append(parts, k+"="+value)
 	}
 
 	return strings.Join(parts, "|"), true

@@ -21,6 +21,8 @@ import (
 
 type stubMonitor struct {
 	mu        sync.Mutex
+	checks    int
+	checkErr  error
 	builders  []uint
 	histories []netmon.HistoryQuery
 	detailErr error
@@ -29,6 +31,13 @@ type stubMonitor struct {
 
 func (m *stubMonitor) Overview(context.Context) (*netmon.Overview, error) {
 	return &netmon.Overview{Enabled: true, IntervalSeconds: 60, Builders: []netmon.BuilderSummary{{ID: 1, Name: "b", Status: "up"}}}, nil
+}
+
+func (m *stubMonitor) CheckNow(context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.checks++
+	return m.checkErr
 }
 
 func (m *stubMonitor) BuilderDetail(_ context.Context, id uint) (*netmon.BuilderDetail, error) {

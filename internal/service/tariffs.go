@@ -40,13 +40,16 @@ func NewTariffService(repo TariffRepository) *TariffService {
 
 // TariffView is the admin projection of a product.
 type TariffView struct {
-	ID            uint     `json:"id"`
-	OfferID       string   `json:"offer_id"`
-	Name          string   `json:"name"`
-	PlanID        uint     `json:"plan_id"`
-	PlanName      string   `json:"plan_name"`
-	PlanActive    bool     `json:"plan_active"`
-	BuilderID     *uint    `json:"builder_id"`
+	ID         uint   `json:"id"`
+	OfferID    string `json:"offer_id"`
+	Name       string `json:"name"`
+	PlanID     uint   `json:"plan_id"`
+	PlanName   string `json:"plan_name"`
+	PlanActive bool   `json:"plan_active"`
+	BuilderID  *uint  `json:"builder_id"`
+	// BuilderName is the builder ("сборка") the tariff sells; '' when the
+	// plan has none yet.
+	BuilderName   string   `json:"builder_name"`
 	DurationDays  int      `json:"duration_days"`
 	PriceCents    int64    `json:"price_cents"`
 	Currency      string   `json:"currency"`
@@ -71,7 +74,7 @@ type TariffView struct {
 func tariffViewOf(r *database.TariffRow) TariffView {
 	return TariffView{
 		ID: r.ID, OfferID: r.OfferID, Name: r.Name, PlanID: r.PlanID, PlanName: r.PlanName, PlanActive: r.PlanActive,
-		BuilderID: r.PlanBuilderID, DurationDays: r.DurationDays, PriceCents: r.PriceCents, Currency: r.Currency,
+		BuilderID: r.PlanBuilderID, BuilderName: r.PlanBuilderName, DurationDays: r.DurationDays, PriceCents: r.PriceCents, Currency: r.Currency,
 		IsActive: r.IsActive, Description: r.Description, Features: database.DecodeTariffFeatures(r.Features),
 		Badge: r.Badge, SortOrder: r.SortOrder, Version: r.Version, PreviousID: r.PreviousID,
 		ReplacedByID: r.ReplacedByID, Orders: r.Orders, Subscriptions: r.Subscriptions, InUse: r.InUse(),
@@ -106,8 +109,11 @@ type TariffOutcome struct {
 
 // TariffInput is the editor payload before normalization.
 type TariffInput struct {
-	Name         string
-	PlanID       uint
+	Name   string
+	PlanID uint
+	// BuilderID sells the tariff on a builder: its plan is resolved by the
+	// repository (created on the first tariff). 0 keeps the explicit PlanID.
+	BuilderID    uint
 	DurationDays int
 	PriceCents   int64
 	Currency     string
@@ -129,7 +135,7 @@ func (in TariffInput) normalize() database.TariffInput {
 	}
 	description := strings.TrimSpace(strings.ReplaceAll(in.Description, "\r\n", "\n"))
 	return database.TariffInput{
-		Name: strings.TrimSpace(in.Name), PlanID: in.PlanID, DurationDays: in.DurationDays,
+		Name: strings.TrimSpace(in.Name), PlanID: in.PlanID, BuilderID: in.BuilderID, DurationDays: in.DurationDays,
 		PriceCents: in.PriceCents, Currency: strings.ToUpper(strings.TrimSpace(in.Currency)),
 		Description: description, Features: features, Badge: strings.TrimSpace(in.Badge),
 		SortOrder: in.SortOrder, IsActive: in.IsActive,

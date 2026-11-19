@@ -94,13 +94,30 @@ type OpsService struct {
 
 	mu        sync.Mutex
 	lastPrune time.Time
+
+	// wake asks the worker for a pass right now (one pending request at most).
+	wake chan struct{}
 }
 
 // NewOpsService wires the service. adminID is the default destination
 // (TELEGRAM_ADMIN_ID); monitor and sender may be nil (set later or absent).
 func NewOpsService(repo OpsRepository, monitor OpsMonitor, adminID int64) *OpsService {
-	return &OpsService{repo: repo, monitor: monitor, adminID: adminID, now: time.Now, loc: moscowLocation()}
+	return &OpsService{repo: repo, monitor: monitor, adminID: adminID, now: time.Now, loc: moscowLocation(), wake: make(chan struct{}, 1)}
 }
+
+// RequestTick asks the worker to run a pass right away instead of waiting for
+// its timer. The network monitor calls it after every check round, so a server
+// that went down is reported as soon as the monitor knows. Never blocks;
+// requests arriving while one is pending are merged.
+func (s *OpsService) RequestTick() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// Wake is the channel RequestTick signals.
+func (s *OpsService) Wake() <-chan struct{} { return s.wake }
 
 // moscowLocation is the report time zone; a fixed offset when the zone
 // database is unavailable (Moscow has no daylight saving time).
@@ -418,6 +435,44 @@ func opsServerName(o *database.OpsOutage) string {
 	return name
 }
 
+// opsServedByLimit is how many builder names a server alert spells out.
+const opsServedByLimit = 3
+
+// opsServerPlace says which server an alert is about and who is affected:
+// "🇩🇪 Berlin (vless host:443) · сборки «Европа», «Все страны» · DE". A server
+// is checked once however many builders hand it out, so every one is named;
+// a server without a country simply has no country part.
+func opsServerPlace(o *database.OpsOutage) string {
+	parts := []string{opsServerName(o)}
+	names := o.BuilderNames
+	if len(names) == 0 && strings.TrimSpace(o.BuilderName) != "" {
+		names = []string{o.BuilderName}
+	}
+	if len(names) > 0 {
+		shown := names
+		if len(shown) > opsServedByLimit {
+			shown = shown[:opsServedByLimit]
+		}
+		quoted := make([]string, 0, len(shown))
+		for _, name := range shown {
+			quoted = append(quoted, "«"+name+"»")
+		}
+		label := "сборка "
+		if len(names) > 1 {
+			label = "сборки "
+		}
+		served := label + strings.Join(quoted, ", ")
+		if rest := len(names) - len(shown); rest > 0 {
+			served += fmt.Sprintf(" и ещё %d", rest)
+		}
+		parts = append(parts, served)
+	}
+	if o.CountryCode != "" {
+		parts = append(parts, o.CountryCode)
+	}
+	return strings.Join(parts, " · ")
+}
+
 func opsBuilderName(name string, id *uint) string {
 	if strings.TrimSpace(name) != "" {
 		return "«" + name + "»"
@@ -448,13 +503,13 @@ func outageOpened(o *database.OpsOutage) *database.OpsEvent {
 	if o.Scope == database.MonitorScopeTarget {
 		ev.Kind, ev.Severity = database.OpsKindServerDown, database.OpsSeverityWarning
 		ev.Title = "Сервер недоступен"
-		ev.Message = fmt.Sprintf("%s · построитель %s · %s", opsServerName(o), opsBuilderName(o.BuilderName, nil), opsCountry(o.CountryCode))
+		ev.Message = opsServerPlace(o)
 		if o.ErrorCode != "" {
 			ev.Message += " · причина: " + opsErrorLabel(o.ErrorCode)
 		}
 		return ev
 	}
-	where := fmt.Sprintf("построитель %s · страна %s", opsBuilderName(o.BuilderName, o.BuilderID), opsCountry(o.CountryCode))
+	where := fmt.Sprintf("сборка %s · страна %s", opsBuilderName(o.BuilderName, o.BuilderID), opsCountry(o.CountryCode))
 	if o.Kind == database.MonitorOutageDegraded {
 		ev.Kind, ev.Severity, ev.Title = database.OpsKindCountryDegraded, database.OpsSeverityWarning, "Страна работает частично"
 		ev.Message = where + " · часть серверов не отвечает"
@@ -474,14 +529,14 @@ func outageClosed(o *database.OpsOutage) *database.OpsEvent {
 	removed := o.EndReason == database.MonitorEndRemoved
 	if o.Scope == database.MonitorScopeTarget {
 		ev.Kind, ev.Title = database.OpsKindServerUp, "Сервер восстановлен"
-		ev.Message = fmt.Sprintf("%s · построитель %s · %s", opsServerName(o), opsBuilderName(o.BuilderName, nil), duration)
+		ev.Message = opsServerPlace(o) + " · " + duration
 		if removed {
 			ev.Kind, ev.Severity, ev.Title = database.OpsKindServerRemoved, database.OpsSeverityInfo, "Сервер снят с выдачи"
 			ev.Message = fmt.Sprintf("%s больше не выдаётся клиентам и не проверяется (не восстановился)", opsServerName(o))
 		}
 		return ev
 	}
-	where := fmt.Sprintf("построитель %s · страна %s", opsBuilderName(o.BuilderName, o.BuilderID), opsCountry(o.CountryCode))
+	where := fmt.Sprintf("сборка %s · страна %s", opsBuilderName(o.BuilderName, o.BuilderID), opsCountry(o.CountryCode))
 	ev.Kind, ev.Title, ev.Message = database.OpsKindCountryUp, "Страна восстановлена", where+" · "+duration
 	if removed {
 		ev.Kind, ev.Severity, ev.Title = database.OpsKindCountryRemoved, database.OpsSeverityInfo, "Страна снята с выдачи"
@@ -525,14 +580,14 @@ func (s *OpsService) watchBuilders(ctx context.Context, settings *database.OpsSe
 			var ev *database.OpsEvent
 			switch {
 			case state == database.MonitorStatusDown:
-				ev = &database.OpsEvent{Kind: database.OpsKindBuilderDown, Severity: database.OpsSeverityCritical, Title: "Построитель недоступен",
-					Message: fmt.Sprintf("Построитель %s: не отвечает ни один сервер (%d из %d недоступны). Клиенты этого построителя остались без VPN.", name, b.NodesDown, b.NodesTotal)}
+				ev = &database.OpsEvent{Kind: database.OpsKindBuilderDown, Severity: database.OpsSeverityCritical, Title: "Сборка недоступна",
+					Message: fmt.Sprintf("Сборка %s: не отвечает ни один сервер (%d из %d недоступны). Клиенты этой сборки остались без VPN.", name, b.NodesDown, b.NodesTotal)}
 			case state == "disabled" && previous != "":
-				ev = &database.OpsEvent{Kind: database.OpsKindBuilderDisabled, Severity: database.OpsSeverityInfo, Title: "Построитель отключён",
-					Message: fmt.Sprintf("Построитель %s отключён: его серверы не выдаются и не проверяются.", name)}
+				ev = &database.OpsEvent{Kind: database.OpsKindBuilderDisabled, Severity: database.OpsSeverityInfo, Title: "Сборка отключена",
+					Message: fmt.Sprintf("Сборка %s отключена: её серверы не выдаются и не проверяются.", name)}
 			case state == "serving" && previous == database.MonitorStatusDown:
-				ev = &database.OpsEvent{Kind: database.OpsKindBuilderUp, Severity: database.OpsSeverityOK, Title: "Построитель восстановлен",
-					Message: fmt.Sprintf("Построитель %s снова выдаёт рабочие серверы (%d из %d отвечают).", name, b.NodesUp, b.NodesTotal)}
+				ev = &database.OpsEvent{Kind: database.OpsKindBuilderUp, Severity: database.OpsSeverityOK, Title: "Сборка восстановлена",
+					Message: fmt.Sprintf("Сборка %s снова выдаёт рабочие серверы (%d из %d отвечают).", name, b.NodesUp, b.NodesTotal)}
 			}
 			if ev != nil {
 				ev.CreatedAt, ev.BuilderID = now, &id
@@ -553,10 +608,10 @@ func (s *OpsService) watchBuilders(ctx context.Context, settings *database.OpsSe
 			switch {
 			case sourceState == "failing":
 				ev = &database.OpsEvent{Kind: database.OpsKindSourceFailing, Severity: database.OpsSeverityWarning, Title: "Источник не загружается",
-					Message: fmt.Sprintf("Построитель %s: не удалось загрузить источников — %d. Их серверы могут пропасть из подписки.", name, b.SourceErrors)}
+					Message: fmt.Sprintf("Сборка %s: не удалось загрузить источников — %d. Их серверы могут пропасть из подписки.", name, b.SourceErrors)}
 			case previous == "failing":
 				ev = &database.OpsEvent{Kind: database.OpsKindSourceRecovered, Severity: database.OpsSeverityOK, Title: "Источники снова загружаются",
-					Message: fmt.Sprintf("Построитель %s: все источники загружаются.", name)}
+					Message: fmt.Sprintf("Сборка %s: все источники загружаются.", name)}
 			}
 			if ev != nil {
 				ev.CreatedAt, ev.BuilderID = now, &id
@@ -886,6 +941,6 @@ func formatOpsReport(st *database.OpsDailyStats, day time.Time) string {
 	}
 	fmt.Fprintf(&b, "%s Открытых инцидентов сейчас: %d\n", mark, st.OpenIncidents)
 	fmt.Fprintf(&b, "Инцидентов за день: стран %d · серверов %d\n", st.IncidentsCountry, st.IncidentsServer)
-	fmt.Fprintf(&b, "Источников: %d (не работает: %d) · построителей включено: %d", st.SourcesTotal, st.SourcesUnusable, st.BuildersEnabled)
+	fmt.Fprintf(&b, "Источников: %d (не работает: %d) · сборок включено: %d", st.SourcesTotal, st.SourcesUnusable, st.BuildersEnabled)
 	return b.String()
 }

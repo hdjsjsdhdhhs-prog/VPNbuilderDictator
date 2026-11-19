@@ -63,6 +63,12 @@ type updateSourceRequest struct {
 	// ExpiresAt: omitted keeps the stored validity end, null clears it, an
 	// RFC 3339 instant sets it.
 	ExpiresAt json.RawMessage `json:"expires_at"`
+	// Fetch configuration: omitted keeps the stored value, a value replaces
+	// it. Write-only: no response ever carries them.
+	SubscriptionURL *string `json:"subscription_url"`
+	HWID            *string `json:"hwid"`
+	UserAgent       *string `json:"user_agent"`
+	Headers         *string `json:"headers"`
 }
 
 // parseSourceExpiry decodes the expires_at member of a source request: set is
@@ -116,6 +122,11 @@ func (a *adminAPI) builderUpdateSource(w http.ResponseWriter, r *http.Request, i
 		Type:         body.Type,
 		ExpiresAtSet: expirySet,
 		ExpiresAt:    expiresAt,
+
+		SubscriptionURL: body.SubscriptionURL,
+		HWID:            body.HWID,
+		UserAgent:       body.UserAgent,
+		Headers:         body.Headers,
 	})
 	if err != nil {
 		a.writeSourceError(w, "builder/source/update", err)

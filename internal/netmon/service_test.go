@@ -33,10 +33,19 @@ type fakeProber struct {
 	up    map[string]bool
 	lat   map[string]int
 	calls map[string]int
+	// blips: how many of the next probes of a host fail whatever its state.
+	blips map[string]int
 }
 
 func newFakeProber() *fakeProber {
-	return &fakeProber{up: map[string]bool{}, lat: map[string]int{}, calls: map[string]int{}}
+	return &fakeProber{up: map[string]bool{}, lat: map[string]int{}, calls: map[string]int{}, blips: map[string]int{}}
+}
+
+// blip makes the next n probes of host fail.
+func (p *fakeProber) blip(host string, n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.blips[host] = n
 }
 
 func (p *fakeProber) set(host string, up bool, latency int) {
@@ -49,6 +58,10 @@ func (p *fakeProber) Probe(_ context.Context, ep subserver.MonitorEndpoint) Resu
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls[ep.Key]++
+	if p.blips[ep.Host] > 0 {
+		p.blips[ep.Host]--
+		return Result{ErrorCode: ErrCodeTimeout}
+	}
 	if p.up[ep.Host] {
 		return Result{OK: true, LatencyMS: p.lat[ep.Host]}
 	}

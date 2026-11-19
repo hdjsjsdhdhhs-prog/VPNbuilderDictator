@@ -192,6 +192,10 @@ func (s *Service) UpdateBuilder(ctx context.Context, meta AdminConfigMeta, in Bu
 				}
 				return configChange{}, fmt.Errorf("update subscription builder: %w", err)
 			}
+			planErr := syncBuilderPlanName(tx, b.ID, b.Name, now)
+			if planErr != nil {
+				return configChange{}, planErr
+			}
 			return configChange{
 				targetID: b.ID,
 				oldValue: old,
@@ -388,6 +392,22 @@ func (s *Service) SetPlanBuilder(ctx context.Context, meta AdminConfigMeta, plan
 			plan.SubscriptionBuilderID = builderID
 			if err := tx.Model(&plan).Update("subscription_builder_id", builderID).Error; err != nil {
 				return configChange{}, fmt.Errorf("set plan builder: %w", err)
+			}
+			// A sale plan is named after the builder it serves (builder_plans.go):
+			// the name is what the users list, the journal and warm-up messages
+			// show. The system plans (trial, free) keep their names.
+			if builderID != nil && !IsSystemPlanName(plan.Name) {
+				var b SubscriptionBuilder
+				loadErr := tx.Select("id", "name").First(&b, *builderID).Error
+				if loadErr != nil && !errors.Is(loadErr, gorm.ErrRecordNotFound) {
+					return configChange{}, fmt.Errorf("load plan builder: %w", loadErr)
+				}
+				if loadErr == nil {
+					renameErr := renamePlanAfterBuilder(tx, &plan, b.Name, now)
+					if renameErr != nil {
+						return configChange{}, renameErr
+					}
+				}
 			}
 			return configChange{
 				targetID: planID,

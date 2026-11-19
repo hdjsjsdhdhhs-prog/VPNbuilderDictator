@@ -149,6 +149,9 @@ func initServices(cfg *config.Config, dbService *database.Service, botAPI *tgbot
 	opsSender := service.NewOpsTelegramSender(botAPI)
 	opsService := service.NewOpsService(dbService, netMonitor, cfg.TelegramAdminID)
 	opsService.SetSender(opsSender)
+	// A finished check round wakes the notifications worker, so an outage is
+	// reported as soon as the monitor confirms it, not on the next minute tick.
+	netMonitor.SetAfterRound(opsService.RequestTick)
 
 	return &appServices{
 		subService: subService, subServer: subServer, handler: handler, orderService: orderService,

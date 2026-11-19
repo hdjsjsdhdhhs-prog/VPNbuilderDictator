@@ -129,9 +129,12 @@ func (a *adminAPI) plansList(w http.ResponseWriter, r *http.Request) {
 // tariffBody is the editable content shared by create and update. Unknown
 // fields are rejected (decodeAdminJSON), so a typo is never a silent no-op.
 type tariffBody struct {
-	RequestKey   string   `json:"request_key"`
-	Name         string   `json:"name"`
-	PlanID       uint     `json:"plan_id"`
+	RequestKey string `json:"request_key"`
+	Name       string `json:"name"`
+	PlanID     uint   `json:"plan_id"`
+	// BuilderID sells the tariff on a builder; the plan behind it is resolved
+	// on the server. The admin panel sends it instead of plan_id.
+	BuilderID    uint     `json:"builder_id"`
 	DurationDays int      `json:"duration_days"`
 	PriceCents   int64    `json:"price_cents"`
 	Currency     string   `json:"currency"`
@@ -144,7 +147,7 @@ type tariffBody struct {
 
 func (b tariffBody) input() service.TariffInput {
 	return service.TariffInput{
-		Name: b.Name, PlanID: b.PlanID, DurationDays: b.DurationDays, PriceCents: b.PriceCents,
+		Name: b.Name, PlanID: b.PlanID, BuilderID: b.BuilderID, DurationDays: b.DurationDays, PriceCents: b.PriceCents,
 		Currency: b.Currency, Description: b.Description, Features: b.Features, Badge: b.Badge,
 		SortOrder: b.SortOrder, IsActive: b.IsActive,
 	}

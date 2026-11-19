@@ -270,6 +270,10 @@ func (s *Service) SaveBuilderConfiguration(ctx context.Context, meta AdminConfig
 			if res.RowsAffected == 0 {
 				return configChange{}, ErrBuilderVersionConflict
 			}
+			planErr := syncBuilderPlanName(tx, in.ID, in.Name, now)
+			if planErr != nil {
+				return configChange{}, planErr
+			}
 
 			if err := tx.Where("builder_id = ?", in.ID).Delete(&SubscriptionBuilderSource{}).Error; err != nil {
 				return configChange{}, fmt.Errorf("clear builder sources: %w", err)

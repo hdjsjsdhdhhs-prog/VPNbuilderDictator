@@ -67,8 +67,13 @@ var tariffCurrencyPattern = regexp.MustCompile(`^[A-Z]{3}$`)
 // trimmed by the caller (the service normalizes); Validate rejects anything
 // out of bounds and reports the offending field.
 type TariffInput struct {
-	Name         string   `json:"name"`
-	PlanID       uint     `json:"plan_id"`
+	Name string `json:"name"`
+	// PlanID is the plan the tariff is sold on. The admin panel sends
+	// BuilderID instead and the plan is resolved (ensureBuilderSalePlan).
+	PlanID uint `json:"plan_id"`
+	// BuilderID selects the builder ("сборка") the tariff sells; when set it
+	// wins over PlanID. 0 keeps the explicit plan.
+	BuilderID    uint     `json:"builder_id,omitempty"`
 	DurationDays int      `json:"duration_days"`
 	PriceCents   int64    `json:"price_cents"`
 	Currency     string   `json:"currency"`
@@ -93,7 +98,7 @@ func (in TariffInput) Validate() error {
 	switch {
 	case in.Name == "" || utf8.RuneCountInString(in.Name) > TariffMaxNameLength || !utf8.ValidString(in.Name):
 		return invalidTariff("name")
-	case in.PlanID == 0:
+	case in.PlanID == 0 && in.BuilderID == 0:
 		return invalidTariff("plan_id")
 	case in.DurationDays <= 0 || in.DurationDays > MaxSubscriptionRenewalDays:
 		return invalidTariff("duration_days")
@@ -161,8 +166,10 @@ type TariffRow struct {
 	PlanName      string
 	PlanActive    bool
 	PlanBuilderID *uint
-	Orders        int64
-	Subscriptions int64
+	// PlanBuilderName is the name of the plan's builder ('' without one).
+	PlanBuilderName string
+	Orders          int64
+	Subscriptions   int64
 	// ReplacedByID is the successor created from this product, if any.
 	ReplacedByID *uint
 }
@@ -257,11 +264,23 @@ func loadTariffRows(tx *gorm.DB, onlyID uint) ([]TariffRow, error) {
 	for _, link := range links {
 		successors[link.PreviousID] = link.ID
 	}
+	builderNames := map[uint]string{}
+	var builders []SubscriptionBuilder
+	buildersErr := tx.Select("id", "name").Find(&builders).Error
+	if buildersErr != nil {
+		return nil, fmt.Errorf("load tariff builders: %w", buildersErr)
+	}
+	for _, b := range builders {
+		builderNames[b.ID] = b.Name
+	}
 	for i := range products {
 		p := products[i]
 		row := TariffRow{Product: p, Orders: orders[p.ID], Subscriptions: subs[p.ID]}
 		if p.Plan != nil {
 			row.PlanName, row.PlanActive, row.PlanBuilderID = p.Plan.Name, p.Plan.IsActive, p.Plan.SubscriptionBuilderID
+			if p.Plan.SubscriptionBuilderID != nil {
+				row.PlanBuilderName = builderNames[*p.Plan.SubscriptionBuilderID]
+			}
 		}
 		if next, ok := successors[p.ID]; ok {
 			successor := next
@@ -385,6 +404,22 @@ func checkTariffPlan(tx *gorm.DB, planID uint) error {
 	return nil
 }
 
+// resolveTariffPlan settles in.PlanID: the sale plan of in.BuilderID when a
+// builder is given (created, adopted or renamed as needed, see
+// ensureBuilderSalePlan), otherwise the explicit plan, which must exist and be
+// sellable. currentPlanID is the plan of the tariff being edited (0 on create).
+func resolveTariffPlan(tx *gorm.DB, in *TariffInput, currentPlanID uint, now time.Time) error {
+	if in.BuilderID == 0 {
+		return checkTariffPlan(tx, in.PlanID)
+	}
+	planID, err := ensureBuilderSalePlan(tx, in.BuilderID, currentPlanID, now)
+	if err != nil {
+		return err
+	}
+	in.PlanID = planID
+	return nil
+}
+
 // claimTariff takes SQLite's write lock on the product row before any usage
 // check, serializing the check-and-update against a concurrent first order
 // (same technique as UpdateProductGuarded), then loads it and verifies the
@@ -465,9 +500,10 @@ func (s *Service) CreateTariff(ctx context.Context, meta AdminConfigMeta, in Tar
 		return nil, err
 	}
 	return s.runAdminConfigMutation(ctx, meta, AdminActionTariffCreated, AdminTargetTariff, 0, in,
-		func(tx *gorm.DB, _ time.Time) (configChange, error) {
-			if err := checkTariffPlan(tx, in.PlanID); err != nil {
-				return configChange{}, err
+		func(tx *gorm.DB, now time.Time) (configChange, error) {
+			planErr := resolveTariffPlan(tx, &in, 0, now)
+			if planErr != nil {
+				return configChange{}, planErr
 			}
 			order := 0
 			if in.SortOrder != nil {
@@ -521,7 +557,8 @@ func (s *Service) UpdateTariff(ctx context.Context, meta AdminConfigMeta, in Tar
 			} else if superseded {
 				return configChange{}, ErrTariffSuperseded
 			}
-			if err := checkTariffPlan(tx, in.PlanID); err != nil {
+			err = resolveTariffPlan(tx, &in.TariffInput, current.PlanID, now)
+			if err != nil {
 				return configChange{}, err
 			}
 			orders, subs, err := tariffUsage(tx, current.ID)

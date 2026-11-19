@@ -148,6 +148,61 @@ func TestFetchSourceCatalogue_FingerprintSurvivesReorderAndCredentialRotation(t 
 	}
 }
 
+// The provider puts a "decoy" member into its balancing configs and picks
+// another one for every request. Such a config stays the same catalogue entry
+// (a rule on it keeps its tick in the constructor); a single server is still
+// identified by its address.
+func TestFetchSourceCatalogue_BalancerFingerprintSurvivesMemberRotation(t *testing.T) {
+	t.Parallel()
+	const (
+		balancer = "🇩🇪⚪Германия (БС-5)☁️"
+		single   = "🇳🇱⚡Нидерланды"
+	)
+	body := loadXrayFixture(t)
+	rotated := rotateXrayMember(t, body, balancer, "198.51.100.9", "198.51.100.4")
+	moved := rotateXrayMember(t, body, single, "198.51.100.3", "198.51.100.200")
+
+	fingerprints := func(body []byte) map[string]string {
+		c, err := FetchSourceCatalogue(context.Background(), catalogueSource(serveBody(t, 200, "", body), "auto"))
+		require.NoError(t, err)
+		require.Len(t, c.Entries, 40)
+		out := map[string]string{}
+		for _, e := range c.Entries {
+			out[e.OriginalName] = e.Fingerprint
+		}
+		return out
+	}
+	before := fingerprints(body)
+	assert.Equal(t, before, fingerprints(rotated), "another decoy is the same balancing config")
+
+	after := fingerprints(moved)
+	assert.NotEqual(t, before[single], after[single], "a single server at another address is another server")
+	delete(before, single)
+	delete(after, single)
+	assert.Equal(t, before, after)
+}
+
+// Providers hand out a random Reality camouflage name on every request (a
+// wildcard such as "*.mail.ru"): the server is the same one. Behind TLS the
+// SNI selects the server, so it stays a part of the identity.
+func TestParseXrayFullConfig_RealitySNIIsNotIdentity(t *testing.T) {
+	t.Parallel()
+	config := func(security, sni string) json.RawMessage {
+		return json.RawMessage(fmt.Sprintf(`{"remarks":"🇭🇺 Hungary","outbounds":[{"tag":"proxy","protocol":"vless",`+
+			`"settings":{"vnext":[{"address":"hu.example.com","port":8443,"users":[{"id":"u","encryption":"none"}]}]},`+
+			`"streamSettings":{"network":"tcp","security":%q,"realitySettings":{"serverName":%q},"tlsSettings":{"serverName":%q}}}]}`,
+			security, sni, sni))
+	}
+	fingerprint := func(security, sni string) string {
+		info, ok := parseXrayFullConfig(config(security, sni))
+		require.True(t, ok)
+		return info.fingerprint
+	}
+	assert.Equal(t, fingerprint("reality", "f0zwlq4wrr.mail.example"), fingerprint("reality", "8pzn96715m.mail.example"))
+	assert.NotEqual(t, fingerprint("tls", "one.example.com"), fingerprint("tls", "two.example.com"))
+	assert.NotEqual(t, fingerprint("reality", "a.example.com"), fingerprint("tls", "a.example.com"))
+}
+
 // A provider section header reuses the outbounds of a real server: both stay
 // separate entries (the real server keeps its country), identical configs
 // with the same name stay one entry.

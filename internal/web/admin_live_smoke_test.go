@@ -2,10 +2,15 @@
 
 package web
 
-// Local browser smoke stand: the real web.Server (admin auth, CSRF, admin API,
-// embedded admin UI, /sub) on a temporary SQLite database, with a local
-// upstream serving two test catalogues. It never touches a real provider,
-// database or production setting. Run it only through
+// Local browser smoke stand: the real web.Server (admin auth, CSRF, admin API
+// with сборки and their tariffs, embedded admin UI, /sub), the real network
+// monitor and the real notifications worker on a temporary SQLite database.
+// A local upstream serves two test catalogues whose servers are local TLS
+// listeners, so the monitor probes them for real; Telegram is replaced by a
+// recorder that writes every message to telegram.jsonl in the state directory.
+// It never touches a real provider (unless the spec adds one through the UI,
+// see frontend/admin/live/README.md), database or production setting. Run it
+// only through
 // frontend/admin/live/README.md (`go test -tags adminsmoke -run
 // TestAdminLiveSmokeServer ./internal/web/`), then run the Playwright live
 // spec against it; the test blocks until the spec writes the stop file.
@@ -22,19 +27,126 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/config"
 	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/database"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/netmon"
+	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/scheduler"
 	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/service"
 	"github.com/hdjsjsdhdhhs-prog/VPNbuilderDictator/internal/subserver"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
 )
 
-func smokeLink(user, host, name string) string {
-	return fmt.Sprintf("vless://%s@%s:443?security=tls&sni=%s&type=tcp#%s", user, host, host, url.PathEscape(name))
+// smokeAdminChat is the Telegram chat the stand "delivers" notifications to.
+const smokeAdminChat = 777000
+
+// smokeServers are local TLS listeners standing in for VPN servers: the
+// network monitor probes them for real (TCP connect + TLS handshake). The spec
+// takes one down and brings it back through files in the state directory.
+type smokeServers struct {
+	mu      sync.Mutex
+	addrs   map[string]string
+	running map[string]*httptest.Server
+}
+
+func (s *smokeServers) listen(key, addr string) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	srv := httptest.NewUnstartedServer(http.NotFoundHandler())
+	_ = srv.Listener.Close()
+	srv.Listener = listener
+	srv.StartTLS()
+	s.addrs[key], s.running[key] = listener.Addr().String(), srv
+	return nil
+}
+
+// link starts the server of key and returns its share link.
+func (s *smokeServers) link(t *testing.T, key, name string) string {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	require.NoError(t, s.listen(key, "127.0.0.1:0"))
+	return fmt.Sprintf("vless://%s@%s?security=tls&sni=%s.smoke.test&type=tcp#%s", key, s.addrs[key], key, url.PathEscape(name))
+}
+
+// down closes the listener: the next probe is refused.
+func (s *smokeServers) down(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if srv := s.running[key]; srv != nil {
+		srv.Close()
+		delete(s.running, key)
+	}
+}
+
+// up listens again on the same address.
+func (s *smokeServers) up(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	addr, known := s.addrs[key]
+	if !known || s.running[key] != nil {
+		return nil
+	}
+	return s.listen(key, addr)
+}
+
+func (s *smokeServers) closeAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, srv := range s.running {
+		srv.Close()
+		delete(s.running, key)
+	}
+}
+
+// control applies the "down-<key>" / "up-<key>" files the spec writes and
+// removes each one as the acknowledgement.
+func (s *smokeServers) control(t *testing.T, stateDir string) {
+	s.mu.Lock()
+	keys := make([]string, 0, len(s.addrs))
+	for key := range s.addrs {
+		keys = append(keys, key)
+	}
+	s.mu.Unlock()
+	for _, key := range keys {
+		if file := filepath.Join(stateDir, "down-"+key); os.Remove(file) == nil {
+			s.down(key)
+			t.Logf("smoke server %s is down", key)
+		}
+		if file := filepath.Join(stateDir, "up-"+key); os.Remove(file) == nil {
+			require.NoError(t, s.up(key))
+			t.Logf("smoke server %s is up", key)
+		}
+	}
+}
+
+// smokeTelegram records what would be sent to Telegram, one JSON line per
+// message, so the spec can read the notifications.
+type smokeTelegram struct {
+	mu   sync.Mutex
+	path string
+}
+
+func (r *smokeTelegram) SendOps(_ context.Context, _ string, chatID int64, html string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	line, err := json.Marshal(map[string]any{"chat_id": chatID, "html": html})
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(r.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	_, err = f.Write(append(line, '\n'))
+	return err
 }
 
 // liveSmokeState is what the Playwright spec reads.
@@ -45,6 +157,7 @@ type liveSmokeState struct {
 	OtherRule      uint   `json:"other_rule"`
 	SubscriptionID uint   `json:"subscription_id"`
 	SubToken       string `json:"sub_token"`
+	AdminChat      int64  `json:"admin_chat"`
 }
 
 func TestAdminLiveSmokeServer(t *testing.T) {
@@ -57,16 +170,18 @@ func TestAdminLiveSmokeServer(t *testing.T) {
 	}
 	ctx := context.Background()
 
+	servers := &smokeServers{addrs: map[string]string{}, running: map[string]*httptest.Server{}}
+	t.Cleanup(servers.closeAll)
 	catalogues := map[string][]string{
 		"/a": {
-			smokeLink("a1", "de1.smoke.test", "🇩🇪 Frankfurt"),
-			smokeLink("a2", "de2.smoke.test", "🇩🇪 Berlin"),
-			smokeLink("a3", "nl.smoke.test", "🇳🇱 Amsterdam"),
-			smokeLink("a4", "fi.smoke.test", "🇫🇮 Helsinki"),
+			servers.link(t, "de1", "🇩🇪 Frankfurt"),
+			servers.link(t, "de2", "🇩🇪 Berlin"),
+			servers.link(t, "nl", "🇳🇱 Amsterdam"),
+			servers.link(t, "fi", "🇫🇮 Helsinki"),
 		},
 		"/b": {
-			smokeLink("b1", "us.smoke.test", "🇺🇸 Dallas"),
-			smokeLink("b2", "de3.smoke.test", "🇩🇪 Munich"),
+			servers.link(t, "us", "🇺🇸 Dallas"),
+			servers.link(t, "de3", "🇩🇪 Munich"),
 		},
 	}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -101,7 +216,7 @@ func TestAdminLiveSmokeServer(t *testing.T) {
 		require.Equal(t, database.SourceSyncOK, sync.Status, name)
 		return view.ID
 	}
-	state := liveSmokeState{SourceA: newSource("Smoke A", "/a"), SourceB: newSource("Smoke B", "/b")}
+	state := liveSmokeState{SourceA: newSource("Smoke A", "/a"), SourceB: newSource("Smoke B", "/b"), AdminChat: smokeAdminChat}
 
 	// Another builder with its own rule (ownership checks).
 	other, err := db.CreateBuilder(ctx, database.AdminConfigMeta{Actor: "seed", RequestKey: "seed-other"}, database.BuilderCreateInput{Name: "Чужой", Enabled: true})
@@ -141,6 +256,34 @@ func TestAdminLiveSmokeServer(t *testing.T) {
 	s := NewServer(internalAddr, db, cfg, "", nil, subSrv)
 	s.SetAdminService(service.NewAdminService(db, nil))
 	s.SetBuilderService(builders)
+	// The constructor of a сборка sets its price: a tariff sold on the builder.
+	s.SetTariffService(service.NewTariffService(db))
+	s.SetPromoService(service.NewPromoService(db))
+
+	// The network monitor and the notifications, wired like cmd/bot: the
+	// monitor resolves the сборки with the /sub pipeline and probes their
+	// servers; a finished round wakes the notifications worker. Only the
+	// background loop is not started — the spec runs the rounds itself with
+	// «Проверить сейчас», which keeps the scenario deterministic.
+	monitor := netmon.New(db, func(ctx context.Context, list []database.SubscriptionBuilder) ([]subserver.MonitorBuilder, error) {
+		return subserver.ResolveMonitorBuilders(ctx, db, list)
+	}, netmon.NetProber{Timeout: 3 * time.Second}, netmon.Config{Enabled: true, Timeout: 3 * time.Second})
+	ops := service.NewOpsService(db, monitor, smokeAdminChat)
+	ops.SetSender(&smokeTelegram{path: filepath.Join(stateDir, "telegram.jsonl")})
+	monitor.SetAfterRound(ops.RequestTick)
+	s.SetNetworkMonitor(monitor)
+	s.SetOpsService(ops)
+	workerCtx, stopWorker := context.WithCancel(ctx)
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		scheduler.NewOpsWorker(ops).Run(workerCtx)
+	}()
+	t.Cleanup(func() {
+		stopWorker()
+		<-workerDone
+	})
+
 	require.NoError(t, s.Start(ctx))
 	t.Cleanup(func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -172,7 +315,8 @@ func TestAdminLiveSmokeServer(t *testing.T) {
 		if _, err := os.Stat(stop); err == nil {
 			return
 		}
-		time.Sleep(500 * time.Millisecond)
+		servers.control(t, stateDir)
+		time.Sleep(250 * time.Millisecond)
 	}
 	t.Fatal("smoke stand timed out waiting for the stop file")
 }

@@ -81,6 +81,10 @@ var ErrNotFound = errors.New("monitor subject not found")
 // ErrInvalidQuery is returned for an invalid history query.
 var ErrInvalidQuery = errors.New("invalid monitor query")
 
+// ErrCheckInProgress is returned by CheckNow while a resolution or a check
+// round is already running.
+var ErrCheckInProgress = errors.New("monitor check is already running")
+
 // Service runs check rounds and serves the admin views.
 type Service struct {
 	repo    Repository
@@ -99,7 +103,18 @@ type Service struct {
 	lastRefreshAt *time.Time
 	lastRoundAt   *time.Time
 	running       bool
+	afterRound    func()
+
+	// cycleMu serializes resolutions and check rounds of the background loop
+	// and of CheckNow, so a manual check never doubles a failure count.
+	cycleMu sync.Mutex
+	// confirmPause is the wait before CheckNow probes a failed server again.
+	confirmPause time.Duration
 }
+
+// checkNowConfirmPause separates the probes of a manual check, so one short
+// hiccup is not counted twice.
+const checkNowConfirmPause = time.Second
 
 type builderRun struct {
 	sourceErrors int
@@ -111,6 +126,7 @@ func New(repo Repository, resolve ResolveFunc, prober Prober, cfg Config) *Servi
 	return &Service{
 		repo: repo, resolve: resolve, prober: prober, cfg: cfg.withDefaults(), now: time.Now,
 		endpoints: map[string]subserver.MonitorEndpoint{}, signatures: map[uint]string{}, builderInfo: map[uint]builderRun{},
+		confirmPause: checkNowConfirmPause,
 	}
 }
 
@@ -121,6 +137,86 @@ func (s *Service) Config() Config { return s.cfg }
 func (s *Service) SetClock(now func() time.Time) { s.now = now }
 
 func (s *Service) nowUTC() time.Time { return s.now().UTC() }
+
+// SetAfterRound registers a callback run after every completed check round
+// (background or manual). It is how operational notifications are delivered
+// right after a status change instead of on their own timer. Set it before
+// Run; the callback must not block.
+func (s *Service) SetAfterRound(fn func()) {
+	s.mu.Lock()
+	s.afterRound = fn
+	s.mu.Unlock()
+}
+
+func (s *Service) notifyRound() {
+	s.mu.Lock()
+	fn := s.afterRound
+	s.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+// CheckNow re-resolves the builders and checks every served server right away
+// (the "Проверить сейчас" button). It is a user-initiated operation: a failure
+// is returned to the caller. ErrCheckInProgress while the background loop or
+// another manual check is in the middle of a pass.
+//
+// The background loop calls a server down after DownAfter failed rounds in a
+// row, which filters out a blip. The owner who presses the button wants the
+// verdict now, not after the next round: the servers that did not answer are
+// probed again after a short pause until they answer or reach DownAfter, so
+// one press ends with a definite status (and its notification).
+func (s *Service) CheckNow(ctx context.Context) error {
+	if !s.cycleMu.TryLock() {
+		return ErrCheckInProgress
+	}
+	defer s.cycleMu.Unlock()
+	err := s.Refresh(ctx)
+	if err != nil {
+		return err
+	}
+	err = s.Round(ctx)
+	if err != nil {
+		return err
+	}
+	for confirmation := 1; confirmation < s.cfg.DownAfter; confirmation++ {
+		pending, err := s.unconfirmedTargets(ctx)
+		if err != nil {
+			return err
+		}
+		if len(pending) == 0 {
+			break
+		}
+		select {
+		case <-time.After(s.confirmPause):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		err = s.round(ctx, pending)
+		if err != nil {
+			return err
+		}
+	}
+	s.notifyRound()
+	return nil
+}
+
+// unconfirmedTargets are the active targets whose last check failed but that
+// are not DOWN yet: one more failure may be needed for a verdict.
+func (s *Service) unconfirmedTargets(ctx context.Context) (map[uint]bool, error) {
+	targets, err := s.repo.ListActiveMonitorTargets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pending := make(map[uint]bool)
+	for _, t := range targets {
+		if t.ConsecutiveFailures > 0 && t.Status != database.MonitorStatusDown && t.Probe != subserver.ProbeUnsupported {
+			pending[t.ID] = true
+		}
+	}
+	return pending, nil
+}
 
 // Refresh re-resolves every enabled builder with the /sub pipeline and stores
 // the bindings. Disabled builders keep only history.
@@ -219,6 +315,12 @@ func (s *Service) ConfigChanged(ctx context.Context) (bool, error) {
 // Round checks every active target once (each endpoint once, however many
 // builders serve it) and records the results.
 func (s *Service) Round(ctx context.Context) error {
+	return s.round(ctx, nil)
+}
+
+// round checks the active targets once; only (when not nil) narrows the round
+// to the given target ids.
+func (s *Service) round(ctx context.Context, only map[uint]bool) error {
 	targets, err := s.repo.ListActiveMonitorTargets(ctx)
 	if err != nil {
 		return err
@@ -230,7 +332,7 @@ func (s *Service) Round(ctx context.Context) error {
 	}
 	jobs := make([]job, 0, len(targets))
 	for _, t := range targets {
-		if t.Probe == subserver.ProbeUnsupported {
+		if t.Probe == subserver.ProbeUnsupported || (only != nil && !only[t.ID]) {
 			continue
 		}
 		ep, ok := s.endpoints[t.EndpointKey]
@@ -335,15 +437,24 @@ func (s *Service) Run(ctx context.Context, initialDelay time.Duration) {
 }
 
 func (s *Service) refreshBestEffort(ctx context.Context) {
+	s.cycleMu.Lock()
+	defer s.cycleMu.Unlock()
 	if err := s.Refresh(ctx); err != nil && ctx.Err() == nil {
 		logger.Warn("Network monitor: resolution failed", zap.Error(err))
 	}
 }
 
 func (s *Service) roundBestEffort(ctx context.Context) {
-	if err := s.Round(ctx); err != nil && ctx.Err() == nil {
-		logger.Warn("Network monitor: check round failed", zap.Error(err))
+	s.cycleMu.Lock()
+	err := s.Round(ctx)
+	s.cycleMu.Unlock()
+	if err != nil {
+		if ctx.Err() == nil {
+			logger.Warn("Network monitor: check round failed", zap.Error(err))
+		}
+		return
 	}
+	s.notifyRound()
 }
 
 // sortedCountries orders countries by code with "" (no country) last.

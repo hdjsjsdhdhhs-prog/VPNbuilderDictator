@@ -18,8 +18,11 @@ import (
 //
 //   - a source is blocked by any builder that links it or has a rule on it,
 //     and by any subscription sold directly on it (provider_source_id);
-//   - a builder is blocked by any plan whose default it is (the system trial
-//     plan included) and by any per-subscription override.
+//   - a builder is blocked by a plan whose default it is while that plan is a
+//     system plan (trial, free) or still has tariffs or subscriptions, and by
+//     any per-subscription override. Its own empty sale plan (no tariffs, no
+//     subscriptions; see builder_plans.go) is internal: it never blocks and
+//     is deleted together with the builder.
 //
 // The foreign keys would SET NULL the plan/subscription references and silently
 // leave customers without content (/sub answers 503 without a builder), so the
@@ -63,7 +66,8 @@ func (d SourceDependents) InUse() bool { return len(d.Builders) > 0 || d.Subscri
 
 // BuilderDependents is what still relies on a subscription builder.
 type BuilderDependents struct {
-	// Plans use the builder as their default (the trial plan included).
+	// Plans use the builder as their default and keep it from being deleted:
+	// a system plan (trial, free) or a plan with tariffs or subscriptions.
 	Plans []DependentRef `json:"plans"`
 	// Subscriptions override their plan builder with this one.
 	Subscriptions int64 `json:"subscriptions"`
@@ -136,6 +140,13 @@ func builderDependents(tx *gorm.DB, onlyID uint) (map[uint]BuilderDependents, er
 		return nil, fmt.Errorf("load builder plans: %w", err)
 	}
 	for _, p := range plans {
+		blocking, err := planBlocksBuilderDeletion(tx, p)
+		if err != nil {
+			return nil, err
+		}
+		if !blocking {
+			continue
+		}
 		d := out[*p.SubscriptionBuilderID]
 		d.Plans = append(d.Plans, DependentRef{ID: p.ID, Name: p.Name})
 		out[*p.SubscriptionBuilderID] = d
@@ -159,6 +170,28 @@ func builderDependents(tx *gorm.DB, onlyID uint) (map[uint]BuilderDependents, er
 		out[c.BuilderID] = d
 	}
 	return out, nil
+}
+
+// planBlocksBuilderDeletion reports whether a plan keeps its default builder
+// from being deleted: a system plan always, any other plan while a tariff or a
+// subscription (in any state) still references it.
+func planBlocksBuilderDeletion(tx *gorm.DB, p Plan) (bool, error) {
+	if IsSystemPlanName(p.Name) {
+		return true, nil
+	}
+	var n int64
+	err := tx.Model(&Product{}).Where("plan_id = ?", p.ID).Count(&n).Error
+	if err != nil {
+		return false, fmt.Errorf("count plan tariffs: %w", err)
+	}
+	if n > 0 {
+		return true, nil
+	}
+	err = tx.Model(&Subscription{}).Where("plan_id = ?", p.ID).Count(&n).Error
+	if err != nil {
+		return false, fmt.Errorf("count plan subscriptions: %w", err)
+	}
+	return n > 0, nil
 }
 
 // normalized returns the dependents with a non-nil list ([] on the wire).
@@ -348,6 +381,12 @@ func (s *Service) DeleteBuilder(ctx context.Context, meta AdminConfigMeta, id ui
 			}
 			if deps[id].InUse() {
 				return configChange{}, ErrBuilderInUse
+			}
+			// What is left pointing at the builder are its empty sale plans
+			// (nothing blocking passed the check above): remove them with it.
+			err = tx.Where("subscription_builder_id = ? AND name NOT IN ?", id, systemPlanNames).Delete(&Plan{}).Error
+			if err != nil {
+				return configChange{}, fmt.Errorf("delete builder sale plans: %w", err)
 			}
 			err = tx.Where("builder_id = ?", id).Delete(&SubscriptionBuilderItem{}).Error
 			if err != nil {
